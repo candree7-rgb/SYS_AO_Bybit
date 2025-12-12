@@ -1,125 +1,190 @@
-import time, random
-from datetime import datetime, timezone
-from config import *
-from state import load_state, save_state, incr_daily, get_daily
-from discord_reader import fetch_messages, extract_text
-from signal_parser import parse_signal
+import time
+import random
+import threading
+import logging
+
+from config import (
+    DISCORD_TOKEN, CHANNEL_ID,
+    BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, RECV_WINDOW,
+    QUOTE,
+    MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
+    POLL_SECONDS, POLL_JITTER_MAX,
+    STATE_FILE, DRY_RUN, LOG_LEVEL
+)
 from bybit_v5 import BybitV5
+from discord_reader import DiscordReader
+from signal_parser import parse_signal, signal_hash
+from state import load_state, save_state, utc_day_key
 from trade_engine import TradeEngine
 
-def now_utc_ts() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
-
-def trade_id(sig_hash: str) -> str:
-    return f"AO:{sig_hash[:10]}:{now_utc_ts()}"
+def setup_logger() -> logging.Logger:
+    log = logging.getLogger("bot")
+    log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    h = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
+    h.setFormatter(fmt)
+    log.handlers[:] = [h]
+    return log
 
 def main():
-    if not DISCORD_TOKEN or not CHANNEL_ID:
-        raise SystemExit("Missing DISCORD_TOKEN/CHANNEL_ID")
-    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-        raise SystemExit("Missing BYBIT_API_KEY/BYBIT_API_SECRET")
+    log = setup_logger()
 
-    st = load_state()
-    bybit = BybitV5(BYBIT_API_KEY, BYBIT_API_SECRET, testnet=BYBIT_TESTNET)
-    engine = TradeEngine(bybit, st)
+    # basic env checks
+    missing = [k for k,v in {
+        "DISCORD_TOKEN": DISCORD_TOKEN,
+        "CHANNEL_ID": CHANNEL_ID,
+        "BYBIT_API_KEY": BYBIT_API_KEY,
+        "BYBIT_API_SECRET": BYBIT_API_SECRET,
+    }.items() if not v]
+    if missing:
+        raise SystemExit(f"Missing ENV(s): {', '.join(missing)}")
 
-    # Start WS in background thread (simple way)
-    import threading
-    t = threading.Thread(target=lambda: bybit.run_private_ws(engine.on_execution), daemon=True)
+    st = load_state(STATE_FILE)
+
+    bybit = BybitV5(BYBIT_API_KEY, BYBIT_API_SECRET, testnet=BYBIT_TESTNET, recv_window=RECV_WINDOW)
+    discord = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
+    engine = TradeEngine(bybit, st, log)
+
+    log.info("="*58)
+    log.info("Discord → Bybit Bot (One-way)" + (" | DRY_RUN" if DRY_RUN else "")) 
+    log.info("="*58)
+
+    # ----- WS thread -----
+    ws_err = {"err": None}
+
+    def on_execution(ev):
+        try:
+            engine.on_execution(ev)
+        except Exception as e:
+            log.warning(f"WS execution handler error: {e}")
+
+    def on_order(ev):
+        # optional: could track cancellations etc
+        return
+
+    def on_ws_error(err):
+        ws_err["err"] = err
+        log.warning(f"WS error: {err}")
+
+    def ws_loop():
+        while True:
+            try:
+                bybit.run_private_ws(on_execution=on_execution, on_order=on_order, on_error=on_ws_error)
+            except Exception as e:
+                on_ws_error(e)
+            time.sleep(3)
+
+    t = threading.Thread(target=ws_loop, daemon=True)
     t.start()
 
-    last_id = st.get("last_discord_id")
+    # ----- helper: limits -----
+    def trades_today() -> int:
+        return int(st.get("daily_counts", {}).get(utc_day_key(), 0))
 
-    print("✅ Bot gestartet")
+    def inc_trades_today():
+        k = utc_day_key()
+        st.setdefault("daily_counts", {})[k] = int(st.get("daily_counts", {}).get(k, 0)) + 1
+
+    # ----- main loop -----
     while True:
         try:
-            msgs = fetch_messages(last_id, limit=50)
-            msgs = sorted(msgs, key=lambda m: int(m.get("id","0")))
+            # maintenance first
+            engine.cancel_expired_entries()
 
-            for m in msgs:
-                mid = str(m.get("id","0"))
-                if last_id and int(mid) <= int(last_id):
-                    continue
-
-                text = extract_text(m)
-                sig = parse_signal(text, quote=QUOTE)
-
-                if sig:
-                    # dedupe
-                    seen = set(st.get("seen_hashes", []))
-                    if sig["hash"] in seen:
-                        last_id = mid
-                        continue
-                    seen.add(sig["hash"])
-                    st["seen_hashes"] = list(seen)[-800:]
-
-                    # limits
-                    if len(st.get("open_trades", {})) >= MAX_CONCURRENT_TRADES:
-                        print("⛔ max concurrent erreicht -> skip")
-                        last_id = mid
-                        continue
-                    if get_daily(st) >= MAX_TRADES_PER_DAY:
-                        print("⛔ max trades/day erreicht -> skip")
-                        last_id = mid
-                        continue
-
-                    tid = trade_id(sig["hash"])
-                    symbol = sig["symbol"]
-                    order_side = "Sell" if sig["side"] == "sell" else "Buy"
-                    pos_side = "Short" if order_side == "Sell" else "Long"
-
-                    # Here: you MUST set qty logic.
-                    # For now, we store signal and place entry after you decide qty model.
-                    # If you want: fixed USDT margin * leverage => qty via last price.
-                    # Sag mir dein exaktes Risk-Modell (Equity% + leverage) und ich droppe dir die qty calc 1:1.
-
-                    # Minimal: just register trade and place conditional entry with placeholder qty fix later.
-                    oid = engine.place_conditional_entry(sig, client_trade_id=tid)
-                    if not oid:
-                        print(f"⚠️ skipped (too far / invalid) {symbol}")
-                        last_id = mid
-                        continue
-
-                    st["open_trades"][tid] = {
-                        "id": tid,
-                        "symbol": symbol,
-                        "order_side": order_side,
-                        "pos_side": pos_side,
-                        "created_ts": now_utc_ts(),
-                        "expires_ts": now_utc_ts() + ENTRY_EXPIRATION_MIN*60,
-                        "entry_trigger": sig["trigger"],
-                        "entry_order_id": oid,
-                        "entry_price": sig["trigger"],   # will be replaced with actual avg fill later
-                        "tp_prices": sig["tps"],
-                        "tp_splits": TP_SPLITS[:len(sig["tps"])],
-                        "dca_prices": sig["dcas"],
-                        "sl_price": sig.get("stop_loss"),
-                        "tp1_order_id": None,
-                        "sl_moved_to_be": False,
-                        "post_orders_placed": False,
-                    }
-
-                    incr_daily(st)
-                    print(f"📌 Placed conditional entry {symbol} ({order_side}) id={tid}")
-
-                last_id = mid
-
-            # Expiry cleanup
-            now = now_utc_ts()
+            # entry-fill fallback (polling) and post-orders placement
             for tid, tr in list(st.get("open_trades", {}).items()):
-                if now >= tr["expires_ts"]:
-                    print(f"⌛ Expired -> cancel {tid} {tr['symbol']}")
-                    # Here you would cancel entry + open orders (best effort)
-                    # (kept short: you can add cancel-all logic per symbol)
-                    st["open_trades"].pop(tid, None)
+                if tr.get("status") == "pending":
+                    # if position opened but ws missed: detect via positions size > 0
+                    sz, avg = engine.position_size_avg(tr["symbol"])
+                    if sz > 0 and avg > 0:
+                        tr["status"] = "open"
+                        tr["entry_price"] = avg
+                        tr["filled_ts"] = time.time()
+                        log.info(f"✅ ENTRY (poll) {tr['symbol']} @ {avg}")
+                if tr.get("status") == "open" and not tr.get("post_orders_placed"):
+                    engine.place_post_entry_orders(tr)
 
-            st["last_discord_id"] = last_id
-            save_state(st)
+            # enforce concurrent trades
+            active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending","open")]
+            if len(active) >= MAX_CONCURRENT_TRADES:
+                log.info(f"Active trades {len(active)}/{MAX_CONCURRENT_TRADES} → skip new signals")
+            elif trades_today() >= MAX_TRADES_PER_DAY:
+                log.info(f"Trades today {trades_today()}/{MAX_TRADES_PER_DAY} → skip new signals")
+            else:
+                # read discord
+                after = st.get("last_discord_id")
+                msgs = discord.fetch_after(after, limit=50)
+                msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id","0")))
+                max_seen = int(after or 0)
 
+                for m in msgs_sorted:
+                    mid = int(m.get("id","0"))
+                    max_seen = max(max_seen, mid)
+
+                    # ignore very old messages
+                    ts = discord.message_timestamp_unix(m)
+                    if ts and (time.time() - ts) > TC_MAX_LAG_SEC:
+                        continue
+
+                    txt = discord.extract_text(m)
+                    if not txt:
+                        continue
+
+                    sig = parse_signal(txt, quote=QUOTE)
+                    if not sig:
+                        continue
+
+                    sh = signal_hash(sig)
+                    seen = set(st.get("seen_signal_hashes", []))
+                    if sh in seen:
+                        continue
+
+                    # mark seen early
+                    seen.add(sh)
+                    st["seen_signal_hashes"] = list(seen)[-500:]
+
+                    trade_id = f"{sig['symbol']}|{sig['side']}|{int(time.time())}"
+                    oid = engine.place_conditional_entry(sig, trade_id)
+                    if not oid:
+                        continue
+
+                    # store trade
+                    st.setdefault("open_trades", {})[trade_id] = {
+                        "id": trade_id,
+                        "symbol": sig["symbol"],
+                        "order_side": "Sell" if sig["side"] == "sell" else "Buy",
+                        "pos_side": "Short" if sig["side"] == "sell" else "Long",
+                        "trigger": float(sig["trigger"]),
+                        "tp_prices": sig.get("tp_prices") or [],
+                        "tp_splits": None,  # engine uses config
+                        "dca_prices": sig.get("dca_prices") or [],
+                        "sl_price": sig.get("sl_price"),
+                        "entry_order_id": oid,
+                        "status": "pending",
+                        "placed_ts": time.time(),
+                        "base_qty": engine.calc_base_qty(sig["symbol"], float(sig["trigger"])),
+                        "raw": sig.get("raw", ""),
+                    }
+                    inc_trades_today()
+                    log.info(f"🟡 ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")
+
+                    # stop if we hit limits mid-batch
+                    active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending","open")]
+                    if len(active) >= MAX_CONCURRENT_TRADES or trades_today() >= MAX_TRADES_PER_DAY:
+                        break
+
+                st["last_discord_id"] = str(max_seen) if max_seen else after
+
+            save_state(STATE_FILE, st)
+
+        except KeyboardInterrupt:
+            log.info("Bye")
+            break
         except Exception as e:
-            print("❌ error:", e)
+            log.exception(f"Loop error: {e}")
+            time.sleep(3)
 
-        time.sleep(POLL_SECONDS + random.uniform(0, 0.25))
+        time.sleep(max(1, POLL_SECONDS + random.uniform(0, max(0, POLL_JITTER_MAX))))
 
 if __name__ == "__main__":
     main()
