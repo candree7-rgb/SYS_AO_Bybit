@@ -26,6 +26,12 @@ ENTRY_TOO_FAR_PCT          = float(os.getenv("ENTRY_TOO_FAR_PCT","0.5"))
 ENTRY_TRIGGER_BUFFER_PCT   = float(os.getenv("ENTRY_TRIGGER_BUFFER_PCT","0.0"))
 ENTRY_LIMIT_PRICE_OFFSET_PCT = float(os.getenv("ENTRY_LIMIT_PRICE_OFFSET_PCT","0.0"))
 
+# Trailing (Runner)
+TRAIL_ENABLED = True
+TRAIL_AFTER_TP_INDEX = 3      # nach TP3
+TRAIL_DIST_PCT = 2.0          # 2% Trailing Abstand
+TRAIL_TRIGGER_BY = "MarkPrice"  # oder LastPrice
+
 INITIAL_SL_PCT = float(os.getenv("INITIAL_SL_PCT","19.0"))
 MOVE_SL_TO_BE_ON_TP1 = _bool(os.getenv("MOVE_SL_TO_BE_ON_TP1","true"))
 
