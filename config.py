@@ -48,12 +48,16 @@ ENTRY_EXPIRATION_PRICE_PCT   = _get_float("ENTRY_EXPIRATION_PRICE_PCT","0.6")
 
 # TP/SL
 MOVE_SL_TO_BE_ON_TP1 = _get_bool("MOVE_SL_TO_BE_ON_TP1","true")
+INITIAL_SL_PCT = _get_float("INITIAL_SL_PCT","19.0")  # SL distance from entry in %
 
 TP_SPLITS = [float(x) for x in _get("TP_SPLITS","30,30,30,10").split(",") if x.strip()]
 if abs(sum(TP_SPLITS) - 100.0) > 0.001:
     # keep it safe: normalize to 100
     s = sum(TP_SPLITS) or 100.0
     TP_SPLITS = [x * 100.0 / s for x in TP_SPLITS]
+
+# Fallback TP distances (% from entry) if signal has no TPs
+FALLBACK_TP_PCT = [float(x) for x in _get("FALLBACK_TP_PCT","0.85,1.65,4.0").split(",") if x.strip()]
 
 TRAIL_AFTER_TP_INDEX = _get_int("TRAIL_AFTER_TP_INDEX","3")  # start trailing when TPn filled
 TRAIL_DISTANCE_PCT   = _get_float("TRAIL_DISTANCE_PCT","2.0")

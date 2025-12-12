@@ -90,6 +90,7 @@ def main():
         try:
             # maintenance first
             engine.cancel_expired_entries()
+            engine.cleanup_closed_trades()
 
             # entry-fill fallback (polling) and post-orders placement
             for tid, tr in list(st.get("open_trades", {}).items()):
