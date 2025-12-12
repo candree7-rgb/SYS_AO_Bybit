@@ -31,12 +31,27 @@ class TradeEngine:
             return x
         return math.floor(x / step) * step
 
-    def _get_qty_rules(self, symbol: str) -> Dict[str, float]:
+    def _get_instrument_rules(self, symbol: str) -> Dict[str, float]:
         info = self.bybit.instruments_info(CATEGORY, symbol)
         lot = info.get("lotSizeFilter") or {}
+        price_filter = info.get("priceFilter") or {}
         qty_step = float(lot.get("qtyStep") or lot.get("basePrecision") or "0.000001")
         min_qty  = float(lot.get("minOrderQty") or "0")
-        return {"qty_step": qty_step, "min_qty": min_qty}
+        tick_size = float(price_filter.get("tickSize") or "0.0001")
+        return {"qty_step": qty_step, "min_qty": min_qty, "tick_size": tick_size}
+
+    def _round_price(self, price: float, tick_size: float) -> float:
+        """Round price to valid tick size."""
+        if tick_size <= 0:
+            return price
+        return round(round(price / tick_size) * tick_size, 10)
+
+    def _round_qty(self, qty: float, qty_step: float, min_qty: float) -> float:
+        """Round qty down to valid step and ensure min qty."""
+        qty = self._floor_to_step(qty, qty_step)
+        if qty < min_qty:
+            qty = min_qty
+        return float(f"{qty:.10f}")
 
     def calc_base_qty(self, symbol: str, entry_price: float) -> float:
         # Risk model: margin = equity * RISK_PCT; notional = margin * LEVERAGE; qty = notional / price
@@ -45,11 +60,8 @@ class TradeEngine:
         notional = margin * LEVERAGE
         qty = notional / entry_price
 
-        rules = self._get_qty_rules(symbol)
-        qty = self._floor_to_step(qty, rules["qty_step"])
-        if qty < rules["min_qty"]:
-            qty = rules["min_qty"]
-        return float(f"{qty:.10f}")
+        rules = self._get_instrument_rules(symbol)
+        return self._round_qty(qty, rules["qty_step"], rules["min_qty"])
 
     # ---------- entry gatekeepers ----------
     def _too_far(self, side: str, last: float, trigger: float) -> bool:
@@ -111,8 +123,13 @@ class TradeEngine:
             self.log.info(f"SKIP {symbol} – beyond expiry-price rule (last={last}, trigger={trigger})")
             return None
 
+        # Get instrument rules for price/qty rounding
+        rules = self._get_instrument_rules(symbol)
+        tick_size = rules["tick_size"]
+
         # buffer: slightly earlier trigger if desired
         trigger_adj = trigger * (1 - ENTRY_TRIGGER_BUFFER_PCT / 100.0) if side == "Buy" else trigger * (1 + ENTRY_TRIGGER_BUFFER_PCT / 100.0)
+        trigger_adj = self._round_price(trigger_adj, tick_size)
 
         # We use LIMIT conditional by default for exact pricing; optionally offset the limit to improve fill odds
         limit_price = trigger
@@ -122,6 +139,7 @@ class TradeEngine:
                 limit_price = trigger * (1 + off)
             else:
                 limit_price = trigger * (1 - off)
+        limit_price = self._round_price(limit_price, tick_size)
 
         qty = self.calc_base_qty(symbol, trigger)
         td = self._trigger_direction(last, trigger_adj)
@@ -164,17 +182,24 @@ class TradeEngine:
         entry  = float(trade["entry_price"])
         base_qty = float(trade["base_qty"])
 
+        # Get instrument rules for price/qty rounding
+        rules = self._get_instrument_rules(symbol)
+        tick_size = rules["tick_size"]
+        qty_step = rules["qty_step"]
+        min_qty = rules["min_qty"]
+
         # ---- SL (position-level) ----
         sl_price = trade.get("sl_price")
         if sl_price is None:
             # default: 19% style is signal-specific; if missing, do nothing
             sl_price = entry * (1 + 0.19) if side == "Sell" else entry * (1 - 0.19)
+        sl_price = self._round_price(float(sl_price), tick_size)
 
         ts_body = {
             "category": CATEGORY,
             "symbol": symbol,
             "positionIdx": 0,
-            "stopLoss": f"{float(sl_price):.10f}",
+            "stopLoss": f"{sl_price:.10f}",
             "tpslMode": "Full",
         }
         if DRY_RUN:
@@ -198,14 +223,14 @@ class TradeEngine:
             pct = float(splits[idx])
             if pct <= 0:
                 continue
-            tp = float(tp_prices[idx])
-            qty = size * (pct / 100.0)
+            tp = self._round_price(float(tp_prices[idx]), tick_size)
+            qty = self._round_qty(size * (pct / 100.0), qty_step, min_qty)
             o = {
                 "category": CATEGORY,
                 "symbol": symbol,
                 "side": _opposite_side(side),
                 "orderType": "Limit",
-                "qty": f"{qty:.10f}",
+                "qty": f"{qty}",
                 "price": f"{tp:.10f}",
                 "timeInForce": "GTC",
                 "reduceOnly": True,
@@ -223,22 +248,26 @@ class TradeEngine:
                 trade["tp1_order_id"] = oid
 
         # ---- DCA conditionals (add) ----
+        # Only place as many DCAs as we have multipliers configured
         dca_prices: List[float] = trade.get("dca_prices") or []
-        for j, price in enumerate(dca_prices, start=1):
-            mult = DCA_QTY_MULTS[min(j-1, len(DCA_QTY_MULTS)-1)]
-            qty = base_qty * mult
-            last = self.bybit.last_price(CATEGORY, symbol)
-            td = self._trigger_direction(last, float(price))
+        dca_to_place = min(len(dca_prices), len(DCA_QTY_MULTS))
+        last = self.bybit.last_price(CATEGORY, symbol)
+
+        for j in range(1, dca_to_place + 1):
+            price = self._round_price(float(dca_prices[j-1]), tick_size)
+            mult = DCA_QTY_MULTS[j-1]
+            qty = self._round_qty(base_qty * mult, qty_step, min_qty)
+            td = self._trigger_direction(last, price)
             o = {
                 "category": CATEGORY,
                 "symbol": symbol,
                 "side": side,
                 "orderType": "Limit",
-                "qty": f"{qty:.10f}",
-                "price": f"{float(price):.10f}",
+                "qty": f"{qty}",
+                "price": f"{price:.10f}",
                 "timeInForce": "GTC",
                 "triggerDirection": td,
-                "triggerPrice": f"{float(price):.10f}",
+                "triggerPrice": f"{price:.10f}",
                 "triggerBy": "LastPrice",
                 "reduceOnly": False,
                 "closeOnTrigger": False,
@@ -301,11 +330,13 @@ class TradeEngine:
                 self.log.info(f"✅ TRAILING STARTED {tr['symbol']} after TP{tp_num}")
 
     def _move_sl(self, symbol: str, sl_price: float) -> None:
+        rules = self._get_instrument_rules(symbol)
+        sl_price = self._round_price(sl_price, rules["tick_size"])
         body = {
             "category": CATEGORY,
             "symbol": symbol,
             "positionIdx": 0,
-            "stopLoss": f"{float(sl_price):.10f}",
+            "stopLoss": f"{sl_price:.10f}",
             "tpslMode": "Full",
         }
         if DRY_RUN:
@@ -318,13 +349,18 @@ class TradeEngine:
         symbol = tr["symbol"]
         side = tr["order_side"]  # Buy/Sell
         tp_prices = tr.get("tp_prices") or []
+
+        rules = self._get_instrument_rules(symbol)
+        tick_size = rules["tick_size"]
+
         if len(tp_prices) < tp_num:
             # fallback: use current market
             anchor = self.bybit.last_price(CATEGORY, symbol)
         else:
             anchor = float(tp_prices[tp_num-1])
 
-        dist = anchor * (TRAIL_DISTANCE_PCT / 100.0)
+        anchor = self._round_price(anchor, tick_size)
+        dist = self._round_price(anchor * (TRAIL_DISTANCE_PCT / 100.0), tick_size)
 
         # activation price: anchor (TP level)
         body = {
@@ -338,7 +374,8 @@ class TradeEngine:
 
         # keep SL at BE if already moved; otherwise keep existing stopLoss unchanged
         if tr.get("sl_moved_to_be") and tr.get("entry_price"):
-            body["stopLoss"] = f"{float(tr['entry_price']):.10f}"
+            be_price = self._round_price(float(tr['entry_price']), tick_size)
+            body["stopLoss"] = f"{be_price:.10f}"
 
         if DRY_RUN:
             self.log.info(f"DRY_RUN set trailing: {body}")
@@ -361,3 +398,25 @@ class TradeEngine:
                     except Exception as e:
                         self.log.warning(f"Cancel failed {tr['symbol']} ({tid}): {e}")
                 tr["status"] = "expired"
+
+    def cleanup_closed_trades(self) -> None:
+        """Remove trades from state if position is closed (size = 0)."""
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") not in ("open",):
+                continue
+            try:
+                size, _ = self.position_size_avg(tr["symbol"])
+                if size == 0:
+                    tr["status"] = "closed"
+                    tr["closed_ts"] = time.time()
+                    self.log.info(f"✅ TRADE CLOSED {tr['symbol']} ({tid})")
+            except Exception as e:
+                self.log.warning(f"Cleanup check failed for {tr['symbol']}: {e}")
+
+        # Prune old closed/expired trades (keep last 24h for reference)
+        cutoff = time.time() - 86400
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") in ("closed", "expired"):
+                closed_at = tr.get("closed_ts") or tr.get("placed_ts") or 0
+                if closed_at < cutoff:
+                    del self.state["open_trades"][tid]

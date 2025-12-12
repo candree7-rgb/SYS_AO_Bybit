@@ -31,6 +31,10 @@ class BybitV5:
             "Content-Type": "application/json",
         }
 
+    def _build_query_string(self, params: Dict[str, Any]) -> str:
+        """Build sorted query string for GET request signatures."""
+        return "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
     def _check(self, data: Dict[str, Any]) -> Dict[str, Any]:
         # Bybit returns retCode/retMsg
         if isinstance(data, dict) and data.get("retCode", 0) not in (0, "0"):
@@ -58,10 +62,12 @@ class BybitV5:
 
     # ---------- Account ----------
     def wallet_equity(self, account_type: str = "UNIFIED") -> float:
+        params = {"accountType": account_type}
+        query_string = self._build_query_string(params)
         r = requests.get(
             f"{self.base}/v5/account/wallet-balance",
-            headers=self._headers(""),
-            params={"accountType": account_type},
+            headers=self._headers(query_string),
+            params=params,
             timeout=15,
         )
         r.raise_for_status()
@@ -100,10 +106,12 @@ class BybitV5:
         return self._check(r.json())
 
     def open_orders(self, category: str, symbol: str) -> List[Dict[str, Any]]:
+        params = {"category": category, "symbol": symbol}
+        query_string = self._build_query_string(params)
         r = requests.get(
             f"{self.base}/v5/order/realtime",
-            headers=self._headers(""),
-            params={"category": category, "symbol": symbol},
+            headers=self._headers(query_string),
+            params=params,
             timeout=15,
         )
         r.raise_for_status()
@@ -114,9 +122,10 @@ class BybitV5:
         params = {"category": category, "symbol": symbol, "limit": limit}
         if order_link_id:
             params["orderLinkId"] = order_link_id
+        query_string = self._build_query_string(params)
         r = requests.get(
             f"{self.base}/v5/order/history",
-            headers=self._headers(""),
+            headers=self._headers(query_string),
             params=params,
             timeout=15,
         )
@@ -126,10 +135,12 @@ class BybitV5:
 
     # ---------- Positions ----------
     def positions(self, category: str, symbol: str) -> List[Dict[str, Any]]:
+        params = {"category": category, "symbol": symbol}
+        query_string = self._build_query_string(params)
         r = requests.get(
             f"{self.base}/v5/position/list",
-            headers=self._headers(""),
-            params={"category": category, "symbol": symbol},
+            headers=self._headers(query_string),
+            params=params,
             timeout=15,
         )
         r.raise_for_status()
