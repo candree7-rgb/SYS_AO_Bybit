@@ -1,12 +1,13 @@
 import time
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 from config import (
     CATEGORY, ACCOUNT_TYPE, QUOTE, LEVERAGE, RISK_PCT,
     ENTRY_EXPIRATION_MIN, ENTRY_TOO_FAR_PCT, ENTRY_TRIGGER_BUFFER_PCT, ENTRY_LIMIT_PRICE_OFFSET_PCT,
     ENTRY_EXPIRATION_PRICE_PCT,
-    TP_SPLITS, DCA_QTY_MULTS,
+    TP_SPLITS, DCA_QTY_MULTS, INITIAL_SL_PCT, FALLBACK_TP_PCT,
     MOVE_SL_TO_BE_ON_TP1,
     TRAIL_AFTER_TP_INDEX, TRAIL_DISTANCE_PCT, TRAIL_ACTIVATE_ON_TP,
     DRY_RUN
@@ -23,6 +24,9 @@ class TradeEngine:
         self.bybit = bybit
         self.state = state
         self.log = logger
+        self._instrument_cache: Dict[str, Dict[str, float]] = {}  # symbol -> rules
+        self._cache_ttl = 300  # 5 min cache
+        self._cache_times: Dict[str, float] = {}
 
     # ---------- precision helpers ----------
     @staticmethod
@@ -32,13 +36,24 @@ class TradeEngine:
         return math.floor(x / step) * step
 
     def _get_instrument_rules(self, symbol: str) -> Dict[str, float]:
+        """Get instrument rules with caching to avoid repeated API calls."""
+        now = time.time()
+        cached_time = self._cache_times.get(symbol, 0)
+
+        if symbol in self._instrument_cache and (now - cached_time) < self._cache_ttl:
+            return self._instrument_cache[symbol]
+
         info = self.bybit.instruments_info(CATEGORY, symbol)
         lot = info.get("lotSizeFilter") or {}
         price_filter = info.get("priceFilter") or {}
         qty_step = float(lot.get("qtyStep") or lot.get("basePrecision") or "0.000001")
         min_qty  = float(lot.get("minOrderQty") or "0")
         tick_size = float(price_filter.get("tickSize") or "0.0001")
-        return {"qty_step": qty_step, "min_qty": min_qty, "tick_size": tick_size}
+
+        rules = {"qty_step": qty_step, "min_qty": min_qty, "tick_size": tick_size}
+        self._instrument_cache[symbol] = rules
+        self._cache_times[symbol] = now
+        return rules
 
     def _round_price(self, price: float, tick_size: float) -> float:
         """Round price to valid tick size."""
@@ -175,6 +190,17 @@ class TradeEngine:
             return
         self.bybit.cancel_order(body)
 
+    def _generate_fallback_tps(self, entry: float, side: str, tick_size: float) -> List[float]:
+        """Generate fallback TP prices based on % distance from entry."""
+        tps = []
+        for pct in FALLBACK_TP_PCT:
+            if side == "Sell":  # SHORT: TPs are below entry
+                tp = entry * (1 - pct / 100.0)
+            else:  # LONG: TPs are above entry
+                tp = entry * (1 + pct / 100.0)
+            tps.append(self._round_price(tp, tick_size))
+        return tps
+
     def place_post_entry_orders(self, trade: Dict[str, Any]) -> None:
         """Places SL + TP ladder + DCA conditionals after entry is filled."""
         symbol = trade["symbol"]
@@ -182,7 +208,7 @@ class TradeEngine:
         entry  = float(trade["entry_price"])
         base_qty = float(trade["base_qty"])
 
-        # Get instrument rules for price/qty rounding
+        # Get instrument rules for price/qty rounding (cached)
         rules = self._get_instrument_rules(symbol)
         tick_size = rules["tick_size"]
         qty_step = rules["qty_step"]
@@ -191,8 +217,9 @@ class TradeEngine:
         # ---- SL (position-level) ----
         sl_price = trade.get("sl_price")
         if sl_price is None:
-            # default: 19% style is signal-specific; if missing, do nothing
-            sl_price = entry * (1 + 0.19) if side == "Sell" else entry * (1 - 0.19)
+            # Use configurable SL %
+            sl_pct = INITIAL_SL_PCT / 100.0
+            sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
         sl_price = self._round_price(float(sl_price), tick_size)
 
         ts_body = {
@@ -217,7 +244,16 @@ class TradeEngine:
         tp_prices: List[float] = trade.get("tp_prices") or []
         splits: List[float] = trade.get("tp_splits") or TP_SPLITS
 
-        # ensure we have same length; if signal provides 4 tps, we keep all but only place up to len(splits)
+        # Fallback TPs if signal has none
+        if not tp_prices:
+            tp_prices = self._generate_fallback_tps(entry, side, tick_size)
+            self.log.info(f"Using fallback TPs for {symbol}: {tp_prices}")
+
+        # Prepare all orders first, then place in parallel
+        tp_orders = []
+        dca_orders = []
+
+        # Build TP orders
         tp_to_place = min(len(tp_prices), len(splits))
         for idx in range(tp_to_place):
             pct = float(splits[idx])
@@ -225,30 +261,23 @@ class TradeEngine:
                 continue
             tp = self._round_price(float(tp_prices[idx]), tick_size)
             qty = self._round_qty(size * (pct / 100.0), qty_step, min_qty)
-            o = {
-                "category": CATEGORY,
-                "symbol": symbol,
-                "side": _opposite_side(side),
-                "orderType": "Limit",
-                "qty": f"{qty}",
-                "price": f"{tp:.10f}",
-                "timeInForce": "GTC",
-                "reduceOnly": True,
-                "closeOnTrigger": False,
-                "orderLinkId": f"{trade['id']}:TP{idx+1}",
-            }
-            if DRY_RUN:
-                self.log.info(f"DRY_RUN TP{idx+1}: {o}")
-                oid = f"DRY_TP{idx+1}"
-            else:
-                resp = self.bybit.place_order(o)
-                oid = (resp.get("result") or {}).get("orderId")
-            trade.setdefault("tp_order_ids", {})[str(idx+1)] = oid
-            if idx == 0:
-                trade["tp1_order_id"] = oid
+            tp_orders.append({
+                "idx": idx,
+                "body": {
+                    "category": CATEGORY,
+                    "symbol": symbol,
+                    "side": _opposite_side(side),
+                    "orderType": "Limit",
+                    "qty": f"{qty}",
+                    "price": f"{tp:.10f}",
+                    "timeInForce": "GTC",
+                    "reduceOnly": True,
+                    "closeOnTrigger": False,
+                    "orderLinkId": f"{trade['id']}:TP{idx+1}",
+                }
+            })
 
-        # ---- DCA conditionals (add) ----
-        # Only place as many DCAs as we have multipliers configured
+        # Build DCA orders
         dca_prices: List[float] = trade.get("dca_prices") or []
         dca_to_place = min(len(dca_prices), len(DCA_QTY_MULTS))
         last = self.bybit.last_price(CATEGORY, symbol)
@@ -258,25 +287,53 @@ class TradeEngine:
             mult = DCA_QTY_MULTS[j-1]
             qty = self._round_qty(base_qty * mult, qty_step, min_qty)
             td = self._trigger_direction(last, price)
-            o = {
-                "category": CATEGORY,
-                "symbol": symbol,
-                "side": side,
-                "orderType": "Limit",
-                "qty": f"{qty}",
-                "price": f"{price:.10f}",
-                "timeInForce": "GTC",
-                "triggerDirection": td,
-                "triggerPrice": f"{price:.10f}",
-                "triggerBy": "LastPrice",
-                "reduceOnly": False,
-                "closeOnTrigger": False,
-                "orderLinkId": f"{trade['id']}:DCA{j}",
-            }
-            if DRY_RUN:
-                self.log.info(f"DRY_RUN DCA{j}: {o}")
-            else:
-                self.bybit.place_order(o)
+            dca_orders.append({
+                "idx": j,
+                "body": {
+                    "category": CATEGORY,
+                    "symbol": symbol,
+                    "side": side,
+                    "orderType": "Limit",
+                    "qty": f"{qty}",
+                    "price": f"{price:.10f}",
+                    "timeInForce": "GTC",
+                    "triggerDirection": td,
+                    "triggerPrice": f"{price:.10f}",
+                    "triggerBy": "LastPrice",
+                    "reduceOnly": False,
+                    "closeOnTrigger": False,
+                    "orderLinkId": f"{trade['id']}:DCA{j}",
+                }
+            })
+
+        # Place orders in parallel for speed
+        if DRY_RUN:
+            for o in tp_orders:
+                self.log.info(f"DRY_RUN TP{o['idx']+1}: {o['body']}")
+                trade.setdefault("tp_order_ids", {})[str(o['idx']+1)] = f"DRY_TP{o['idx']+1}"
+                if o['idx'] == 0:
+                    trade["tp1_order_id"] = f"DRY_TP1"
+            for o in dca_orders:
+                self.log.info(f"DRY_RUN DCA{o['idx']}: {o['body']}")
+        else:
+            all_orders = [("TP", o) for o in tp_orders] + [("DCA", o) for o in dca_orders]
+
+            def place_order(order_tuple):
+                order_type, o = order_tuple
+                resp = self.bybit.place_order(o["body"])
+                return order_type, o["idx"], (resp.get("result") or {}).get("orderId")
+
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [executor.submit(place_order, o) for o in all_orders]
+                for future in as_completed(futures):
+                    try:
+                        order_type, idx, oid = future.result()
+                        if order_type == "TP":
+                            trade.setdefault("tp_order_ids", {})[str(idx+1)] = oid
+                            if idx == 0:
+                                trade["tp1_order_id"] = oid
+                    except Exception as e:
+                        self.log.warning(f"Order placement failed: {e}")
 
         trade["post_orders_placed"] = True
 
