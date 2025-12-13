@@ -1,3 +1,4 @@
+import sys
 import time
 import random
 import threading
@@ -20,7 +21,7 @@ from trade_engine import TradeEngine
 def setup_logger() -> logging.Logger:
     log = logging.getLogger("bot")
     log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-    h = logging.StreamHandler()
+    h = logging.StreamHandler(sys.stdout)  # stdout so Railway shows INFO as normal (not red)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
     h.setFormatter(fmt)
     log.handlers[:] = [h]

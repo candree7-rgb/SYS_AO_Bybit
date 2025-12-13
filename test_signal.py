@@ -17,10 +17,12 @@ from state import load_state, save_state
 from trade_engine import TradeEngine
 import logging
 
+import sys
+
 # Setup logger
 log = logging.getLogger("test")
 log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-h = logging.StreamHandler()
+h = logging.StreamHandler(sys.stdout)
 fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
 h.setFormatter(fmt)
 log.handlers[:] = [h]
