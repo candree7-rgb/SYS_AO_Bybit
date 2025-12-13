@@ -8,8 +8,29 @@ class DiscordReader:
         self.channel_id = channel_id
         self.headers = {
             "Authorization": token,
-            "User-Agent": "DiscordToBybitBot/1.0",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         }
+
+    def _request_with_retry(self, url: str, params: dict, max_retries: int = 3) -> requests.Response:
+        """Make request with retry logic for timeouts."""
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(url, headers=self.headers, params=params, timeout=20)
+                if r.status_code == 429:
+                    retry = 5.0
+                    try:
+                        retry = float((r.json() or {}).get("retry_after", 5))
+                    except Exception:
+                        pass
+                    time.sleep(retry + 0.25)
+                    continue
+                return r
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Wait 1s before retry
+                    continue
+                raise
+        raise requests.exceptions.Timeout("Max retries exceeded")
 
     def fetch_after(self, after_id: Optional[str], limit: int = 50) -> List[Dict[str, Any]]:
         collected: List[Dict[str, Any]] = []
@@ -18,20 +39,10 @@ class DiscordReader:
             params["after"] = str(after_id)
 
         while True:
-            r = requests.get(
+            r = self._request_with_retry(
                 f"https://discord.com/api/v10/channels/{self.channel_id}/messages",
-                headers=self.headers,
-                params=params,
-                timeout=15,
+                params
             )
-            if r.status_code == 429:
-                retry = 5.0
-                try:
-                    retry = float((r.json() or {}).get("retry_after", 5))
-                except Exception:
-                    pass
-                time.sleep(retry + 0.25)
-                continue
             r.raise_for_status()
             page = r.json() or []
             collected.extend(page)
