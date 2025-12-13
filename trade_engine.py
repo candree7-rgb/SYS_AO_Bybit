@@ -454,6 +454,37 @@ class TradeEngine:
         self.bybit.set_trading_stop(body)
 
     # ---------- maintenance ----------
+    def check_tp_fills_fallback(self) -> None:
+        """Polling fallback: Check if TP1 was filled but WS missed it."""
+        if DRY_RUN:
+            return
+
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") != "open":
+                continue
+            if not tr.get("post_orders_placed"):
+                continue
+            if tr.get("sl_moved_to_be"):
+                continue  # Already moved
+
+            # Check if TP1 order still exists
+            tp1_oid = tr.get("tp1_order_id")
+            if not tp1_oid:
+                continue
+
+            try:
+                open_orders = self.bybit.open_orders(CATEGORY, tr["symbol"])
+                tp1_still_open = any(o.get("orderId") == tp1_oid for o in open_orders)
+
+                if not tp1_still_open:
+                    # TP1 was filled (or cancelled) - move SL to BE
+                    be = float(tr.get("entry_price") or tr.get("trigger"))
+                    if self._move_sl(tr["symbol"], be):
+                        tr["sl_moved_to_be"] = True
+                        self.log.info(f"✅ SL -> BE (poll fallback) {tr['symbol']} @ {be}")
+            except Exception as e:
+                self.log.debug(f"TP fill check failed for {tr['symbol']}: {e}")
+
     def cancel_expired_entries(self) -> None:
         now = time.time()
         for tid, tr in list(self.state.get("open_trades", {}).items()):

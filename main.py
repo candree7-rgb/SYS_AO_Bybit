@@ -64,7 +64,7 @@ def main():
 
     def on_ws_error(err):
         ws_err["err"] = err
-        log.warning(f"WS error: {err}")
+        log.debug(f"WS reconnecting: {err}")  # Normal, reduced to DEBUG
 
     def ws_loop():
         while True:
@@ -91,6 +91,7 @@ def main():
             # maintenance first
             engine.cancel_expired_entries()
             engine.cleanup_closed_trades()
+            engine.check_tp_fills_fallback()  # Catch TP1 fills if WS missed
 
             # entry-fill fallback (polling) and post-orders placement
             for tid, tr in list(st.get("open_trades", {}).items()):
