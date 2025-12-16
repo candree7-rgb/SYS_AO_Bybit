@@ -6,7 +6,8 @@ NUM = r"([0-9]+(?:\.[0-9]+)?)"
 
 RE_SYMBOL_SIDE = re.compile(r"\*\*([A-Z0-9]+)\*\*\s+(LONG|SHORT)\s+Signal", re.I)
 RE_ENTER_TRIGGER = re.compile(r"Enter\s+on\s+Trigger\s*:\s*`?\$?"+NUM+r"`?", re.I)
-RE_ENTRY = re.compile(r"\bEntry\s*:\s*`?\$?"+NUM+r"`?", re.I)
+# Support both: "Entry $0.08850" (header) and "**Entry:** `$0.08850000`" (body)
+RE_ENTRY = re.compile(r"(?:\*\*)?Entry:?(?:\*\*)?\s*`?\$?"+NUM+r"`?", re.I)
 
 RE_TP = re.compile(r"\*\*TP(\d+)\:\*\*\s*`?\$?"+NUM+r"`?", re.I)
 RE_DCA = re.compile(r"\*\*DCA\s*#?\s*(\d+)\:\*\*\s*`?\$?"+NUM+r"`?", re.I)
