@@ -7,7 +7,7 @@ import logging
 from config import (
     DISCORD_TOKEN, CHANNEL_ID,
     BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, RECV_WINDOW,
-    QUOTE,
+    CATEGORY, QUOTE, LEVERAGE, RISK_PCT,
     MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
     POLL_SECONDS, POLL_JITTER_MAX,
     STATE_FILE, DRY_RUN, LOG_LEVEL
@@ -49,9 +49,17 @@ def main():
     log.info("="*58)
     log.info("Discord → Bybit Bot (One-way)" + (" | DRY_RUN" if DRY_RUN else ""))
     log.info("="*58)
+    log.info(f"Config: CATEGORY={CATEGORY}, QUOTE={QUOTE}, LEVERAGE={LEVERAGE}x")
+    log.info(f"Config: RISK_PCT={RISK_PCT}%, MAX_CONCURRENT={MAX_CONCURRENT_TRADES}, MAX_DAILY={MAX_TRADES_PER_DAY}")
+    log.info(f"Config: POLL_SECONDS={POLL_SECONDS}, TC_MAX_LAG_SEC={TC_MAX_LAG_SEC}")
+    log.info(f"Config: DRY_RUN={DRY_RUN}, LOG_LEVEL={LOG_LEVEL}")
 
     # Startup sync - check for orphaned positions
     engine.startup_sync()
+
+    # Heartbeat tracking
+    last_heartbeat = time.time()
+    HEARTBEAT_INTERVAL = 300  # Log heartbeat every 5 minutes
 
     # ----- WS thread -----
     ws_err = {"err": None}
@@ -92,6 +100,12 @@ def main():
     # ----- main loop -----
     while True:
         try:
+            # Heartbeat log every 5 minutes
+            if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
+                active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending","open")]
+                log.info(f"💓 Heartbeat: {len(active)} active trade(s), {trades_today()} today")
+                last_heartbeat = time.time()
+
             # maintenance first
             engine.cancel_expired_entries()
             engine.cleanup_closed_trades()
@@ -120,7 +134,14 @@ def main():
             else:
                 # read discord
                 after = st.get("last_discord_id")
-                msgs = discord.fetch_after(after, limit=50)
+                log.debug(f"Polling Discord (after={after})...")
+                try:
+                    msgs = discord.fetch_after(after, limit=50)
+                except Exception as e:
+                    log.warning(f"Discord fetch failed: {e}")
+                    msgs = []
+
+                log.debug(f"Fetched {len(msgs)} message(s) from Discord")
                 msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id","0")))
                 max_seen = int(after or 0)
 
@@ -130,20 +151,34 @@ def main():
 
                     # ignore very old messages
                     ts = discord.message_timestamp_unix(m)
-                    if ts and (time.time() - ts) > TC_MAX_LAG_SEC:
+                    age = time.time() - ts if ts else 0
+                    if ts and age > TC_MAX_LAG_SEC:
+                        log.debug(f"Skipping old message (age={age:.0f}s > {TC_MAX_LAG_SEC}s)")
                         continue
 
                     txt = discord.extract_text(m)
                     if not txt:
+                        log.debug(f"Message {mid}: empty text, skipping")
                         continue
+
+                    # Log first 200 chars of message for debugging
+                    log.debug(f"Message {mid}: {txt[:200]}...")
 
                     sig = parse_signal(txt, quote=QUOTE)
                     if not sig:
+                        # Check if it looks like a signal but failed to parse
+                        if "SIGNAL" in txt.upper() or "ENTRY" in txt.upper():
+                            log.warning(f"⚠️ Possible signal NOT parsed: {txt[:300]}...")
+                        else:
+                            log.debug(f"Message {mid}: not a signal")
                         continue
+
+                    log.info(f"📨 Signal parsed: {sig['symbol']} {sig['side'].upper()} @ {sig['trigger']}")
 
                     sh = signal_hash(sig)
                     seen = set(st.get("seen_signal_hashes", []))
                     if sh in seen:
+                        log.debug(f"Signal {sig['symbol']} already seen, skipping")
                         continue
 
                     # mark seen early
@@ -151,8 +186,10 @@ def main():
                     st["seen_signal_hashes"] = list(seen)[-500:]
 
                     trade_id = f"{sig['symbol']}|{sig['side']}|{int(time.time())}"
+                    log.info(f"🔄 Placing entry order for {sig['symbol']}...")
                     oid = engine.place_conditional_entry(sig, trade_id)
                     if not oid:
+                        log.warning(f"❌ Entry order failed for {sig['symbol']}")
                         continue
 
                     # store trade
