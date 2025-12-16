@@ -247,9 +247,19 @@ class TradeEngine:
             self.log.info(f"DRY_RUN ENTRY {symbol}: {body}")
             return "DRY_RUN"
 
-        resp = self.bybit.place_order(body)
-        oid = (resp.get("result") or {}).get("orderId")
-        return oid
+        try:
+            self.log.debug(f"Bybit place_order request: {body}")
+            resp = self.bybit.place_order(body)
+            self.log.debug(f"Bybit place_order response: {resp}")
+            oid = (resp.get("result") or {}).get("orderId")
+            if oid:
+                self.log.info(f"✅ Bybit order created: {symbol} orderId={oid}")
+            else:
+                self.log.warning(f"⚠️ Bybit response has no orderId: {resp}")
+            return oid
+        except Exception as e:
+            self.log.error(f"❌ Bybit place_order FAILED for {symbol}: {e}")
+            return None
 
     def cancel_entry(self, symbol: str, order_id: str) -> None:
         body = {"category": CATEGORY, "symbol": symbol, "orderId": order_id}
