@@ -280,7 +280,10 @@ class TradeEngine:
         return tps
 
     def place_post_entry_orders(self, trade: Dict[str, Any]) -> None:
-        """Places SL + TP ladder + DCA conditionals after entry is filled."""
+        """Places SL + TP ladder + DCA conditionals after entry is filled.
+
+        OPTIMIZED: Gets position size first, then places SL + TPs + DCAs in parallel.
+        """
         symbol = trade["symbol"]
         side   = trade["order_side"]  # Buy/Sell
         entry  = float(trade["entry_price"])
@@ -292,32 +295,18 @@ class TradeEngine:
         qty_step = rules["qty_step"]
         min_qty = rules["min_qty"]
 
-        # ---- SL (position-level) ----
-        # ALWAYS use INITIAL_SL_PCT from config, ignore signal's SL
-        # (signal's SL might be breakeven or some other value we don't want)
-        sl_pct = INITIAL_SL_PCT / 100.0
-        sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
-        sl_price = self._round_price(sl_price, tick_size)
-        self.log.info(f"📍 SL set at {INITIAL_SL_PCT}% from entry: {sl_price}")
-
-        ts_body = {
-            "category": CATEGORY,
-            "symbol": symbol,
-            "positionIdx": 0,
-            "stopLoss": f"{sl_price:.10f}",
-            "tpslMode": "Full",
-        }
-        if DRY_RUN:
-            self.log.info(f"DRY_RUN set SL: {ts_body}")
-        else:
-            self.bybit.set_trading_stop(ts_body)
-
-        # ---- TP ladder (reduce-only LIMITs) ----
+        # ---- Get position size FIRST (needed for TP quantities) ----
         size, _avg = self.position_size_avg(symbol)
         if size <= 0:
             # sometimes position size appears a bit later; retry via main loop
             self.log.warning(f"No position size yet for {symbol}; will retry post-orders")
             return
+
+        # ---- Calculate SL price ----
+        sl_pct = INITIAL_SL_PCT / 100.0
+        sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
+        sl_price = self._round_price(sl_price, tick_size)
+        self.log.info(f"📍 SL at {INITIAL_SL_PCT}% from entry: {sl_price}")
 
         tp_prices: List[float] = trade.get("tp_prices") or []
         splits: List[float] = trade.get("tp_splits") or TP_SPLITS
@@ -386,8 +375,17 @@ class TradeEngine:
                 }
             })
 
-        # Place orders in parallel for speed
+        # Place SL + TPs + DCAs in parallel for speed
+        ts_body = {
+            "category": CATEGORY,
+            "symbol": symbol,
+            "positionIdx": 0,
+            "stopLoss": f"{sl_price:.10f}",
+            "tpslMode": "Full",
+        }
+
         if DRY_RUN:
+            self.log.info(f"DRY_RUN set SL: {ts_body}")
             for o in tp_orders:
                 self.log.info(f"DRY_RUN TP{o['idx']+1}: {o['body']}")
                 trade.setdefault("tp_order_ids", {})[str(o['idx']+1)] = f"DRY_TP{o['idx']+1}"
@@ -396,6 +394,7 @@ class TradeEngine:
             for o in dca_orders:
                 self.log.info(f"DRY_RUN DCA{o['idx']}: {o['body']}")
         else:
+            # Build list of all operations to run in parallel
             all_orders = [("TP", o) for o in tp_orders] + [("DCA", o) for o in dca_orders]
 
             def place_order(order_tuple):
@@ -403,9 +402,26 @@ class TradeEngine:
                 resp = self.bybit.place_order(o["body"])
                 return order_type, o["idx"], (resp.get("result") or {}).get("orderId")
 
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = [executor.submit(place_order, o) for o in all_orders]
-                for future in as_completed(futures):
+            def set_sl():
+                self.bybit.set_trading_stop(ts_body)
+                return "SL", 0, None
+
+            # Run SL + all orders in parallel (max 6 workers: 1 SL + 3 TPs + 2 DCAs)
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                # Submit SL first (highest priority)
+                sl_future = executor.submit(set_sl)
+                # Submit all TP and DCA orders
+                order_futures = [executor.submit(place_order, o) for o in all_orders]
+
+                # Wait for SL first
+                try:
+                    sl_future.result()
+                    self.log.info(f"✅ SL set successfully")
+                except Exception as e:
+                    self.log.warning(f"SL setting failed: {e}")
+
+                # Process order results
+                for future in as_completed(order_futures):
                     try:
                         order_type, idx, oid = future.result()
                         if order_type == "TP":
@@ -589,6 +605,8 @@ class TradeEngine:
             try:
                 size, _ = self.position_size_avg(tr["symbol"])
                 if size == 0:
+                    # Position closed - cancel all pending orders for this trade!
+                    self._cancel_all_trade_orders(tr)
                     tr["status"] = "closed"
                     tr["closed_ts"] = time.time()
                     self.log.info(f"✅ TRADE CLOSED {tr['symbol']} ({tid})")
@@ -602,3 +620,42 @@ class TradeEngine:
                 closed_at = tr.get("closed_ts") or tr.get("placed_ts") or 0
                 if closed_at < cutoff:
                     del self.state["open_trades"][tid]
+
+    def _cancel_all_trade_orders(self, trade: Dict[str, Any]) -> None:
+        """Cancel all pending DCA and TP orders for a closed trade."""
+        if DRY_RUN:
+            self.log.info(f"DRY_RUN: Would cancel orders for {trade['symbol']}")
+            return
+
+        symbol = trade["symbol"]
+        trade_id = trade["id"]
+
+        try:
+            # Get all open orders for this symbol
+            open_orders = self.bybit.open_orders(CATEGORY, symbol)
+
+            cancelled = 0
+            for order in open_orders:
+                link_id = order.get("orderLinkId") or ""
+                # Check if this order belongs to our trade (DCA or TP)
+                if link_id.startswith(trade_id + ":"):
+                    order_id = order.get("orderId")
+                    if order_id:
+                        try:
+                            self.bybit.cancel_order({
+                                "category": CATEGORY,
+                                "symbol": symbol,
+                                "orderId": order_id
+                            })
+                            cancelled += 1
+                            self.log.info(f"🗑️ Cancelled orphan order: {link_id}")
+                        except Exception as e:
+                            # Ignore "order not found" errors
+                            if "not found" not in str(e).lower():
+                                self.log.warning(f"Failed to cancel {link_id}: {e}")
+
+            if cancelled > 0:
+                self.log.info(f"🧹 Cleaned up {cancelled} pending order(s) for {symbol}")
+
+        except Exception as e:
+            self.log.warning(f"Failed to cleanup orders for {symbol}: {e}")
