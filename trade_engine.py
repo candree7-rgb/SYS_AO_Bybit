@@ -465,6 +465,12 @@ class TradeEngine:
                 tr.setdefault("tp_fills", 0)
                 tr.setdefault("tp_fills_list", [])
                 self.log.info(f"✅ ENTRY FILLED {tr['symbol']} @ {tr.get('entry_price')}")
+
+                # Place post-entry orders IMMEDIATELY (SL, TPs, DCAs)
+                try:
+                    self.place_post_entry_orders(tr)
+                except Exception as e:
+                    self.log.warning(f"Post-entry orders failed (will retry in main loop): {e}")
             return
 
         # DCA fills: orderLinkId pattern "<trade_id>:DCA1"
