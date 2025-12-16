@@ -64,10 +64,10 @@ class BybitV5:
     def wallet_equity(self, account_type: str = "UNIFIED") -> float:
         params = {"accountType": account_type}
         query_string = self._build_query_string(params)
+        # Use query string in URL (not params=) to ensure order matches signature
         r = requests.get(
-            f"{self.base}/v5/account/wallet-balance",
+            f"{self.base}/v5/account/wallet-balance?{query_string}",
             headers=self._headers(query_string),
-            params=params,
             timeout=15,
         )
         r.raise_for_status()
@@ -109,9 +109,8 @@ class BybitV5:
         params = {"category": category, "symbol": symbol}
         query_string = self._build_query_string(params)
         r = requests.get(
-            f"{self.base}/v5/order/realtime",
+            f"{self.base}/v5/order/realtime?{query_string}",
             headers=self._headers(query_string),
-            params=params,
             timeout=15,
         )
         r.raise_for_status()
@@ -124,9 +123,8 @@ class BybitV5:
             params["orderLinkId"] = order_link_id
         query_string = self._build_query_string(params)
         r = requests.get(
-            f"{self.base}/v5/order/history",
+            f"{self.base}/v5/order/history?{query_string}",
             headers=self._headers(query_string),
-            params=params,
             timeout=15,
         )
         r.raise_for_status()
@@ -141,9 +139,8 @@ class BybitV5:
         params["settleCoin"] = "USDT"  # Required for fetching all positions
         query_string = self._build_query_string(params)
         r = requests.get(
-            f"{self.base}/v5/position/list",
+            f"{self.base}/v5/position/list?{query_string}",
             headers=self._headers(query_string),
-            params=params,
             timeout=15,
         )
         r.raise_for_status()
@@ -154,7 +151,26 @@ class BybitV5:
         payload = json.dumps(body, separators=(",", ":"))
         r = requests.post(f"{self.base}/v5/position/trading-stop", headers=self._headers(payload), data=payload, timeout=15)
         r.raise_for_status()
-        return self._check(r.json())
+        data = r.json()
+        # 34040 = "not modified" - SL/TP already set to same value, ignore this
+        if data.get("retCode") == 34040:
+            return data
+        return self._check(data)
+
+    def closed_pnl(self, category: str, symbol: str, start_time: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get closed PnL records for a symbol."""
+        params = {"category": category, "symbol": symbol, "limit": limit}
+        if start_time:
+            params["startTime"] = start_time
+        query_string = self._build_query_string(params)
+        r = requests.get(
+            f"{self.base}/v5/position/closed-pnl?{query_string}",
+            headers=self._headers(query_string),
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = self._check(r.json())
+        return ((data.get("result") or {}).get("list") or [])
 
     # ---------- WebSocket (private executions & orders) ----------
     def run_private_ws(self, on_execution, on_order=None, on_error=None):
