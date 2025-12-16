@@ -293,12 +293,12 @@ class TradeEngine:
         min_qty = rules["min_qty"]
 
         # ---- SL (position-level) ----
-        sl_price = trade.get("sl_price")
-        if sl_price is None:
-            # Use configurable SL %
-            sl_pct = INITIAL_SL_PCT / 100.0
-            sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
-        sl_price = self._round_price(float(sl_price), tick_size)
+        # ALWAYS use INITIAL_SL_PCT from config, ignore signal's SL
+        # (signal's SL might be breakeven or some other value we don't want)
+        sl_pct = INITIAL_SL_PCT / 100.0
+        sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
+        sl_price = self._round_price(sl_price, tick_size)
+        self.log.info(f"📍 SL set at {INITIAL_SL_PCT}% from entry: {sl_price}")
 
         ts_body = {
             "category": CATEGORY,
@@ -333,6 +333,7 @@ class TradeEngine:
 
         # Build TP orders
         tp_to_place = min(len(tp_prices), len(splits))
+        self.log.info(f"📊 Placing {tp_to_place} TPs (splits: {splits[:tp_to_place]}, remaining {100-sum(splits[:tp_to_place]):.0f}% runner)")
         for idx in range(tp_to_place):
             pct = float(splits[idx])
             if pct <= 0:
@@ -358,6 +359,7 @@ class TradeEngine:
         # Build DCA orders
         dca_prices: List[float] = trade.get("dca_prices") or []
         dca_to_place = min(len(dca_prices), len(DCA_QTY_MULTS))
+        self.log.info(f"📊 Placing {dca_to_place} DCAs (mults: {DCA_QTY_MULTS[:dca_to_place]})")
         last = self.bybit.last_price(CATEGORY, symbol)
 
         for j in range(1, dca_to_place + 1):
