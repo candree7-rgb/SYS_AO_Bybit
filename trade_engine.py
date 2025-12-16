@@ -661,6 +661,10 @@ class TradeEngine:
                     # Fetch final PnL from Bybit
                     self._fetch_and_store_trade_stats(tr)
 
+                    # Export to Google Sheets IMMEDIATELY (not waiting for archive)
+                    if sheets_export.is_enabled():
+                        self._export_trade_to_sheets(tr)
+
                     self.log.info(f"✅ TRADE CLOSED {tr['symbol']} ({tid})")
             except Exception as e:
                 self.log.warning(f"Cleanup check failed for {tr['symbol']}: {e}")
@@ -713,6 +717,34 @@ class TradeEngine:
 
         except Exception as e:
             self.log.warning(f"Failed to cleanup orders for {symbol}: {e}")
+
+    def _export_trade_to_sheets(self, trade: Dict[str, Any]) -> None:
+        """Export trade to Google Sheets immediately after close."""
+        try:
+            export_data = {
+                "id": trade.get("id"),
+                "symbol": trade.get("symbol"),
+                "side": trade.get("pos_side"),
+                "entry_price": trade.get("entry_price"),
+                "trigger": trade.get("trigger"),
+                "placed_ts": trade.get("placed_ts"),
+                "filled_ts": trade.get("filled_ts"),
+                "closed_ts": trade.get("closed_ts"),
+                "realized_pnl": trade.get("realized_pnl"),
+                "is_win": trade.get("is_win"),
+                "exit_reason": trade.get("exit_reason"),
+                "tp_fills": trade.get("tp_fills", 0),
+                "tp_count": len(trade.get("tp_prices") or FALLBACK_TP_PCT),
+                "dca_fills": trade.get("dca_fills", 0),
+                "dca_count": len(DCA_QTY_MULTS),
+                "trailing_used": trade.get("trailing_started", False),
+            }
+            if sheets_export.export_trade(export_data):
+                self.log.info(f"📊 Trade exported to Google Sheets")
+            else:
+                self.log.warning(f"⚠️ Google Sheets export failed (check credentials)")
+        except Exception as e:
+            self.log.warning(f"Google Sheets export error: {e}")
 
     def _fetch_and_store_trade_stats(self, trade: Dict[str, Any]) -> None:
         """Fetch final PnL from Bybit and determine exit reason."""
@@ -824,9 +856,8 @@ class TradeEngine:
         }
         history.append(archived)
 
-        # Export to Google Sheets if configured
-        if sheets_export.is_enabled():
-            sheets_export.export_trade(archived)
+        # Note: Google Sheets export happens immediately at trade close,
+        # not here at archive time (to avoid 24h delay)
 
         # Keep max 500 trades in history (oldest pruned)
         if len(history) > 500:
