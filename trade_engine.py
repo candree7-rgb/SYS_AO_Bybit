@@ -3,6 +3,8 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
+import sheets_export
+
 from config import (
     CATEGORY, ACCOUNT_TYPE, QUOTE, LEVERAGE, RISK_PCT,
     ENTRY_EXPIRATION_MIN, ENTRY_TOO_FAR_PCT, ENTRY_TRIGGER_BUFFER_PCT, ENTRY_LIMIT_PRICE_OFFSET_PCT,
@@ -816,6 +818,10 @@ class TradeEngine:
         }
         history.append(archived)
 
+        # Export to Google Sheets if configured
+        if sheets_export.is_enabled():
+            sheets_export.export_trade(archived)
+
         # Keep max 500 trades in history (oldest pruned)
         if len(history) > 500:
             self.state["trade_history"] = history[-500:]
@@ -903,3 +909,7 @@ class TradeEngine:
 
         self.log.info("")
         self.log.info("=" * 60)
+
+        # Export stats to Google Sheets if configured
+        if sheets_export.is_enabled():
+            sheets_export.export_stats_summary(stats_7d, stats_30d, stats_all)
