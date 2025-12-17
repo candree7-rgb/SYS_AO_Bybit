@@ -6,7 +6,7 @@ import logging
 
 from config import (
     DISCORD_TOKEN, CHANNEL_ID,
-    BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, RECV_WINDOW,
+    BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_DEMO, RECV_WINDOW,
     CATEGORY, QUOTE, LEVERAGE, RISK_PCT,
     MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
     POLL_SECONDS, POLL_JITTER_MAX,
@@ -42,12 +42,15 @@ def main():
 
     st = load_state(STATE_FILE)
 
-    bybit = BybitV5(BYBIT_API_KEY, BYBIT_API_SECRET, testnet=BYBIT_TESTNET, recv_window=RECV_WINDOW)
+    bybit = BybitV5(BYBIT_API_KEY, BYBIT_API_SECRET, testnet=BYBIT_TESTNET, demo=BYBIT_DEMO, recv_window=RECV_WINDOW)
     discord = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
     engine = TradeEngine(bybit, st, log)
 
     log.info("="*58)
-    log.info("Discord → Bybit Bot (One-way)" + (" | DRY_RUN" if DRY_RUN else ""))
+    mode_str = " | DRY_RUN" if DRY_RUN else ""
+    mode_str += " | DEMO" if BYBIT_DEMO else ""
+    mode_str += " | TESTNET" if BYBIT_TESTNET else ""
+    log.info("Discord → Bybit Bot (One-way)" + mode_str)
     log.info("="*58)
     log.info(f"Config: CATEGORY={CATEGORY}, QUOTE={QUOTE}, LEVERAGE={LEVERAGE}x")
     log.info(f"Config: RISK_PCT={RISK_PCT}%, MAX_CONCURRENT={MAX_CONCURRENT_TRADES}, MAX_DAILY={MAX_TRADES_PER_DAY}")

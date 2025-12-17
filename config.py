@@ -23,6 +23,7 @@ CHANNEL_ID    = _get("CHANNEL_ID")
 BYBIT_API_KEY    = _get("BYBIT_API_KEY")
 BYBIT_API_SECRET = _get("BYBIT_API_SECRET")
 BYBIT_TESTNET    = _get_bool("BYBIT_TESTNET","false")
+BYBIT_DEMO       = _get_bool("BYBIT_DEMO","false")  # Demo trading (paper trading)
 ACCOUNT_TYPE     = _get("ACCOUNT_TYPE","UNIFIED")  # UNIFIED / CONTRACT etc (depends on your Bybit account)
 
 RECV_WINDOW = _get("RECV_WINDOW","5000")

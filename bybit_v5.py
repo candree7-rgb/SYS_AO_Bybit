@@ -7,12 +7,21 @@ import requests
 from websocket import WebSocketApp
 
 class BybitV5:
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False, recv_window: str = "5000"):
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = False, demo: bool = False, recv_window: str = "5000"):
         self.api_key = api_key
         self.api_secret = api_secret.encode()
         self.recv_window = str(recv_window)
-        self.base = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
-        self.ws   = "wss://stream-testnet.bybit.com/v5/private" if testnet else "wss://stream.bybit.com/v5/private"
+
+        # Demo trading uses different endpoints (paper trading on live market data)
+        if demo:
+            self.base = "https://api-demo.bybit.com"
+            self.ws   = "wss://stream-demo.bybit.com/v5/private"
+        elif testnet:
+            self.base = "https://api-testnet.bybit.com"
+            self.ws   = "wss://stream-testnet.bybit.com/v5/private"
+        else:
+            self.base = "https://api.bybit.com"
+            self.ws   = "wss://stream.bybit.com/v5/private"
 
     # ---------- signing ----------
     def _sign(self, ts: str, recv_window: str, payload: str) -> str:
