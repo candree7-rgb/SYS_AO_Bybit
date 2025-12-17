@@ -325,6 +325,16 @@ class TradeEngine:
             tp_prices = self._generate_fallback_tps(entry, side, tick_size)
             self.log.info(f"Using fallback TPs for {symbol}: {tp_prices}")
 
+        # Store original TP percentages for recalculation after DCA
+        tp_percentages = []
+        for tp in tp_prices:
+            if side == "Buy":  # Long: TP is above entry
+                pct = (float(tp) / entry - 1)
+            else:  # Short: TP is below entry
+                pct = (1 - float(tp) / entry)
+            tp_percentages.append(pct)
+        trade["tp_percentages"] = tp_percentages
+
         # Prepare all orders first, then place in parallel
         tp_orders = []
         dca_orders = []
@@ -442,6 +452,114 @@ class TradeEngine:
 
         trade["post_orders_placed"] = True
 
+    def _recalculate_tps_after_dca(self, trade: Dict[str, Any]) -> None:
+        """Recalculates and replaces unfilled TPs after DCA fill.
+
+        Uses Bybit's avgPrice (automatically calculated) and original TP percentages
+        to place new TPs at correct distances from the new average entry.
+        """
+        symbol = trade["symbol"]
+        side = trade["order_side"]
+
+        # Get new average entry from Bybit position
+        size, new_avg = self.position_size_avg(symbol)
+        if size <= 0 or new_avg <= 0:
+            self.log.warning(f"Cannot recalculate TPs: no position data for {symbol}")
+            return
+
+        # Get original TP percentages
+        tp_percentages = trade.get("tp_percentages", [])
+        if not tp_percentages:
+            self.log.debug(f"No TP percentages stored, cannot recalculate")
+            return
+
+        # Get unfilled TPs
+        filled_tps = trade.get("tp_fills_list", [])
+        tp_order_ids = trade.get("tp_order_ids", {})
+        splits = trade.get("tp_splits") or TP_SPLITS
+
+        # Get instrument rules
+        rules = self._get_instrument_rules(symbol)
+        tick_size = rules["tick_size"]
+        qty_step = rules["qty_step"]
+        min_qty = rules["min_qty"]
+
+        # Track version for unique orderLinkId (avoids conflicts)
+        tp_version = trade.get("tp_version", 1) + 1
+        trade["tp_version"] = tp_version
+
+        old_entry = trade.get("entry_price", new_avg)
+        self.log.info(f"🔄 Recalculating TPs: entry {old_entry:.4f} → avg {new_avg:.4f}")
+
+        # Calculate new TP prices and replace unfilled TPs
+        new_tp_prices = []
+        for i, pct in enumerate(tp_percentages):
+            tp_num = i + 1
+
+            # Calculate new TP price based on original percentage
+            if side == "Buy":  # Long
+                new_tp_price = new_avg * (1 + pct)
+            else:  # Short
+                new_tp_price = new_avg * (1 - pct)
+            new_tp_prices.append(new_tp_price)
+
+            # Skip already filled TPs
+            if tp_num in filled_tps:
+                continue
+
+            # Skip if no split for this TP
+            if i >= len(splits) or splits[i] <= 0:
+                continue
+
+            # Cancel existing TP order
+            old_order_id = tp_order_ids.get(str(tp_num))
+            if old_order_id:
+                try:
+                    self.bybit.cancel_order({
+                        "category": CATEGORY,
+                        "symbol": symbol,
+                        "orderId": old_order_id
+                    })
+                    self.log.debug(f"Cancelled old TP{tp_num} order {old_order_id}")
+                except Exception as e:
+                    self.log.debug(f"Failed to cancel TP{tp_num}: {e}")
+
+            # Place new TP order
+            new_tp = self._round_price(new_tp_price, tick_size)
+            qty = self._round_qty(size * (splits[i] / 100.0), qty_step, min_qty)
+
+            body = {
+                "category": CATEGORY,
+                "symbol": symbol,
+                "side": _opposite_side(side),
+                "orderType": "Limit",
+                "qty": f"{qty}",
+                "price": f"{new_tp:.10f}",
+                "timeInForce": "GTC",
+                "reduceOnly": True,
+                "closeOnTrigger": False,
+                "orderLinkId": f"{trade['id']}:TP{tp_num}v{tp_version}",
+            }
+
+            if DRY_RUN:
+                self.log.info(f"DRY_RUN new TP{tp_num}: {new_tp}")
+                continue
+
+            try:
+                resp = self.bybit.place_order(body)
+                new_oid = (resp.get("result") or {}).get("orderId")
+                if new_oid:
+                    tp_order_ids[str(tp_num)] = new_oid
+                    if tp_num == 1:
+                        trade["tp1_order_id"] = new_oid
+                    self.log.info(f"   TP{tp_num}: {new_tp:.4f} (was {tp_percentages[i]*100:+.2f}% from entry)")
+            except Exception as e:
+                self.log.warning(f"Failed to place new TP{tp_num}: {e}")
+
+        # Update trade's TP prices and average entry
+        trade["tp_prices"] = new_tp_prices
+        trade["avg_entry"] = new_avg
+
     # ---------- reactive events ----------
     def on_execution(self, ev: Dict[str, Any]) -> None:
         link = ev.get("orderLinkId") or ev.get("orderLinkID") or ""
@@ -491,6 +609,12 @@ class TradeEngine:
                     tr["dca_fills"] = len(filled_dcas)
                     dca_count = len(DCA_QTY_MULTS)
                     self.log.info(f"📈 DCA{dca_num} FILLED {tr['symbol']} ({tr['dca_fills']}/{dca_count})")
+
+                    # Recalculate TPs based on new average entry
+                    try:
+                        self._recalculate_tps_after_dca(tr)
+                    except Exception as e:
+                        self.log.warning(f"TP recalculation failed after DCA{dca_num}: {e}")
             return
 
         # TP fills / other events: orderLinkId pattern "<trade_id>:TP1"
@@ -517,9 +641,9 @@ class TradeEngine:
                 tp_count = len(tr.get("tp_prices") or FALLBACK_TP_PCT)
                 self.log.info(f"🎯 TP{tp_num} HIT {tr['symbol']} ({tr['tp_fills']}/{tp_count})")
 
-            # TP1 -> SL to BE
+            # TP1 -> SL to BE (use avg_entry if DCAs filled, otherwise entry_price)
             if MOVE_SL_TO_BE_ON_TP1 and tp_num == 1 and not tr.get("sl_moved_to_be"):
-                be = float(tr.get("entry_price") or tr.get("trigger"))
+                be = float(tr.get("avg_entry") or tr.get("entry_price") or tr.get("trigger"))
                 self._move_sl(tr["symbol"], be)
                 tr["sl_moved_to_be"] = True
                 self.log.info(f"✅ SL -> BE {tr['symbol']} @ {be}")
