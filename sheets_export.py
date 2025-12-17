@@ -136,9 +136,11 @@ def _trade_to_row(trade: Dict[str, Any]) -> List[Any]:
     margin_used = trade.get("margin_used", 0) or 0
     pnl_margin_pct = round((pnl / margin_used) * 100, 2) if margin_used > 0 else 0
 
-    # Calculate PnL % relative to total equity
-    equity = trade.get("equity_at_close", 0) or 0
-    pnl_equity_pct = round((pnl / equity) * 100, 4) if equity > 0 else 0
+    # Calculate PnL % relative to total equity BEFORE the trade
+    # equity_at_close already includes the PnL, so we subtract it to get equity before
+    equity_after = trade.get("equity_at_close", 0) or 0
+    equity_before = equity_after - pnl  # Equity before this trade's PnL
+    pnl_equity_pct = round((pnl / equity_before) * 100, 4) if equity_before > 0 else 0
 
     return [
         trade.get("id", ""),
@@ -152,7 +154,7 @@ def _trade_to_row(trade: Dict[str, Any]) -> List[Any]:
         duration_min,
         pnl,
         pnl_margin_pct,
-        equity,
+        equity_after,
         pnl_equity_pct,
         "WIN" if trade.get("is_win") else "LOSS",
         trade.get("exit_reason", "unknown"),
