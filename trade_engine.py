@@ -726,6 +726,13 @@ class TradeEngine:
             base_qty = trade.get("base_qty") or 0
             margin_used = (entry_price * base_qty) / LEVERAGE if entry_price and base_qty else 0
 
+            # Fetch current equity from Bybit for Equity PnL % calculation
+            equity_at_close = 0
+            try:
+                equity_at_close = self.bybit.wallet_equity(ACCOUNT_TYPE)
+            except Exception as e:
+                self.log.debug(f"Could not fetch equity: {e}")
+
             # TP count = how many we actually placed (limited by TP_SPLITS), not signal's TP count
             signal_tp_count = len(trade.get("tp_prices") or FALLBACK_TP_PCT)
             actual_tp_count = min(signal_tp_count, len(TP_SPLITS))
@@ -741,6 +748,7 @@ class TradeEngine:
                 "closed_ts": trade.get("closed_ts"),
                 "realized_pnl": trade.get("realized_pnl"),
                 "margin_used": margin_used,
+                "equity_at_close": equity_at_close,
                 "is_win": trade.get("is_win"),
                 "exit_reason": trade.get("exit_reason"),
                 "tp_fills": trade.get("tp_fills", 0),
