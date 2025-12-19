@@ -684,7 +684,16 @@ class TradeEngine:
         return False
 
     def _start_trailing(self, tr: Dict[str, Any], tp_num: int) -> None:
-        # Bybit trailingStop expects absolute distance (price units), so we convert percent -> price distance
+        """Start trailing stop after TPn is hit.
+
+        For Bybit V5:
+        - activePrice: price at which trailing activates
+        - trailingStop: distance to trail behind price
+
+        For SHORT: activePrice must be BELOW current price to activate later,
+                   OR we skip activePrice if price already passed the level.
+        For LONG: activePrice must be ABOVE current price to activate later.
+        """
         symbol = tr["symbol"]
         side = tr["order_side"]  # Buy/Sell
         tp_prices = tr.get("tp_prices") or []
@@ -692,38 +701,65 @@ class TradeEngine:
         rules = self._get_instrument_rules(symbol)
         tick_size = rules["tick_size"]
 
+        # Get current market price
+        current_price = self.bybit.last_price(CATEGORY, symbol)
+
         if len(tp_prices) < tp_num:
-            # fallback: use current market
-            anchor = self.bybit.last_price(CATEGORY, symbol)
+            anchor = current_price
         else:
             anchor = float(tp_prices[tp_num-1])
 
         anchor = self._round_price(anchor, tick_size)
         dist = self._round_price(anchor * (TRAIL_DISTANCE_PCT / 100.0), tick_size)
 
-        # activation price: anchor (TP level)
         body = {
             "category": CATEGORY,
             "symbol": symbol,
             "positionIdx": 0,
             "tpslMode": "Full",
-            "activePrice": f"{anchor:.10f}",
             "trailingStop": f"{dist:.10f}",
         }
 
+        # Only set activePrice if price hasn't already passed the activation level
+        # For SHORT: activePrice should be below current price (activate when dropping further)
+        # For LONG: activePrice should be above current price (activate when rising further)
+        if side == "Sell":  # SHORT
+            if anchor < current_price:
+                # Price hasn't reached anchor yet - set activation price
+                body["activePrice"] = f"{anchor:.10f}"
+            # else: price already at/past anchor - don't set activePrice, activate immediately
+        else:  # LONG
+            if anchor > current_price:
+                # Price hasn't reached anchor yet - set activation price
+                body["activePrice"] = f"{anchor:.10f}"
+            # else: price already at/past anchor - don't set activePrice, activate immediately
+
         # keep SL at BE if already moved; otherwise keep existing stopLoss unchanged
-        if tr.get("sl_moved_to_be") and tr.get("entry_price"):
-            be_price = self._round_price(float(tr['entry_price']), tick_size)
+        if tr.get("sl_moved_to_be"):
+            be_price = float(tr.get("avg_entry") or tr.get("entry_price") or tr.get("trigger"))
+            be_price = self._round_price(be_price, tick_size)
             body["stopLoss"] = f"{be_price:.10f}"
 
         if DRY_RUN:
             self.log.info(f"DRY_RUN set trailing: {body}")
             return
-        self.bybit.set_trading_stop(body)
+
+        try:
+            self.bybit.set_trading_stop(body)
+            self.log.info(f"🔄 Trailing started for {symbol} (dist: {dist})")
+        except Exception as e:
+            self.log.warning(f"Failed to set trailing for {symbol}: {e}")
 
     # ---------- maintenance ----------
     def check_tp_fills_fallback(self) -> None:
-        """Polling fallback: Check if TP1 was filled but WS missed it."""
+        """Polling fallback: Check if TP1 was filled OR price went through TP1 level.
+
+        This handles two scenarios:
+        1. TP1 order was filled but WebSocket missed the event
+        2. Price shot through TP1 so fast the limit order wasn't filled
+
+        In both cases, we should move SL to BE.
+        """
         if DRY_RUN:
             return
 
@@ -735,23 +771,52 @@ class TradeEngine:
             if tr.get("sl_moved_to_be"):
                 continue  # Already moved
 
-            # Check if TP1 order still exists
-            tp1_oid = tr.get("tp1_order_id")
-            if not tp1_oid:
+            symbol = tr["symbol"]
+            side = tr["order_side"]  # Buy/Sell
+            tp_prices = tr.get("tp_prices") or []
+
+            if not tp_prices:
                 continue
 
-            try:
-                open_orders = self.bybit.open_orders(CATEGORY, tr["symbol"])
-                tp1_still_open = any(o.get("orderId") == tp1_oid for o in open_orders)
+            tp1_price = float(tp_prices[0])
+            should_move_to_be = False
 
-                if not tp1_still_open:
-                    # TP1 was filled (or cancelled) - move SL to BE
-                    be = float(tr.get("entry_price") or tr.get("trigger"))
-                    if self._move_sl(tr["symbol"], be):
-                        tr["sl_moved_to_be"] = True
-                        self.log.info(f"✅ SL -> BE (poll fallback) {tr['symbol']} @ {be}")
-            except Exception as e:
-                self.log.debug(f"TP fill check failed for {tr['symbol']}: {e}")
+            # Check 1: Did TP1 order get filled?
+            tp1_oid = tr.get("tp1_order_id")
+            if tp1_oid:
+                try:
+                    open_orders = self.bybit.open_orders(CATEGORY, symbol)
+                    tp1_still_open = any(o.get("orderId") == tp1_oid for o in open_orders)
+                    if not tp1_still_open:
+                        should_move_to_be = True
+                        self.log.debug(f"TP1 order no longer open for {symbol}")
+                except Exception as e:
+                    self.log.debug(f"TP1 order check failed for {symbol}: {e}")
+
+            # Check 2: Did price go THROUGH TP1 level? (even if order wasn't filled)
+            if not should_move_to_be:
+                try:
+                    current_price = self.bybit.last_price(CATEGORY, symbol)
+                    if side == "Buy":  # LONG: TP1 is above entry
+                        if current_price >= tp1_price:
+                            should_move_to_be = True
+                            self.log.info(f"📈 Price passed TP1 level for {symbol} ({current_price} >= {tp1_price})")
+                    else:  # SHORT: TP1 is below entry
+                        if current_price <= tp1_price:
+                            should_move_to_be = True
+                            self.log.info(f"📉 Price passed TP1 level for {symbol} ({current_price} <= {tp1_price})")
+                except Exception as e:
+                    self.log.debug(f"Price check failed for {symbol}: {e}")
+
+            if should_move_to_be:
+                be = float(tr.get("avg_entry") or tr.get("entry_price") or tr.get("trigger"))
+                if self._move_sl(symbol, be):
+                    tr["sl_moved_to_be"] = True
+                    # Also track TP1 as filled if not already
+                    if 1 not in tr.get("tp_fills_list", []):
+                        tr.setdefault("tp_fills_list", []).append(1)
+                        tr["tp_fills"] = len(tr["tp_fills_list"])
+                    self.log.info(f"✅ SL -> BE (fallback) {symbol} @ {be}")
 
     def cancel_expired_entries(self) -> None:
         now = time.time()
