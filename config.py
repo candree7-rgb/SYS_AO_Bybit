@@ -80,3 +80,9 @@ POLL_JITTER_MAX = _get_int("POLL_JITTER_MAX","5")
 DRY_RUN     = _get_bool("DRY_RUN","true")
 STATE_FILE  = _get("STATE_FILE","state.json")
 LOG_LEVEL   = _get("LOG_LEVEL","INFO").upper()
+
+# Telegram Alerts
+TELEGRAM_BOT_TOKEN = _get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = _get("TELEGRAM_CHAT_ID")
+# Position P&L thresholds to trigger alerts (e.g., 25,35,50 = alert at -25%, -35%, -50%)
+POSITION_ALERT_THRESHOLDS = [float(x) for x in _get("POSITION_ALERT_THRESHOLDS", "25,35,50").split(",") if x.strip()]

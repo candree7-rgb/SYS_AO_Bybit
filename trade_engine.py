@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 import sheets_export
+import telegram_alerts
 
 from config import (
     CATEGORY, ACCOUNT_TYPE, QUOTE, LEVERAGE, RISK_PCT,
@@ -584,6 +585,14 @@ class TradeEngine:
                 tr.setdefault("tp_fills_list", [])
                 self.log.info(f"✅ ENTRY FILLED {tr['symbol']} @ {tr.get('entry_price')}")
 
+                # Send Telegram notification
+                telegram_alerts.send_trade_opened(
+                    symbol=tr["symbol"],
+                    side=tr["order_side"],
+                    entry=tr.get("entry_price", 0),
+                    qty=tr.get("base_qty", 0),
+                )
+
                 # Place post-entry orders IMMEDIATELY (SL, TPs, DCAs)
                 try:
                     self.place_post_entry_orders(tr)
@@ -834,6 +843,40 @@ class TradeEngine:
                         self.log.warning(f"Cancel failed {tr['symbol']} ({tid}): {e}")
                 tr["status"] = "expired"
 
+    def check_position_alerts(self) -> None:
+        """Check all open positions and send Telegram alerts if thresholds crossed."""
+        if not telegram_alerts.is_enabled():
+            return
+
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") != "open":
+                continue
+
+            symbol = tr["symbol"]
+            side = tr["order_side"]
+            avg_entry = float(tr.get("avg_entry") or tr.get("entry_price") or 0)
+
+            if not avg_entry:
+                continue
+
+            try:
+                current_price = self.bybit.last_price(CATEGORY, symbol)
+                if not current_price:
+                    continue
+
+                telegram_alerts.check_position_alerts(
+                    trade_id=tid,
+                    symbol=symbol,
+                    side=side,
+                    avg_entry=avg_entry,
+                    current_price=current_price,
+                    leverage=LEVERAGE,
+                    dca_fills=tr.get("dca_fills", 0),
+                    dca_count=len(DCA_QTY_MULTS),
+                )
+            except Exception as e:
+                self.log.debug(f"Position alert check failed for {symbol}: {e}")
+
     def cleanup_closed_trades(self) -> None:
         """Remove trades from state if position is closed (size = 0)."""
         for tid, tr in list(self.state.get("open_trades", {}).items()):
@@ -853,6 +896,17 @@ class TradeEngine:
                     # Export to Google Sheets IMMEDIATELY (not waiting for archive)
                     if sheets_export.is_enabled():
                         self._export_trade_to_sheets(tr)
+
+                    # Send Telegram notification
+                    telegram_alerts.send_trade_closed(
+                        symbol=tr["symbol"],
+                        side=tr["order_side"],
+                        pnl=tr.get("realized_pnl", 0),
+                        exit_reason=tr.get("exit_reason", "unknown"),
+                        tp_fills=tr.get("tp_fills", 0),
+                        dca_fills=tr.get("dca_fills", 0),
+                    )
+                    telegram_alerts.clear_alerts_for_trade(tid)
 
                     self.log.info(f"✅ TRADE CLOSED {tr['symbol']} ({tid})")
             except Exception as e:

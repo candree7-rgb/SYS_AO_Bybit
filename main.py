@@ -113,7 +113,8 @@ def main():
             engine.cancel_expired_entries()
             engine.cleanup_closed_trades()
             engine.check_tp_fills_fallback()  # Catch TP1 fills if WS missed
-            engine.log_daily_stats()  # Log stats once per day
+            engine.check_position_alerts()    # Send Telegram alerts if position P&L crosses thresholds
+            engine.log_daily_stats()          # Log stats once per day
 
             # entry-fill fallback (polling) and post-orders placement
             for tid, tr in list(st.get("open_trades", {}).items()):
