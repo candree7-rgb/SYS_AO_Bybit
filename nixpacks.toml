@@ -1,9 +1,13 @@
 # Railway Nixpacks configuration
+# Force rebuild: 2024-12-24-v2
 [phases.setup]
 nixPkgs = ["python310", "postgresql"]
 
 [phases.install]
-cmds = ["pip install --no-cache-dir -r requirements.txt"]
+cmds = [
+  "pip install --upgrade pip",
+  "pip install --no-cache-dir --force-reinstall -r requirements.txt"
+]
 
 [start]
-cmd = "python main.py"
+cmd = "python -u main.py"
