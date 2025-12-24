@@ -32,7 +32,7 @@ except ImportError:
     psycopg2 = None
     RealDictCursor = None
     SimpleConnectionPool = None
-    log.warning("psycopg2 not installed. Run: pip install psycopg2-binary")
+    # Don't log warning at import time - causes Railway build issues
 
 # Connection pool (singleton) - use comment-style type hint to avoid NameError
 _connection_pool = None  # type: Optional[SimpleConnectionPool]
@@ -342,4 +342,9 @@ def get_stats(days: Optional[int] = None) -> Dict[str, Any]:
 
 def is_enabled() -> bool:
     """Check if database export is configured."""
+    if not PSYCOPG2_AVAILABLE and os.getenv("DATABASE_URL"):
+        # Only warn once at runtime if DB is configured but psycopg2 missing
+        if not hasattr(is_enabled, '_warned'):
+            log.warning("DATABASE_URL set but psycopg2 not installed. Install with: pip install psycopg2-binary")
+            is_enabled._warned = True
     return bool(os.getenv("DATABASE_URL")) and PSYCOPG2_AVAILABLE
