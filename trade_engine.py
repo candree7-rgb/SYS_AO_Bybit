@@ -3,7 +3,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
-import sheets_export
+import db_export
 import telegram_alerts
 
 from config import (
@@ -893,9 +893,9 @@ class TradeEngine:
                     # Fetch final PnL from Bybit
                     self._fetch_and_store_trade_stats(tr)
 
-                    # Export to Google Sheets IMMEDIATELY (not waiting for archive)
-                    if sheets_export.is_enabled():
-                        self._export_trade_to_sheets(tr)
+                    # Export to Database IMMEDIATELY (not waiting for archive)
+                    if db_export.is_enabled():
+                        self._export_trade_to_db(tr)
 
                     # Send Telegram notification
                     telegram_alerts.send_trade_closed(
@@ -961,8 +961,8 @@ class TradeEngine:
         except Exception as e:
             self.log.warning(f"Failed to cleanup orders for {symbol}: {e}")
 
-    def _export_trade_to_sheets(self, trade: Dict[str, Any]) -> None:
-        """Export trade to Google Sheets immediately after close."""
+    def _export_trade_to_db(self, trade: Dict[str, Any]) -> None:
+        """Export trade to PostgreSQL database immediately after close."""
         try:
             # Calculate margin used for PnL % calculation
             entry_price = trade.get("entry_price") or trade.get("trigger") or 0
@@ -976,36 +976,16 @@ class TradeEngine:
             except Exception as e:
                 self.log.debug(f"Could not fetch equity: {e}")
 
-            # TP count = how many we actually placed (limited by TP_SPLITS), not signal's TP count
-            signal_tp_count = len(trade.get("tp_prices") or FALLBACK_TP_PCT)
-            actual_tp_count = min(signal_tp_count, len(TP_SPLITS))
+            # Add margin and equity to trade for export
+            trade["margin_used"] = margin_used
+            trade["equity_at_close"] = equity_at_close
 
-            export_data = {
-                "id": trade.get("id"),
-                "symbol": trade.get("symbol"),
-                "side": trade.get("pos_side"),
-                "entry_price": entry_price,
-                "trigger": trade.get("trigger"),
-                "placed_ts": trade.get("placed_ts"),
-                "filled_ts": trade.get("filled_ts"),
-                "closed_ts": trade.get("closed_ts"),
-                "realized_pnl": trade.get("realized_pnl"),
-                "margin_used": margin_used,
-                "equity_at_close": equity_at_close,
-                "is_win": trade.get("is_win"),
-                "exit_reason": trade.get("exit_reason"),
-                "tp_fills": trade.get("tp_fills", 0),
-                "tp_count": actual_tp_count,
-                "dca_fills": trade.get("dca_fills", 0),
-                "dca_count": len(DCA_QTY_MULTS),
-                "trailing_used": trade.get("trailing_started", False),
-            }
-            if sheets_export.export_trade(export_data):
-                self.log.info(f"📊 Trade exported to Google Sheets")
+            if db_export.export_trade(trade):
+                self.log.info(f"📊 Trade exported to database")
             else:
-                self.log.warning(f"⚠️ Google Sheets export failed (check credentials)")
+                self.log.warning(f"⚠️ Database export failed (check DATABASE_URL)")
         except Exception as e:
-            self.log.warning(f"Google Sheets export error: {e}")
+            self.log.warning(f"Database export error: {e}")
 
     def _fetch_and_store_trade_stats(self, trade: Dict[str, Any]) -> None:
         """Fetch final PnL from Bybit and determine exit reason."""
@@ -1214,6 +1194,18 @@ class TradeEngine:
         self.log.info("")
         self.log.info("=" * 60)
 
-        # Export stats to Google Sheets if configured
-        if sheets_export.is_enabled():
-            sheets_export.export_stats_summary(stats_7d, stats_30d, stats_all)
+        # Update daily equity snapshot
+        if db_export.is_enabled():
+            try:
+                equity = self.bybit.wallet_equity(ACCOUNT_TYPE)
+                # Count today's trades
+                from state import utc_day_key
+                today = utc_day_key()
+                today_trades = sum(1 for tr in self.state.get("open_trades", {}).values()
+                                 if utc_day_key(tr.get("closed_ts") or 0) == today)
+                today_wins = sum(1 for tr in self.state.get("open_trades", {}).values()
+                               if utc_day_key(tr.get("closed_ts") or 0) == today and tr.get("is_win"))
+                today_losses = today_trades - today_wins
+                db_export.update_daily_equity(equity, today_trades, today_wins, today_losses)
+            except Exception as e:
+                self.log.debug(f"Failed to update daily equity: {e}")

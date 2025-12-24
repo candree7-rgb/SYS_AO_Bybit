@@ -17,6 +17,7 @@ from discord_reader import DiscordReader
 from signal_parser import parse_signal, signal_hash
 from state import load_state, save_state, utc_day_key
 from trade_engine import TradeEngine
+import db_export
 
 def setup_logger() -> logging.Logger:
     log = logging.getLogger("bot")
@@ -56,6 +57,14 @@ def main():
     log.info(f"Config: RISK_PCT={RISK_PCT}%, MAX_CONCURRENT={MAX_CONCURRENT_TRADES}, MAX_DAILY={MAX_TRADES_PER_DAY}")
     log.info(f"Config: POLL_SECONDS={POLL_SECONDS}, TC_MAX_LAG_SEC={TC_MAX_LAG_SEC}")
     log.info(f"Config: DRY_RUN={DRY_RUN}, LOG_LEVEL={LOG_LEVEL}")
+
+    # Initialize database if enabled
+    if db_export.is_enabled():
+        log.info("📊 Initializing database...")
+        if db_export.init_database():
+            log.info("✅ Database ready")
+        else:
+            log.warning("⚠️ Database initialization failed (continuing without DB export)")
 
     # Startup sync - check for orphaned positions
     engine.startup_sync()
