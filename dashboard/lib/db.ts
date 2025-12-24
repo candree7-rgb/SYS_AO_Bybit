@@ -172,12 +172,13 @@ export async function getTPDistribution(): Promise<TPDistribution[]> {
   const client = await pool.connect();
   try {
     const result = await client.query(`
-      SELECT
-        generate_series(0, 3) as tp_level,
-        COUNT(CASE WHEN tp_fills >= generate_series THEN 1 END) as count
-      FROM trades
-      WHERE closed_at IS NOT NULL
-      GROUP BY tp_level
+      SELECT 0 as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= 0 AND closed_at IS NOT NULL
+      UNION ALL
+      SELECT 1 as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= 1 AND closed_at IS NOT NULL
+      UNION ALL
+      SELECT 2 as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= 2 AND closed_at IS NOT NULL
+      UNION ALL
+      SELECT 3 as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= 3 AND closed_at IS NOT NULL
       ORDER BY tp_level
     `);
     return result.rows;
@@ -190,12 +191,11 @@ export async function getDCADistribution(): Promise<DCADistribution[]> {
   const client = await pool.connect();
   try {
     const result = await client.query(`
-      SELECT
-        generate_series(0, 2) as dca_level,
-        COUNT(CASE WHEN dca_fills >= generate_series THEN 1 END) as count
-      FROM trades
-      WHERE closed_at IS NOT NULL
-      GROUP BY dca_level
+      SELECT 0 as dca_level, COUNT(*) as count FROM trades WHERE dca_fills >= 0 AND closed_at IS NOT NULL
+      UNION ALL
+      SELECT 1 as dca_level, COUNT(*) as count FROM trades WHERE dca_fills >= 1 AND closed_at IS NOT NULL
+      UNION ALL
+      SELECT 2 as dca_level, COUNT(*) as count FROM trades WHERE dca_fills >= 2 AND closed_at IS NOT NULL
       ORDER BY dca_level
     `);
     return result.rows;
