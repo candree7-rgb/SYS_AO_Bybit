@@ -1,0 +1,9 @@
+# Railway Nixpacks configuration
+[phases.setup]
+nixPkgs = ["python310", "postgresql"]
+
+[phases.install]
+cmds = ["pip install --no-cache-dir -r requirements.txt"]
+
+[start]
+cmd = "python main.py"
