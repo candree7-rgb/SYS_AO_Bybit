@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: 'standalone',
+  // Removed 'output: standalone' - not compatible with 'next start'
   experimental: {
     serverActions: {
       bodySizeLimit: '2mb',
