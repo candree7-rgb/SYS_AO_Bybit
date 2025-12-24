@@ -28,10 +28,14 @@ try:
     PSYCOPG2_AVAILABLE = True
 except ImportError:
     PSYCOPG2_AVAILABLE = False
+    # Set to None to avoid NameError in type hints
+    psycopg2 = None
+    RealDictCursor = None
+    SimpleConnectionPool = None
     log.warning("psycopg2 not installed. Run: pip install psycopg2-binary")
 
-# Connection pool (singleton)
-_connection_pool: Optional[SimpleConnectionPool] = None
+# Connection pool (singleton) - use comment-style type hint to avoid NameError
+_connection_pool = None  # type: Optional[SimpleConnectionPool]
 
 
 def _get_connection_pool():
