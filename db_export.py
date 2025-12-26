@@ -139,53 +139,108 @@ def export_trade(trade: Dict[str, Any]) -> bool:
         pnl_equity_pct = (pnl / equity_before) * 100 if equity_before > 0 else 0
 
         # TP count = how many we actually placed (limited by config)
-        from config import TP_SPLITS, DCA_QTY_MULTS
+        from config import TP_SPLITS, DCA_QTY_MULTS, BOT_ID
         signal_tp_count = len(trade.get("tp_prices") or [])
         actual_tp_count = min(signal_tp_count, len(TP_SPLITS)) if signal_tp_count else 3
 
+        # Add bot_id to trade (future-proof for multi-bot support)
+        bot_id = trade.get("bot_id", BOT_ID)
+
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO trades (
-                    id, symbol, side, order_side,
-                    entry_price, trigger_price, avg_entry,
-                    placed_at, filled_at, closed_at, duration_minutes,
-                    realized_pnl, pnl_pct_margin, pnl_pct_equity, margin_used, equity_at_close,
-                    is_win, exit_reason,
-                    tp_fills, tp_count, dca_fills, dca_count, trailing_used
-                ) VALUES (
-                    %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s,
-                    %s, %s,
-                    %s, %s, %s, %s, %s
-                )
-                ON CONFLICT (id) DO UPDATE SET
-                    closed_at = EXCLUDED.closed_at,
-                    duration_minutes = EXCLUDED.duration_minutes,
-                    realized_pnl = EXCLUDED.realized_pnl,
-                    pnl_pct_margin = EXCLUDED.pnl_pct_margin,
-                    pnl_pct_equity = EXCLUDED.pnl_pct_equity,
-                    equity_at_close = EXCLUDED.equity_at_close,
-                    is_win = EXCLUDED.is_win,
-                    exit_reason = EXCLUDED.exit_reason,
-                    tp_fills = EXCLUDED.tp_fills,
-                    dca_fills = EXCLUDED.dca_fills,
-                    trailing_used = EXCLUDED.trailing_used,
-                    avg_entry = EXCLUDED.avg_entry
-            """, (
-                trade.get("id"), trade.get("symbol"), trade.get("pos_side"), trade.get("order_side"),
-                trade.get("entry_price"), trade.get("trigger"), trade.get("avg_entry"),
-                _ts_to_datetime(trade.get("placed_ts")),
-                _ts_to_datetime(filled_ts),
-                _ts_to_datetime(closed_ts),
-                duration_min,
-                pnl, pnl_margin_pct, pnl_equity_pct, margin_used, equity_after,
-                trade.get("is_win", False), trade.get("exit_reason", "unknown"),
-                trade.get("tp_fills", 0), actual_tp_count,
-                trade.get("dca_fills", 0), len(DCA_QTY_MULTS),
-                trade.get("trailing_started", False)
-            ))
+            # Try to insert with bot_id column (new schema)
+            # Falls back gracefully if column doesn't exist yet (old schema)
+            try:
+                cur.execute("""
+                    INSERT INTO trades (
+                        id, symbol, side, order_side,
+                        entry_price, trigger_price, avg_entry,
+                        placed_at, filled_at, closed_at, duration_minutes,
+                        realized_pnl, pnl_pct_margin, pnl_pct_equity, margin_used, equity_at_close,
+                        is_win, exit_reason,
+                        tp_fills, tp_count, dca_fills, dca_count, trailing_used,
+                        bot_id
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        closed_at = EXCLUDED.closed_at,
+                        duration_minutes = EXCLUDED.duration_minutes,
+                        realized_pnl = EXCLUDED.realized_pnl,
+                        pnl_pct_margin = EXCLUDED.pnl_pct_margin,
+                        pnl_pct_equity = EXCLUDED.pnl_pct_equity,
+                        equity_at_close = EXCLUDED.equity_at_close,
+                        is_win = EXCLUDED.is_win,
+                        exit_reason = EXCLUDED.exit_reason,
+                        tp_fills = EXCLUDED.tp_fills,
+                        dca_fills = EXCLUDED.dca_fills,
+                        trailing_used = EXCLUDED.trailing_used,
+                        avg_entry = EXCLUDED.avg_entry,
+                        bot_id = EXCLUDED.bot_id
+                """, (
+                    trade.get("id"), trade.get("symbol"), trade.get("pos_side"), trade.get("order_side"),
+                    trade.get("entry_price"), trade.get("trigger"), trade.get("avg_entry"),
+                    _ts_to_datetime(trade.get("placed_ts")),
+                    _ts_to_datetime(filled_ts),
+                    _ts_to_datetime(closed_ts),
+                    duration_min,
+                    pnl, pnl_margin_pct, pnl_equity_pct, margin_used, equity_after,
+                    trade.get("is_win", False), trade.get("exit_reason", "unknown"),
+                    trade.get("tp_fills", 0), actual_tp_count,
+                    trade.get("dca_fills", 0), len(DCA_QTY_MULTS),
+                    trade.get("trailing_started", False),
+                    bot_id
+                ))
+            except psycopg2.errors.UndefinedColumn:
+                # Column doesn't exist yet - fall back to old schema without bot_id
+                log.debug("bot_id column not found, using legacy schema (run migration to add bot_id support)")
+                cur.execute("""
+                    INSERT INTO trades (
+                        id, symbol, side, order_side,
+                        entry_price, trigger_price, avg_entry,
+                        placed_at, filled_at, closed_at, duration_minutes,
+                        realized_pnl, pnl_pct_margin, pnl_pct_equity, margin_used, equity_at_close,
+                        is_win, exit_reason,
+                        tp_fills, tp_count, dca_fills, dca_count, trailing_used
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        closed_at = EXCLUDED.closed_at,
+                        duration_minutes = EXCLUDED.duration_minutes,
+                        realized_pnl = EXCLUDED.realized_pnl,
+                        pnl_pct_margin = EXCLUDED.pnl_pct_margin,
+                        pnl_pct_equity = EXCLUDED.pnl_pct_equity,
+                        equity_at_close = EXCLUDED.equity_at_close,
+                        is_win = EXCLUDED.is_win,
+                        exit_reason = EXCLUDED.exit_reason,
+                        tp_fills = EXCLUDED.tp_fills,
+                        dca_fills = EXCLUDED.dca_fills,
+                        trailing_used = EXCLUDED.trailing_used,
+                        avg_entry = EXCLUDED.avg_entry
+                """, (
+                    trade.get("id"), trade.get("symbol"), trade.get("pos_side"), trade.get("order_side"),
+                    trade.get("entry_price"), trade.get("trigger"), trade.get("avg_entry"),
+                    _ts_to_datetime(trade.get("placed_ts")),
+                    _ts_to_datetime(filled_ts),
+                    _ts_to_datetime(closed_ts),
+                    duration_min,
+                    pnl, pnl_margin_pct, pnl_equity_pct, margin_used, equity_after,
+                    trade.get("is_win", False), trade.get("exit_reason", "unknown"),
+                    trade.get("tp_fills", 0), actual_tp_count,
+                    trade.get("dca_fills", 0), len(DCA_QTY_MULTS),
+                    trade.get("trailing_started", False)
+                ))
             conn.commit()
             log.info(f"Exported trade {trade.get('id')} to database")
             return True
