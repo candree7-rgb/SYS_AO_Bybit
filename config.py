@@ -27,7 +27,7 @@ BYBIT_DEMO       = _get_bool("BYBIT_DEMO","false")  # Demo trading (paper tradin
 ACCOUNT_TYPE     = _get("ACCOUNT_TYPE","UNIFIED")  # UNIFIED / CONTRACT etc (depends on your Bybit account)
 
 # Bot identification (for multi-bot dashboard support)
-BOT_ID = _get("BOT_ID", "main")  # Unique identifier for this bot instance
+BOT_ID = _get("BOT_ID", "ao")  # Unique identifier for this bot instance
 
 RECV_WINDOW = _get("RECV_WINDOW","5000")
 

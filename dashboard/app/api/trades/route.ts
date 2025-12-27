@@ -6,8 +6,9 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const limit = parseInt(searchParams.get('limit') || '100');
     const offset = parseInt(searchParams.get('offset') || '0');
+    const botId = searchParams.get('botId') || undefined;
 
-    const trades = await getTrades(limit, offset);
+    const trades = await getTrades(limit, offset, botId);
     return NextResponse.json(trades);
   } catch (error) {
     console.error('Failed to fetch trades:', error);
