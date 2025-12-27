@@ -89,6 +89,22 @@ def init_database() -> bool:
 
     try:
         with conn.cursor() as cur:
+            # First, run migration to add bot_id column if table already exists
+            migration_sql = """
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'trades') THEN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name = 'trades' AND column_name = 'bot_id') THEN
+                        ALTER TABLE trades ADD COLUMN bot_id VARCHAR(50) DEFAULT 'ao';
+                        CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id);
+                    END IF;
+                END IF;
+            END $$;
+            """
+            cur.execute(migration_sql)
+            conn.commit()
+
             # Read schema file
             schema_path = os.path.join(os.path.dirname(__file__), "database", "schema.sql")
             if not os.path.exists(schema_path):
