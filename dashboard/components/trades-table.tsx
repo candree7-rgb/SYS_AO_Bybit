@@ -4,7 +4,11 @@ import { useEffect, useState } from 'react';
 import { Trade } from '@/lib/db';
 import { formatCurrency, formatDate, formatDuration, cn } from '@/lib/utils';
 
-export default function TradesTable() {
+interface TradesTableProps {
+  botId?: string;
+}
+
+export default function TradesTable({ botId }: TradesTableProps) {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [loading, setLoading] = useState(true);
   const [sortField, setSortField] = useState<keyof Trade>('closed_at');
@@ -13,7 +17,10 @@ export default function TradesTable() {
   useEffect(() => {
     async function fetchTrades() {
       try {
-        const res = await fetch('/api/trades?limit=50');
+        const params = new URLSearchParams({ limit: '50' });
+        if (botId) params.append('botId', botId);
+
+        const res = await fetch(`/api/trades?${params.toString()}`);
         const data = await res.json();
         setTrades(data);
       } catch (error) {
@@ -26,7 +33,7 @@ export default function TradesTable() {
     fetchTrades();
     const interval = setInterval(fetchTrades, 30000); // Refresh every 30s
     return () => clearInterval(interval);
-  }, []);
+  }, [botId]);
 
   const handleSort = (field: keyof Trade) => {
     if (sortField === field) {

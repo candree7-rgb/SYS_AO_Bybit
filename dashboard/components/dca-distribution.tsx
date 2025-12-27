@@ -4,14 +4,22 @@ import { useEffect, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import { DCADistribution } from '@/lib/db';
 
-export default function DCADistributionChart() {
+interface DCADistributionChartProps {
+  botId?: string;
+}
+
+export default function DCADistributionChart({ botId }: DCADistributionChartProps) {
   const [data, setData] = useState<DCADistribution[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     async function fetchData() {
       try {
-        const res = await fetch('/api/dca-distribution');
+        const params = new URLSearchParams();
+        if (botId) params.append('botId', botId);
+
+        const url = `/api/dca-distribution${params.toString() ? `?${params.toString()}` : ''}`;
+        const res = await fetch(url);
         const distribution = await res.json();
         setData(distribution);
       } catch (error) {
@@ -24,7 +32,7 @@ export default function DCADistributionChart() {
     fetchData();
     const interval = setInterval(fetchData, 60000); // Refresh every 60s
     return () => clearInterval(interval);
-  }, []);
+  }, [botId]);
 
   if (loading) {
     return (

@@ -6,16 +6,21 @@ import { formatCurrency, formatPercent } from '@/lib/utils';
 
 interface StatsCardsProps {
   period?: number; // days, undefined = all time
+  botId?: string;
 }
 
-export default function StatsCards({ period }: StatsCardsProps) {
+export default function StatsCards({ period, botId }: StatsCardsProps) {
   const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     async function fetchStats() {
       try {
-        const url = period ? `/api/stats?days=${period}` : '/api/stats';
+        const params = new URLSearchParams();
+        if (period) params.append('days', period.toString());
+        if (botId) params.append('botId', botId);
+
+        const url = `/api/stats${params.toString() ? `?${params.toString()}` : ''}`;
         const res = await fetch(url);
         const data = await res.json();
         setStats(data);
@@ -29,7 +34,7 @@ export default function StatsCards({ period }: StatsCardsProps) {
     fetchStats();
     const interval = setInterval(fetchStats, 30000); // Refresh every 30s
     return () => clearInterval(interval);
-  }, [period]);
+  }, [period, botId]);
 
   if (loading) {
     return (

@@ -32,6 +32,7 @@ export interface Trade {
   dca_fills: number;
   dca_count: number;
   trailing_used: boolean;
+  bot_id: string;
   created_at: Date;
   updated_at: Date;
 }
@@ -76,15 +77,23 @@ export interface DCADistribution {
   count: number;
 }
 
-export async function getTrades(limit: number = 100, offset: number = 0): Promise<Trade[]> {
+export async function getTrades(limit: number = 100, offset: number = 0, botId?: string): Promise<Trade[]> {
   const client = await pool.connect();
   try {
-    const result = await client.query(
-      `SELECT * FROM trades
-       ORDER BY closed_at DESC NULLS LAST, placed_at DESC
-       LIMIT $1 OFFSET $2`,
-      [limit, offset]
-    );
+    let query = `SELECT * FROM trades`;
+    const params: any[] = [];
+
+    if (botId) {
+      query += ` WHERE bot_id = $1`;
+      params.push(botId);
+      query += ` ORDER BY closed_at DESC NULLS LAST, placed_at DESC LIMIT $2 OFFSET $3`;
+      params.push(limit, offset);
+    } else {
+      query += ` ORDER BY closed_at DESC NULLS LAST, placed_at DESC LIMIT $1 OFFSET $2`;
+      params.push(limit, offset);
+    }
+
+    const result = await client.query(query, params);
     return result.rows;
   } finally {
     client.release();
@@ -106,7 +115,7 @@ export async function getDailyEquity(days: number = 30): Promise<DailyEquity[]> 
   }
 }
 
-export async function getStats(days?: number): Promise<Stats> {
+export async function getStats(days?: number, botId?: string): Promise<Stats> {
   const client = await pool.connect();
   try {
     let query = `
@@ -128,8 +137,15 @@ export async function getStats(days?: number): Promise<Stats> {
       FROM trades
     `;
 
+    const conditions: string[] = [];
     if (days) {
-      query += ` WHERE closed_at >= NOW() - INTERVAL '${days} days'`;
+      conditions.push(`closed_at >= NOW() - INTERVAL '${days} days'`);
+    }
+    if (botId) {
+      conditions.push(`bot_id = '${botId}'`);
+    }
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(' AND ')}`;
     }
 
     const result = await client.query(query);
@@ -183,15 +199,19 @@ export async function getStats(days?: number): Promise<Stats> {
   }
 }
 
-export async function getTPDistribution(): Promise<TPDistribution[]> {
+export async function getTPDistribution(tpCount: number = 3, botId?: string): Promise<TPDistribution[]> {
   const client = await pool.connect();
   try {
+    const botFilter = botId ? `AND bot_id = '${botId}'` : '';
+
+    // Build dynamic query based on tpCount
+    const queries: string[] = [];
+    for (let i = 1; i <= tpCount; i++) {
+      queries.push(`SELECT ${i} as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= ${i} AND closed_at IS NOT NULL ${botFilter}`);
+    }
+
     const result = await client.query(`
-      SELECT 1 as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= 1 AND closed_at IS NOT NULL
-      UNION ALL
-      SELECT 2 as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= 2 AND closed_at IS NOT NULL
-      UNION ALL
-      SELECT 3 as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= 3 AND closed_at IS NOT NULL
+      ${queries.join(' UNION ALL ')}
       ORDER BY tp_level
     `);
     return result.rows;
@@ -200,15 +220,19 @@ export async function getTPDistribution(): Promise<TPDistribution[]> {
   }
 }
 
-export async function getDCADistribution(): Promise<DCADistribution[]> {
+export async function getDCADistribution(dcaCount: number = 2, botId?: string): Promise<DCADistribution[]> {
   const client = await pool.connect();
   try {
+    const botFilter = botId ? `AND bot_id = '${botId}'` : '';
+
+    // Build dynamic query based on dcaCount
+    const queries: string[] = [];
+    for (let i = 0; i <= dcaCount; i++) {
+      queries.push(`SELECT ${i} as dca_level, COUNT(*) as count FROM trades WHERE dca_fills >= ${i} AND closed_at IS NOT NULL ${botFilter}`);
+    }
+
     const result = await client.query(`
-      SELECT 0 as dca_level, COUNT(*) as count FROM trades WHERE dca_fills >= 0 AND closed_at IS NOT NULL
-      UNION ALL
-      SELECT 1 as dca_level, COUNT(*) as count FROM trades WHERE dca_fills >= 1 AND closed_at IS NOT NULL
-      UNION ALL
-      SELECT 2 as dca_level, COUNT(*) as count FROM trades WHERE dca_fills >= 2 AND closed_at IS NOT NULL
+      ${queries.join(' UNION ALL ')}
       ORDER BY dca_level
     `);
     return result.rows;

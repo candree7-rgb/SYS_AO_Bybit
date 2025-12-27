@@ -1,9 +1,14 @@
 import { NextResponse } from 'next/server';
 import { getTPDistribution } from '@/lib/db';
+import { getBotConfig } from '@/lib/bot-config';
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
-    const distribution = await getTPDistribution();
+    const { searchParams } = new URL(request.url);
+    const botId = searchParams.get('botId') || 'main';
+    const config = getBotConfig(botId);
+
+    const distribution = await getTPDistribution(config.tpCount, botId);
     return NextResponse.json(distribution);
   } catch (error) {
     console.error('Failed to fetch TP distribution:', error);
