@@ -1010,7 +1010,7 @@ class TradeEngine:
                     total_pnl += float(rec.get("closedPnl") or 0)
 
             trade["realized_pnl"] = total_pnl
-            trade["is_win"] = total_pnl > 0
+            trade["is_win"] = total_pnl >= 0  # Breakeven counts as win
 
             # Determine exit reason based on what happened
             trade["exit_reason"] = self._determine_exit_reason(trade)
@@ -1057,7 +1057,7 @@ class TradeEngine:
         tp_count = min(signal_tp_count, len(TP_SPLITS))
         dca_fills = trade.get("dca_fills", 0)
         dca_count = len(DCA_QTY_MULTS)
-        is_win = pnl > 0
+        is_win = pnl >= 0  # Breakeven counts as win
 
         emoji = "🟢" if is_win else "🔴"
         result = "WIN" if is_win else "LOSS"
