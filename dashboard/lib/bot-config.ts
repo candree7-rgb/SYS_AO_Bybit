@@ -9,6 +9,15 @@ export interface BotConfig {
 }
 
 export const BOT_CONFIGS: Record<string, BotConfig> = {
+  all: {
+    id: 'all',
+    name: 'All Bots',
+    description: 'Combined performance across all strategies',
+    tpCount: 5,  // Max for display purposes
+    dcaCount: 2, // Max for display purposes
+    hasTrailing: true,
+    hasBreakeven: true,
+  },
   ao: {
     id: 'ao',
     name: 'AO Bot',

@@ -5,10 +5,12 @@ import { getBotConfig } from '@/lib/bot-config';
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
-    const botId = searchParams.get('botId') || 'ao';
+    const botId = searchParams.get('botId') || 'all';
     const config = getBotConfig(botId);
 
-    const distribution = await getTPDistribution(config.tpCount, botId);
+    // When showing "all" bots, don't filter by botId in the query
+    const filterBotId = botId === 'all' ? undefined : botId;
+    const distribution = await getTPDistribution(config.tpCount, filterBotId);
     return NextResponse.json(distribution);
   } catch (error) {
     console.error('Failed to fetch TP distribution:', error);

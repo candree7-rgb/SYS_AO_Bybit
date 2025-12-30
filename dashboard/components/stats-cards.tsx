@@ -18,7 +18,7 @@ export default function StatsCards({ period, botId }: StatsCardsProps) {
       try {
         const params = new URLSearchParams();
         if (period) params.append('days', period.toString());
-        if (botId) params.append('botId', botId);
+        if (botId && botId !== 'all') params.append('botId', botId);
 
         const url = `/api/stats${params.toString() ? `?${params.toString()}` : ''}`;
         const res = await fetch(url);

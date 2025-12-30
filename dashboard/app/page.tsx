@@ -10,7 +10,7 @@ import BotTabs from '@/components/bot-tabs';
 import { getBotConfig } from '@/lib/bot-config';
 
 export default function Dashboard() {
-  const [selectedBot, setSelectedBot] = useState<string>('ao');
+  const [selectedBot, setSelectedBot] = useState<string>('all');
   const botConfig = getBotConfig(selectedBot);
 
   return (

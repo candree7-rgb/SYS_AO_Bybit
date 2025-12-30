@@ -18,7 +18,7 @@ export default function TradesTable({ botId }: TradesTableProps) {
     async function fetchTrades() {
       try {
         const params = new URLSearchParams({ limit: '50' });
-        if (botId) params.append('botId', botId);
+        if (botId && botId !== 'all') params.append('botId', botId);
 
         const res = await fetch(`/api/trades?${params.toString()}`);
         const data = await res.json();

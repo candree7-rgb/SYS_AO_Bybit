@@ -201,6 +201,14 @@ class TradeEngine:
         side   = "Sell" if sig["side"] == "sell" else "Buy"
         trigger = float(sig["trigger"])
 
+        # Symbol Locking: Check if another bot is already trading this symbol
+        if db_export.is_enabled():
+            active_trade = db_export.get_active_trade_for_symbol(symbol)
+            if active_trade and active_trade.get("bot_id") != BOT_ID:
+                other_bot = active_trade.get("bot_id")
+                self.log.info(f"⏭️  SKIP {symbol} – already managed by bot '{other_bot}' (symbol locked)")
+                return None
+
         # ensure leverage set
         try:
             if not DRY_RUN:
