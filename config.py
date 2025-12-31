@@ -52,6 +52,7 @@ ENTRY_EXPIRATION_PRICE_PCT   = _get_float("ENTRY_EXPIRATION_PRICE_PCT","0.6")
 
 # TP/SL
 MOVE_SL_TO_BE_ON_TP1 = _get_bool("MOVE_SL_TO_BE_ON_TP1","true")
+BREAKEVEN_PROFIT_BUFFER_PCT = _get_float("BREAKEVEN_PROFIT_BUFFER_PCT","0.1")  # Profit buffer when moving SL to BE (to cover fees)
 INITIAL_SL_PCT = _get_float("INITIAL_SL_PCT","19.0")  # SL distance from entry in %
 
 # TP_SPLITS: percentage of position to close at each TP level

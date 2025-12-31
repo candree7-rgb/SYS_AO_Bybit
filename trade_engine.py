@@ -11,7 +11,7 @@ from config import (
     ENTRY_EXPIRATION_MIN, ENTRY_TOO_FAR_PCT, ENTRY_TRIGGER_BUFFER_PCT, ENTRY_LIMIT_PRICE_OFFSET_PCT,
     ENTRY_EXPIRATION_PRICE_PCT,
     TP_SPLITS, DCA_QTY_MULTS, INITIAL_SL_PCT, FALLBACK_TP_PCT,
-    MOVE_SL_TO_BE_ON_TP1,
+    MOVE_SL_TO_BE_ON_TP1, BREAKEVEN_PROFIT_BUFFER_PCT,
     TRAIL_AFTER_TP_INDEX, TRAIL_DISTANCE_PCT, TRAIL_ACTIVATE_ON_TP,
     DRY_RUN
 )
@@ -661,9 +661,17 @@ class TradeEngine:
             # TP1 -> SL to BE (use avg_entry if DCAs filled, otherwise entry_price)
             if MOVE_SL_TO_BE_ON_TP1 and tp_num == 1 and not tr.get("sl_moved_to_be"):
                 be = float(tr.get("avg_entry") or tr.get("entry_price") or tr.get("trigger"))
-                self._move_sl(tr["symbol"], be)
+
+                # Add profit buffer to cover fees (Long: +buffer, Short: -buffer)
+                side = tr["order_side"]  # Buy or Sell
+                if side == "Buy":
+                    be_with_buffer = be * (1 + BREAKEVEN_PROFIT_BUFFER_PCT / 100.0)
+                else:  # Sell
+                    be_with_buffer = be * (1 - BREAKEVEN_PROFIT_BUFFER_PCT / 100.0)
+
+                self._move_sl(tr["symbol"], be_with_buffer)
                 tr["sl_moved_to_be"] = True
-                self.log.info(f"✅ SL -> BE {tr['symbol']} @ {be}")
+                self.log.info(f"✅ SL -> BE+buffer {tr['symbol']} @ {be_with_buffer:.6f} (entry: {be:.6f}, buffer: {BREAKEVEN_PROFIT_BUFFER_PCT}%)")
 
             # start trailing after TPn
             if TRAIL_ACTIVATE_ON_TP and tp_num == TRAIL_AFTER_TP_INDEX and not tr.get("trailing_started"):
