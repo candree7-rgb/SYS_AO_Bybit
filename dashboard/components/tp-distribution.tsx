@@ -54,11 +54,19 @@ export default function TPDistributionChart({ botId }: TPDistributionChartProps)
     );
   }
 
-  const chartData = data.map(d => ({
-    level: `TP${d.tp_level}`,
-    count: parseInt(d.count.toString()),
-    fill: getTPColor(d.tp_level),
-  }));
+  // Total trades = TP1 count (all trades reach at least entry)
+  const totalTrades = data.length > 0 ? parseInt(data[0].count.toString()) : 1;
+
+  const chartData = data.map(d => {
+    const count = parseInt(d.count.toString());
+    const percentage = totalTrades > 0 ? (count / totalTrades) * 100 : 0;
+    return {
+      level: `TP${d.tp_level}`,
+      count,
+      percentage: parseFloat(percentage.toFixed(1)),
+      fill: getTPColor(d.tp_level),
+    };
+  });
 
   const maxCount = Math.max(...chartData.map(d => d.count));
 
@@ -104,8 +112,9 @@ export default function TPDistributionChart({ botId }: TPDistributionChartProps)
           <div key={d.level} className="text-center">
             <div className="text-xs text-muted-foreground mb-1">{d.level}</div>
             <div className="text-2xl font-bold" style={{ color: d.fill }}>
-              {d.count}
+              {d.percentage}%
             </div>
+            <div className="text-xs text-muted-foreground">{d.count} trades</div>
           </div>
         ))}
       </div>
@@ -132,6 +141,9 @@ function CustomTooltip({ active, payload }: any) {
       <p className="text-sm font-semibold mb-1">{data.level}</p>
       <p className="text-sm text-foreground">
         Reached: <span className="font-bold">{data.count}</span> times
+      </p>
+      <p className="text-sm text-muted-foreground">
+        {data.percentage}% of all trades
       </p>
     </div>
   );
