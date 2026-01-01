@@ -74,17 +74,29 @@ export default function EquityChart({ botId = 'all' }: EquityChartProps) {
 
   return (
     <div className="bg-card border border-border rounded-lg p-6">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-4">
+      <div className="flex flex-col gap-4 mb-6">
+        {/* Header with Title and Time Range Selector */}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <h2 className="text-xl font-bold">Equity Curve</h2>
           <TimeRangeSelector selected={timeRange} onSelect={setTimeRange} />
         </div>
-        <div className="text-right">
-          <div className="text-2xl font-bold text-foreground">
-            {formatCurrency(currentEquity)}
+
+        {/* Equity Stats */}
+        <div className="flex items-center justify-between p-4 bg-muted/50 rounded-lg">
+          <div>
+            <div className="text-sm text-muted-foreground mb-1">Current Equity</div>
+            <div className="text-3xl font-bold text-foreground">
+              {formatCurrency(currentEquity)}
+            </div>
           </div>
-          <div className={`text-sm ${totalPnL >= 0 ? 'text-success' : 'text-danger'}`}>
-            {totalPnL >= 0 ? '+' : ''}{formatCurrency(totalPnL)} ({totalPnLPct >= 0 ? '+' : ''}{totalPnLPct.toFixed(2)}%)
+          <div className="text-right">
+            <div className="text-sm text-muted-foreground mb-1">{timeRange} Performance</div>
+            <div className={`text-2xl font-bold ${totalPnL >= 0 ? 'text-success' : 'text-danger'}`}>
+              {totalPnL >= 0 ? '+' : ''}{formatCurrency(totalPnL)}
+            </div>
+            <div className={`text-sm ${totalPnL >= 0 ? 'text-success' : 'text-danger'}`}>
+              {totalPnLPct >= 0 ? '+' : ''}{totalPnLPct.toFixed(2)}%
+            </div>
           </div>
         </div>
       </div>
