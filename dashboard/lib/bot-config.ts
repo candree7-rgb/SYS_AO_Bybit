@@ -39,7 +39,7 @@ export const BOT_CONFIGS: Record<string, BotConfig> = {
   rya: {
     id: 'rya',
     name: 'RYA Bot',
-    description: '10% equity, 3-5 TPs, no DCA',
+    description: '10% equity, 3-5 TPs, Follow TP (SL trails after each TP)',
     tpCount: 5,
     dcaCount: 0,
     hasTrailing: true,
