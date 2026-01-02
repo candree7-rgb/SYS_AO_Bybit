@@ -894,15 +894,52 @@ class TradeEngine:
                 self.log.debug(f"Position alert check failed for {symbol}: {e}")
 
     def cleanup_closed_trades(self) -> None:
-        """Remove trades from state if position is closed (size = 0)."""
+        """Remove trades from state if position is closed (size = 0).
+
+        CRITICAL: This function must ensure positions are TRULY closed before
+        canceling protection orders. If a position is still open after cleanup,
+        we force-close it to prevent unprotected positions.
+        """
         for tid, tr in list(self.state.get("open_trades", {}).items()):
             if tr.get("status") not in ("open",):
                 continue
             try:
-                size, _ = self.position_size_avg(tr["symbol"])
+                symbol = tr["symbol"]
+                size, _ = self.position_size_avg(symbol)
+
                 if size == 0:
                     # Position closed - cancel all pending orders for this trade!
                     self._cancel_all_trade_orders(tr)
+
+                    # SAFETY CHECK: Verify position is REALLY closed after canceling orders
+                    # (prevents leaving unprotected positions open)
+                    size_verify, _ = self.position_size_avg(tr["symbol"])
+                    if size_verify > 0:
+                        self.log.error(f"🚨 CRITICAL: Position {tr['symbol']} still open ({size_verify}) after cleanup!")
+                        self.log.error(f"   Forcing MARKET CLOSE to protect position...")
+
+                        # Force close the remaining position
+                        if not DRY_RUN:
+                            try:
+                                side = "Buy" if tr["order_side"] == "Sell" else "Sell"  # Opposite side to close
+                                self.bybit.place_order({
+                                    "category": CATEGORY,
+                                    "symbol": tr["symbol"],
+                                    "side": side,
+                                    "orderType": "Market",
+                                    "qty": f"{size_verify}",
+                                    "reduceOnly": True,
+                                    "closeOnTrigger": True,
+                                })
+                                self.log.info(f"✅ Emergency position close executed for {tr['symbol']}")
+                                # Small delay to allow close to execute
+                                time.sleep(0.5)
+                            except Exception as e:
+                                self.log.error(f"❌ FAILED to force close {tr['symbol']}: {e}")
+                                self.log.error(f"   ⚠️ MANUAL INTERVENTION REQUIRED!")
+                                # Don't mark trade as closed if we couldn't close the position
+                                continue
+
                     tr["status"] = "closed"
                     tr["closed_ts"] = time.time()
 
