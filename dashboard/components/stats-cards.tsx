@@ -63,7 +63,7 @@ export default function StatsCards({ period, botId }: StatsCardsProps) {
       <StatCard
         label="Total Trades"
         value={stats.total_trades.toString()}
-        subValue={`${stats.wins}W / ${stats.losses}L`}
+        subValue={`${stats.wins}W / ${stats.breakeven}BE / ${stats.losses}L`}
       />
 
       {/* Win Rate */}
@@ -71,6 +71,7 @@ export default function StatsCards({ period, botId }: StatsCardsProps) {
         label="Win Rate"
         value={`${stats.win_rate.toFixed(1)}%`}
         variant={stats.win_rate >= 50 ? 'success' : 'danger'}
+        subValue="Wins + Breakeven"
       />
 
       {/* Total Wins */}
@@ -78,6 +79,15 @@ export default function StatsCards({ period, botId }: StatsCardsProps) {
         label="Total Wins"
         value={stats.wins.toString()}
         valueColor="text-success"
+        subValue="PnL > 0"
+      />
+
+      {/* Breakeven */}
+      <StatCard
+        label="Breakeven"
+        value={stats.breakeven.toString()}
+        valueColor="text-muted-foreground"
+        subValue="TP1+ but ≤ 0%"
       />
 
       {/* Total Losses */}
@@ -85,6 +95,7 @@ export default function StatsCards({ period, botId }: StatsCardsProps) {
         label="Total Losses"
         value={stats.losses.toString()}
         valueColor="text-danger"
+        subValue="Pure SL, no TP"
       />
 
       {/* Total PnL */}

@@ -52,6 +52,7 @@ export interface Stats {
   total_trades: number;
   wins: number;
   losses: number;
+  breakeven: number;  // TP1+ reached but closed at/below 0
   win_rate: number;
   total_pnl: number;
   total_pnl_pct: number;  // Total PnL as % of average equity
@@ -195,15 +196,16 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
     let query = `
       SELECT
         COUNT(*) as total_trades,
-        SUM(CASE WHEN is_win THEN 1 ELSE 0 END) as wins,
-        SUM(CASE WHEN NOT is_win THEN 1 ELSE 0 END) as losses,
+        SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
+        SUM(CASE WHEN tp_fills = 0 AND realized_pnl < 0 THEN 1 ELSE 0 END) as losses,
+        SUM(CASE WHEN tp_fills >= 1 AND realized_pnl <= 0 THEN 1 ELSE 0 END) as breakeven,
         SUM(realized_pnl) as total_pnl,
         AVG(equity_at_close) as avg_equity,
         AVG(realized_pnl) as avg_pnl,
-        AVG(CASE WHEN is_win THEN realized_pnl END) as avg_win,
-        AVG(CASE WHEN is_win THEN pnl_pct_equity END) as avg_win_pct,
-        AVG(CASE WHEN NOT is_win AND tp_fills = 0 THEN realized_pnl END) as avg_loss,
-        AVG(CASE WHEN NOT is_win AND tp_fills = 0 THEN pnl_pct_equity END) as avg_loss_pct,
+        AVG(CASE WHEN realized_pnl > 0 THEN realized_pnl END) as avg_win,
+        AVG(CASE WHEN realized_pnl > 0 THEN pnl_pct_equity END) as avg_win_pct,
+        AVG(CASE WHEN tp_fills = 0 AND realized_pnl < 0 THEN realized_pnl END) as avg_loss,
+        AVG(CASE WHEN tp_fills = 0 AND realized_pnl < 0 THEN pnl_pct_equity END) as avg_loss_pct,
         MAX(realized_pnl) as best_trade,
         MIN(realized_pnl) as worst_trade,
         AVG(tp_fills) as avg_tp_fills,
@@ -233,6 +235,7 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
         total_trades: 0,
         wins: 0,
         losses: 0,
+        breakeven: 0,
         win_rate: 0,
         total_pnl: 0,
         total_pnl_pct: 0,
@@ -252,6 +255,11 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
       };
     }
 
+    const wins = parseInt(row.wins || 0);
+    const losses = parseInt(row.losses || 0);
+    const breakeven = parseInt(row.breakeven || 0);
+    const total_trades = parseInt(row.total_trades);
+
     const avg_win = parseFloat(row.avg_win || 0);
     const avg_win_pct = parseFloat(row.avg_win_pct || 0);
     const avg_loss = parseFloat(row.avg_loss || 0);
@@ -262,11 +270,15 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
     const avg_equity = parseFloat(row.avg_equity || 0);
     const total_pnl_pct = avg_equity > 0 ? (total_pnl / avg_equity) * 100 : 0;
 
+    // Win rate includes wins + breakeven (TP1 reached = strategic success)
+    const win_rate = total_trades > 0 ? ((wins + breakeven) / total_trades) * 100 : 0;
+
     return {
-      total_trades: parseInt(row.total_trades),
-      wins: parseInt(row.wins),
-      losses: parseInt(row.losses),
-      win_rate: parseFloat(((row.wins / row.total_trades) * 100).toFixed(1)),
+      total_trades,
+      wins,
+      losses,
+      breakeven,
+      win_rate: parseFloat(win_rate.toFixed(1)),
       total_pnl,
       total_pnl_pct: parseFloat(total_pnl_pct.toFixed(2)),
       avg_pnl: parseFloat(row.avg_pnl || 0),
