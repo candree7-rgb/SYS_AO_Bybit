@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import { BOT_CONFIGS, type BotConfig } from '@/lib/bot-config';
 
 interface BotTabsProps {
@@ -8,35 +9,60 @@ interface BotTabsProps {
 }
 
 export default function BotTabs({ selectedBot, onSelectBot }: BotTabsProps) {
-  const bots = Object.values(BOT_CONFIGS);
+  const [showInactive, setShowInactive] = useState(false);
+  const allBots = Object.values(BOT_CONFIGS);
+  const activeBots = allBots.filter(bot => bot.isActive);
+  const inactiveBots = allBots.filter(bot => !bot.isActive);
+  const displayedBots = showInactive ? allBots : activeBots;
 
   return (
     <div className="mb-8">
-      <div className="border-b border-border">
-        <nav className="flex space-x-8" aria-label="Tabs">
-          {bots.map((bot) => (
+      <div className="flex items-center gap-4 flex-wrap">
+        {/* Active Bots */}
+        <div className="flex gap-2 flex-wrap">
+          {displayedBots.map((bot) => (
             <button
               key={bot.id}
               onClick={() => onSelectBot(bot.id)}
               className={`
-                py-4 px-1 border-b-2 font-medium text-sm transition-colors
+                px-4 py-2 rounded-lg font-medium text-sm transition-all
                 ${
                   selectedBot === bot.id
-                    ? 'border-primary text-foreground'
-                    : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
+                    ? 'bg-primary text-primary-foreground shadow-md'
+                    : bot.isActive
+                    ? 'bg-muted hover:bg-muted/80 text-foreground'
+                    : 'bg-muted/50 text-muted-foreground opacity-60'
                 }
               `}
             >
-              <div className="flex flex-col items-start">
-                <span className="font-bold text-lg">{bot.name}</span>
-                <span className="text-xs text-muted-foreground mt-1">
-                  {bot.description}
-                </span>
-              </div>
+              {bot.name}
+              {!bot.isActive && (
+                <span className="ml-1 text-xs opacity-60">●</span>
+              )}
             </button>
           ))}
-        </nav>
+        </div>
+
+        {/* Toggle Inactive Bots */}
+        {inactiveBots.length > 0 && (
+          <button
+            onClick={() => setShowInactive(!showInactive)}
+            className="px-3 py-1.5 rounded-md text-xs font-medium bg-background border border-border text-muted-foreground hover:text-foreground transition-colors"
+          >
+            {showInactive ? '− Hide Inactive' : `+ ${inactiveBots.length} Inactive`}
+          </button>
+        )}
       </div>
+
+      {/* Bot Info */}
+      {selectedBot && BOT_CONFIGS[selectedBot] && (
+        <div className="mt-4 text-sm text-muted-foreground">
+          {BOT_CONFIGS[selectedBot].description}
+          {!BOT_CONFIGS[selectedBot].isActive && (
+            <span className="ml-2 text-xs bg-muted px-2 py-0.5 rounded">Inactive</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

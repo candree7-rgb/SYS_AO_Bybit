@@ -57,7 +57,9 @@ export interface Stats {
   total_pnl_pct: number;  // Total PnL as % of average equity
   avg_pnl: number;
   avg_win: number;
+  avg_win_pct: number;  // Average win as % of equity
   avg_loss: number;
+  avg_loss_pct: number;  // Average loss as % of equity (only pure SL trades)
   win_loss_ratio: number;
   best_trade: number;
   worst_trade: number;
@@ -199,7 +201,9 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
         AVG(equity_at_close) as avg_equity,
         AVG(realized_pnl) as avg_pnl,
         AVG(CASE WHEN is_win THEN realized_pnl END) as avg_win,
-        AVG(CASE WHEN NOT is_win THEN realized_pnl END) as avg_loss,
+        AVG(CASE WHEN is_win THEN pnl_pct_equity END) as avg_win_pct,
+        AVG(CASE WHEN NOT is_win AND tp_fills = 0 THEN realized_pnl END) as avg_loss,
+        AVG(CASE WHEN NOT is_win AND tp_fills = 0 THEN pnl_pct_equity END) as avg_loss_pct,
         MAX(realized_pnl) as best_trade,
         MIN(realized_pnl) as worst_trade,
         AVG(tp_fills) as avg_tp_fills,
@@ -234,7 +238,9 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
         total_pnl_pct: 0,
         avg_pnl: 0,
         avg_win: 0,
+        avg_win_pct: 0,
         avg_loss: 0,
+        avg_loss_pct: 0,
         win_loss_ratio: 0,
         best_trade: 0,
         worst_trade: 0,
@@ -247,7 +253,9 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
     }
 
     const avg_win = parseFloat(row.avg_win || 0);
+    const avg_win_pct = parseFloat(row.avg_win_pct || 0);
     const avg_loss = parseFloat(row.avg_loss || 0);
+    const avg_loss_pct = parseFloat(row.avg_loss_pct || 0);
     const win_loss_ratio = avg_loss !== 0 ? Math.abs(avg_win / avg_loss) : 0;
 
     const total_pnl = parseFloat(row.total_pnl || 0);
@@ -263,7 +271,9 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
       total_pnl_pct: parseFloat(total_pnl_pct.toFixed(2)),
       avg_pnl: parseFloat(row.avg_pnl || 0),
       avg_win,
+      avg_win_pct: parseFloat(avg_win_pct.toFixed(2)),
       avg_loss,
+      avg_loss_pct: parseFloat(avg_loss_pct.toFixed(2)),
       win_loss_ratio: parseFloat(win_loss_ratio.toFixed(2)),
       best_trade: parseFloat(row.best_trade || 0),
       worst_trade: parseFloat(row.worst_trade || 0),

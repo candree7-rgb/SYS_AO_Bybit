@@ -105,17 +105,17 @@ export default function StatsCards({ period, botId }: StatsCardsProps) {
       {/* Avg Win */}
       <StatCard
         label="Avg Win"
-        value={formatCurrency(stats.avg_win)}
+        value={`${stats.avg_win_pct >= 0 ? '+' : ''}${stats.avg_win_pct.toFixed(2)}%`}
         valueColor="text-success"
-        subValue={stats.wins > 0 ? `${stats.wins} trades` : undefined}
+        subValue={`${formatCurrency(stats.avg_win)} • ${stats.wins} trades`}
       />
 
       {/* Avg Loss */}
       <StatCard
         label="Avg Loss"
-        value={formatCurrency(stats.avg_loss)}
+        value={`${stats.avg_loss_pct.toFixed(2)}%`}
         valueColor="text-danger"
-        subValue={stats.losses > 0 ? `${stats.losses} trades` : undefined}
+        subValue={`${formatCurrency(stats.avg_loss)} • Pure SL only`}
       />
 
       {/* Win/Loss Ratio */}

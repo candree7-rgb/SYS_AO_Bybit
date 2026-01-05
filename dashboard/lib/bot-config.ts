@@ -6,53 +6,69 @@ export interface BotConfig {
   dcaCount: number; // Number of DCA levels (0-2)
   hasTrailing: boolean;
   hasBreakeven: boolean;
+  isActive: boolean; // Whether the bot is currently active
 }
 
 export const BOT_CONFIGS: Record<string, BotConfig> = {
   all: {
     id: 'all',
     name: 'All Bots',
-    description: 'Combined performance across all strategies',
+    description: 'Combined performance',
     tpCount: 5,  // Max for display purposes
     dcaCount: 2, // Max for display purposes
     hasTrailing: true,
     hasBreakeven: true,
+    isActive: true,
   },
   ao: {
     id: 'ao',
-    name: 'AO Bot',
-    description: 'Original strategy with 3 TPs and 2 DCAs',
+    name: 'AO',
+    description: '3 TPs, 2 DCAs',
     tpCount: 3,
     dcaCount: 2,
     hasTrailing: true,
     hasBreakeven: true,
+    isActive: true,
   },
   hsb: {
     id: 'hsb',
-    name: 'HSB Bot',
+    name: 'HSB',
     description: '10% equity, 3 TPs, 1 DCA',
     tpCount: 3,
     dcaCount: 1,
     hasTrailing: true,
     hasBreakeven: true,
+    isActive: false,
   },
   rya: {
     id: 'rya',
-    name: 'RYA Bot',
-    description: '10% equity, 3-5 TPs, Follow TP (SL trails after each TP)',
+    name: 'RYA',
+    description: '10% equity, 3-5 TPs, Follow TP',
     tpCount: 5,
     dcaCount: 0,
     hasTrailing: true,
     hasBreakeven: true,
+    isActive: true,
+  },
+  rvn: {
+    id: 'rvn',
+    name: 'RVN',
+    description: 'Low RR, 3 TPs, 2 DCAs',
+    tpCount: 3,
+    dcaCount: 2,
+    hasTrailing: true,
+    hasBreakeven: true,
+    isActive: true,
   },
   fox: {
     id: 'fox',
-    name: 'Fox Bot',
-    description: '5 TPs, no DCA, breakeven after TP1',
+    name: 'Fox',
+    description: '5 TPs, no DCA, BE after TP1',
     tpCount: 5,
     dcaCount: 0,
     hasTrailing: false,
     hasBreakeven: true,
+    isActive: false,
   },
 };
 
