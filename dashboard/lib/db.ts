@@ -90,7 +90,7 @@ export async function getTrades(limit: number = 100, offset: number = 0, botId?:
     let whereClause = '';
 
     // Handle bot filtering
-    if (botId === 'all') {
+    if (!botId || botId === 'all') {
       const activeBotIds = getActiveBotIds();
       if (activeBotIds.length > 0) {
         whereClause = ` WHERE bot_id = ANY($1)`;
@@ -235,8 +235,8 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
     }
 
     // Handle bot filtering
-    if (botId === 'all') {
-      // Only include active bots
+    if (!botId || botId === 'all') {
+      // Default to active bots only (when no botId or 'all')
       const activeBotIds = getActiveBotIds();
       if (activeBotIds.length > 0) {
         const botList = activeBotIds.map(id => `'${id}'`).join(', ');
@@ -329,7 +329,7 @@ export async function getTPDistribution(tpCount: number = 3, botId?: string): Pr
   try {
     // Handle bot filtering
     let botFilter = '';
-    if (botId === 'all') {
+    if (!botId || botId === 'all') {
       const activeBotIds = getActiveBotIds();
       if (activeBotIds.length > 0) {
         const botList = activeBotIds.map(id => `'${id}'`).join(', ');
@@ -360,7 +360,7 @@ export async function getDCADistribution(dcaCount: number = 2, botId?: string): 
   try {
     // Handle bot filtering
     let botFilter = '';
-    if (botId === 'all') {
+    if (!botId || botId === 'all') {
       const activeBotIds = getActiveBotIds();
       if (activeBotIds.length > 0) {
         const botList = activeBotIds.map(id => `'${id}'`).join(', ');
