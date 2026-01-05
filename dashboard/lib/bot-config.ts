@@ -79,3 +79,9 @@ export function getBotConfig(botId: string): BotConfig {
 export function getAllBotIds(): string[] {
   return Object.keys(BOT_CONFIGS);
 }
+
+export function getActiveBotIds(): string[] {
+  return Object.values(BOT_CONFIGS)
+    .filter(bot => bot.isActive && bot.id !== 'all')
+    .map(bot => bot.id);
+}

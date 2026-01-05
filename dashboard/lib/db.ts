@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { getActiveBotIds } from './bot-config';
 
 // Create PostgreSQL connection pool
 const pool = new Pool({
@@ -86,16 +87,28 @@ export async function getTrades(limit: number = 100, offset: number = 0, botId?:
   try {
     let query = `SELECT * FROM trades`;
     const params: any[] = [];
+    let whereClause = '';
 
-    if (botId) {
-      query += ` WHERE bot_id = $1`;
+    // Handle bot filtering
+    if (botId === 'all') {
+      const activeBotIds = getActiveBotIds();
+      if (activeBotIds.length > 0) {
+        whereClause = ` WHERE bot_id = ANY($1)`;
+        params.push(activeBotIds);
+      }
+    } else if (botId) {
+      whereClause = ` WHERE bot_id = $1`;
       params.push(botId);
-      query += ` ORDER BY closed_at DESC NULLS LAST, placed_at DESC LIMIT $2 OFFSET $3`;
-      params.push(limit, offset);
-    } else {
-      query += ` ORDER BY closed_at DESC NULLS LAST, placed_at DESC LIMIT $1 OFFSET $2`;
-      params.push(limit, offset);
     }
+
+    query += whereClause;
+    query += ` ORDER BY closed_at DESC NULLS LAST, placed_at DESC`;
+
+    // Add limit and offset
+    const limitParam = params.length + 1;
+    const offsetParam = params.length + 2;
+    query += ` LIMIT $${limitParam} OFFSET $${offsetParam}`;
+    params.push(limit, offset);
 
     const result = await client.query(query, params);
     return result.rows;
@@ -220,9 +233,20 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
     if (days) {
       conditions.push(`closed_at >= NOW() - INTERVAL '${days} days'`);
     }
-    if (botId) {
+
+    // Handle bot filtering
+    if (botId === 'all') {
+      // Only include active bots
+      const activeBotIds = getActiveBotIds();
+      if (activeBotIds.length > 0) {
+        const botList = activeBotIds.map(id => `'${id}'`).join(', ');
+        conditions.push(`bot_id IN (${botList})`);
+      }
+    } else if (botId) {
+      // Specific bot
       conditions.push(`bot_id = '${botId}'`);
     }
+
     if (conditions.length > 0) {
       query += ` WHERE ${conditions.join(' AND ')}`;
     }
@@ -303,7 +327,17 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
 export async function getTPDistribution(tpCount: number = 3, botId?: string): Promise<TPDistribution[]> {
   const client = await pool.connect();
   try {
-    const botFilter = botId ? `AND bot_id = '${botId}'` : '';
+    // Handle bot filtering
+    let botFilter = '';
+    if (botId === 'all') {
+      const activeBotIds = getActiveBotIds();
+      if (activeBotIds.length > 0) {
+        const botList = activeBotIds.map(id => `'${id}'`).join(', ');
+        botFilter = `AND bot_id IN (${botList})`;
+      }
+    } else if (botId) {
+      botFilter = `AND bot_id = '${botId}'`;
+    }
 
     // Build dynamic query based on tpCount
     const queries: string[] = [];
@@ -324,7 +358,17 @@ export async function getTPDistribution(tpCount: number = 3, botId?: string): Pr
 export async function getDCADistribution(dcaCount: number = 2, botId?: string): Promise<DCADistribution[]> {
   const client = await pool.connect();
   try {
-    const botFilter = botId ? `AND bot_id = '${botId}'` : '';
+    // Handle bot filtering
+    let botFilter = '';
+    if (botId === 'all') {
+      const activeBotIds = getActiveBotIds();
+      if (activeBotIds.length > 0) {
+        const botList = activeBotIds.map(id => `'${id}'`).join(', ');
+        botFilter = `AND bot_id IN (${botList})`;
+      }
+    } else if (botId) {
+      botFilter = `AND bot_id = '${botId}'`;
+    }
 
     // Build dynamic query based on dcaCount
     // DCA0 = exactly 0 DCAs filled, DCA1 = exactly 1 DCA filled, etc.
