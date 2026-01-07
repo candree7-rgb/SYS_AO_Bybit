@@ -6,13 +6,15 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const daysParam = searchParams.get('days');
     const days = daysParam ? parseInt(daysParam) : undefined;
+    const from = searchParams.get('from') || undefined;
+    const to = searchParams.get('to') || undefined;
     const botId = searchParams.get('botId');
 
     // If specific bot is selected, calculate cumulative PnL from trades
     // If 'all' or no botId, use daily_equity table (account-wide equity)
     const equity = (botId && botId !== 'all')
-      ? await getBotCumulativePnL(botId, days)
-      : await getDailyEquity(days);
+      ? await getBotCumulativePnL(botId, days, from, to)
+      : await getDailyEquity(days, from, to);
 
     return NextResponse.json(equity);
   } catch (error) {

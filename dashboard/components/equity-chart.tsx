@@ -6,6 +6,7 @@ import { DailyEquity } from '@/lib/db';
 import { formatCurrency } from '@/lib/utils';
 import { format } from 'date-fns';
 import TimeRangeSelector, { TimeRange, TIME_RANGES } from '@/components/time-range-selector';
+import DateRangePicker from '@/components/date-range-picker';
 
 interface EquityChartProps {
   botId?: string;
@@ -15,15 +16,24 @@ export default function EquityChart({ botId = 'all' }: EquityChartProps) {
   const [data, setData] = useState<DailyEquity[]>([]);
   const [loading, setLoading] = useState(true);
   const [timeRange, setTimeRange] = useState<TimeRange>('1M');
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [customDateRange, setCustomDateRange] = useState<{ from: string; to: string } | null>(null);
 
   useEffect(() => {
     async function fetchEquity() {
       try {
-        const selectedRange = TIME_RANGES.find(r => r.value === timeRange);
-        const days = selectedRange?.days;
-
         const params = new URLSearchParams();
-        if (days) params.append('days', days.toString());
+
+        // Custom date range takes priority
+        if (timeRange === 'CUSTOM' && customDateRange) {
+          params.append('from', customDateRange.from);
+          params.append('to', customDateRange.to);
+        } else {
+          const selectedRange = TIME_RANGES.find(r => r.value === timeRange);
+          const days = selectedRange?.days;
+          if (days) params.append('days', days.toString());
+        }
+
         if (botId && botId !== 'all') params.append('botId', botId);
 
         const res = await fetch(`/api/equity?${params.toString()}`);
@@ -39,7 +49,12 @@ export default function EquityChart({ botId = 'all' }: EquityChartProps) {
     fetchEquity();
     const interval = setInterval(fetchEquity, 60000); // Refresh every 60s
     return () => clearInterval(interval);
-  }, [timeRange, botId]);
+  }, [timeRange, customDateRange, botId]);
+
+  const handleCustomDateApply = (from: string, to: string) => {
+    setCustomDateRange({ from, to });
+    setTimeRange('CUSTOM');
+  };
 
   if (loading) {
     return (
@@ -72,14 +87,36 @@ export default function EquityChart({ botId = 'all' }: EquityChartProps) {
   const totalPnL = currentEquity - startEquity;
   const totalPnLPct = startEquity > 0 ? ((totalPnL / startEquity) * 100) : 0;
 
+  const displayLabel = timeRange === 'CUSTOM' && customDateRange
+    ? `${format(new Date(customDateRange.from), 'MMM dd, yyyy')} - ${format(new Date(customDateRange.to), 'MMM dd, yyyy')}`
+    : timeRange;
+
   return (
-    <div className="bg-card border border-border rounded-lg p-6">
-      <div className="flex flex-col gap-4 mb-6">
-        {/* Header with Title and Time Range Selector */}
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <h2 className="text-xl font-bold">Equity Curve</h2>
-          <TimeRangeSelector selected={timeRange} onSelect={setTimeRange} />
-        </div>
+    <>
+      <DateRangePicker
+        isOpen={showDatePicker}
+        onClose={() => setShowDatePicker(false)}
+        onApply={handleCustomDateApply}
+      />
+
+      <div className="bg-card border border-border rounded-lg p-6">
+        <div className="flex flex-col gap-4 mb-6">
+          {/* Header with Title and Time Range Selector */}
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div>
+              <h2 className="text-xl font-bold">Equity Curve</h2>
+              {timeRange === 'CUSTOM' && customDateRange && (
+                <p className="text-sm text-muted-foreground mt-1">
+                  {format(new Date(customDateRange.from), 'MMM dd, yyyy')} - {format(new Date(customDateRange.to), 'MMM dd, yyyy')}
+                </p>
+              )}
+            </div>
+            <TimeRangeSelector
+              selected={timeRange}
+              onSelect={setTimeRange}
+              onCustomClick={() => setShowDatePicker(true)}
+            />
+          </div>
 
         {/* Equity Stats */}
         <div className="flex items-center justify-between p-4 bg-muted/50 rounded-lg">
@@ -90,7 +127,9 @@ export default function EquityChart({ botId = 'all' }: EquityChartProps) {
             </div>
           </div>
           <div className="text-right">
-            <div className="text-sm text-muted-foreground mb-1">{timeRange} Performance</div>
+            <div className="text-sm text-muted-foreground mb-1">
+              {timeRange === 'CUSTOM' ? 'Custom' : timeRange} Performance
+            </div>
             <div className={`text-2xl font-bold ${totalPnL >= 0 ? 'text-success' : 'text-danger'}`}>
               {totalPnL >= 0 ? '+' : ''}{formatCurrency(totalPnL)}
             </div>
@@ -138,7 +177,8 @@ export default function EquityChart({ botId = 'all' }: EquityChartProps) {
           />
         </AreaChart>
       </ResponsiveContainer>
-    </div>
+      </div>
+    </>
   );
 }
 

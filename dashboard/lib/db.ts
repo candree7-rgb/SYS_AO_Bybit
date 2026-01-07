@@ -122,19 +122,35 @@ export async function getTrades(limit: number = 100, offset: number = 0, botId?:
   }
 }
 
-export async function getDailyEquity(days?: number): Promise<DailyEquity[]> {
+export async function getDailyEquity(days?: number, from?: string, to?: string): Promise<DailyEquity[]> {
   const client = await pool.connect();
   try {
-    let query = `SELECT * FROM daily_equity ORDER BY date DESC`;
+    let query = `SELECT * FROM daily_equity`;
     const params: any[] = [];
+    const conditions: string[] = [];
 
-    if (days) {
-      query += ` LIMIT $1`;
-      params.push(days);
+    // Use custom date range if provided, otherwise use days limit
+    if (from && to) {
+      conditions.push(`date >= $1`);
+      conditions.push(`date <= $2`);
+      params.push(from, to);
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(' AND ')}`;
+    }
+
+    query += ` ORDER BY date ASC`;
+
+    // Apply limit only if no custom date range and days is specified
+    if (days && !from && !to) {
+      const limitIndex = params.length + 1;
+      const result = await client.query(`${query} ORDER BY date DESC LIMIT $${limitIndex}`, [...params, days]);
+      return result.rows.reverse();
     }
 
     const result = await client.query(query, params);
-    return result.rows.reverse(); // Return chronological order for charts
+    return result.rows;
   } finally {
     client.release();
   }
@@ -144,7 +160,7 @@ export async function getDailyEquity(days?: number): Promise<DailyEquity[]> {
  * Get cumulative PnL curve for a specific bot by summing up realized_pnl from trades
  * This creates a pseudo-equity curve showing the bot's performance over time
  */
-export async function getBotCumulativePnL(botId: string, days?: number): Promise<DailyEquity[]> {
+export async function getBotCumulativePnL(botId: string, days?: number, from?: string, to?: string): Promise<DailyEquity[]> {
   const client = await pool.connect();
   try {
     // Use CTE to first aggregate by day, then apply window function for cumulative sum
@@ -163,7 +179,11 @@ export async function getBotCumulativePnL(botId: string, days?: number): Promise
 
     const params: any[] = [botId];
 
-    if (days) {
+    // Use custom date range if provided, otherwise use days
+    if (from && to) {
+      query += ` AND DATE(closed_at) >= $2 AND DATE(closed_at) <= $3`;
+      params.push(from, to);
+    } else if (days) {
       query += ` AND closed_at >= NOW() - INTERVAL '${days} days'`;
     }
 
