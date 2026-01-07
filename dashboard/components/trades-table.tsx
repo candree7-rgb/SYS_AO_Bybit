@@ -109,8 +109,25 @@ export default function TradesTable({ botId }: TradesTableProps) {
                 className="hover:bg-muted/20 transition-colors cursor-pointer group"
               >
                 {/* Symbol */}
-                <td className="px-4 py-4 font-mono font-semibold">
-                  {trade.symbol.replace('USDT', '')}
+                <td className="px-4 py-4">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono font-semibold">
+                      {trade.symbol.replace('USDT', '')}
+                    </span>
+                    {/* Risk & Leverage Badges */}
+                    <div className="flex gap-1">
+                      {trade.leverage && (
+                        <span className="px-1.5 py-0.5 rounded text-xs font-semibold bg-muted/80 text-muted-foreground">
+                          {trade.leverage}x
+                        </span>
+                      )}
+                      {trade.risk_pct && (
+                        <span className="px-1.5 py-0.5 rounded text-xs font-semibold bg-primary/10 text-primary">
+                          {trade.risk_pct}%
+                        </span>
+                      )}
+                    </div>
+                  </div>
                 </td>
 
                 {/* Close Time */}

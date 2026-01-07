@@ -173,6 +173,7 @@ def export_trade(trade: Dict[str, Any]) -> bool:
                         placed_at, filled_at, closed_at, duration_minutes,
                         realized_pnl, pnl_pct_margin, pnl_pct_equity, margin_used, equity_at_close,
                         is_win, exit_reason,
+                        risk_pct, risk_amount, equity_at_entry, leverage,
                         tp_fills, tp_count, dca_fills, dca_count, trailing_used,
                         bot_id
                     ) VALUES (
@@ -181,6 +182,7 @@ def export_trade(trade: Dict[str, Any]) -> bool:
                         %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s, %s,
+                        %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s
                     )
@@ -197,7 +199,11 @@ def export_trade(trade: Dict[str, Any]) -> bool:
                         dca_fills = EXCLUDED.dca_fills,
                         trailing_used = EXCLUDED.trailing_used,
                         avg_entry = EXCLUDED.avg_entry,
-                        bot_id = EXCLUDED.bot_id
+                        bot_id = EXCLUDED.bot_id,
+                        risk_pct = EXCLUDED.risk_pct,
+                        risk_amount = EXCLUDED.risk_amount,
+                        equity_at_entry = EXCLUDED.equity_at_entry,
+                        leverage = EXCLUDED.leverage
                 """, (
                     trade.get("id"), trade.get("symbol"), trade.get("pos_side"), trade.get("order_side"),
                     trade.get("entry_price"), trade.get("trigger"), trade.get("avg_entry"),
@@ -207,6 +213,7 @@ def export_trade(trade: Dict[str, Any]) -> bool:
                     duration_min,
                     pnl, pnl_margin_pct, pnl_equity_pct, margin_used, equity_after,
                     trade.get("is_win", False), trade.get("exit_reason", "unknown"),
+                    trade.get("risk_pct"), trade.get("risk_amount"), trade.get("equity_at_entry"), trade.get("leverage"),
                     trade.get("tp_fills", 0), actual_tp_count,
                     trade.get("dca_fills", 0), len(DCA_QTY_MULTS),
                     trade.get("trailing_started", False),

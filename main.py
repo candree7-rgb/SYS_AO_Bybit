@@ -6,7 +6,7 @@ import logging
 
 from config import (
     DISCORD_TOKEN, CHANNEL_ID,
-    BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_DEMO, RECV_WINDOW,
+    BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_DEMO, RECV_WINDOW, ACCOUNT_TYPE,
     CATEGORY, QUOTE, LEVERAGE, RISK_PCT,
     MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
     POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC,
@@ -308,6 +308,12 @@ def main():
                         log.warning(f"❌ Entry order failed for {sig['symbol']}")
                         continue
 
+                    # Get current equity for risk tracking
+                    try:
+                        equity_now = bybit.wallet_equity(ACCOUNT_TYPE)
+                    except Exception:
+                        equity_now = 0
+
                     # store trade
                     st.setdefault("open_trades", {})[trade_id] = {
                         "id": trade_id,
@@ -325,6 +331,11 @@ def main():
                         "base_qty": engine.calc_base_qty(sig["symbol"], float(sig["trigger"])),
                         "raw": sig.get("raw", ""),
                         "discord_msg_id": mid,  # Store Discord message ID for signal updates
+                        # Risk & Leverage tracking (captured at trade creation)
+                        "risk_pct": RISK_PCT,
+                        "risk_amount": round(equity_now * RISK_PCT / 100, 2) if equity_now > 0 else None,
+                        "equity_at_entry": round(equity_now, 2) if equity_now > 0 else None,
+                        "leverage": LEVERAGE,
                     }
                     inc_trades_today()
                     log.info(f"🟡 ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")

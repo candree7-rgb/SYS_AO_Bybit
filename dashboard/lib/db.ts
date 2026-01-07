@@ -28,6 +28,10 @@ export interface Trade {
   equity_at_close: number;
   is_win: boolean;
   exit_reason: string;
+  risk_pct: number | null;
+  risk_amount: number | null;
+  equity_at_entry: number | null;
+  leverage: number | null;
   tp_fills: number;
   tp_count: number;
   dca_fills: number;

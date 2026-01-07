@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS trades (
     equity_at_close DECIMAL(20, 8),
     is_win BOOLEAN,
 
+    -- Risk & Leverage Settings (captured at trade creation)
+    risk_pct DECIMAL(5, 2),          -- Risk % setting used (e.g. 5.00, 10.00)
+    risk_amount DECIMAL(12, 2),      -- Risk amount in $ (e.g. 200.00)
+    equity_at_entry DECIMAL(12, 2),  -- Account equity at trade entry (e.g. 4000.00)
+    leverage INTEGER,                -- Leverage setting used (e.g. 5, 10)
+
     -- Trade Details
     exit_reason VARCHAR(50),
     tp_fills INTEGER DEFAULT 0,
@@ -85,5 +91,14 @@ BEGIN
                    WHERE table_name = 'trades' AND column_name = 'bot_id') THEN
         ALTER TABLE trades ADD COLUMN bot_id VARCHAR(50) DEFAULT 'ao';
         CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id);
+    END IF;
+
+    -- Migration: Add risk/leverage tracking columns (2026-01-07)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'trades' AND column_name = 'risk_pct') THEN
+        ALTER TABLE trades ADD COLUMN risk_pct DECIMAL(5, 2);
+        ALTER TABLE trades ADD COLUMN risk_amount DECIMAL(12, 2);
+        ALTER TABLE trades ADD COLUMN equity_at_entry DECIMAL(12, 2);
+        ALTER TABLE trades ADD COLUMN leverage INTEGER;
     END IF;
 END $$;
