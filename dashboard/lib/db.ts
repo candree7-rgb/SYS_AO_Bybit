@@ -58,6 +58,7 @@ export interface Stats {
   total_pnl: number;
   total_pnl_pct: number;  // Total PnL as % of average equity
   avg_pnl: number;
+  avg_pnl_pct: number;  // Average PnL as % of equity (all trades)
   avg_win: number;
   avg_win_pct: number;  // Average win as % of equity
   avg_loss: number;
@@ -215,6 +216,7 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
         SUM(realized_pnl) as total_pnl,
         AVG(equity_at_close) as avg_equity,
         AVG(realized_pnl) as avg_pnl,
+        AVG(pnl_pct_equity) as avg_pnl_pct,
         AVG(CASE WHEN realized_pnl > 0 THEN realized_pnl END) as avg_win,
         AVG(CASE WHEN realized_pnl > 0 THEN pnl_pct_equity END) as avg_win_pct,
         AVG(CASE WHEN tp_fills = 0 AND realized_pnl < 0 THEN realized_pnl END) as avg_loss,
@@ -264,6 +266,7 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
         total_pnl: 0,
         total_pnl_pct: 0,
         avg_pnl: 0,
+        avg_pnl_pct: 0,
         avg_win: 0,
         avg_win_pct: 0,
         avg_loss: 0,
@@ -306,6 +309,7 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
       total_pnl,
       total_pnl_pct: parseFloat(total_pnl_pct.toFixed(2)),
       avg_pnl: parseFloat(row.avg_pnl || 0),
+      avg_pnl_pct: parseFloat(row.avg_pnl_pct || 0),
       avg_win,
       avg_win_pct: parseFloat(avg_win_pct.toFixed(2)),
       avg_loss,

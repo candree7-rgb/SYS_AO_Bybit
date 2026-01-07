@@ -103,14 +103,15 @@ export default function StatsCards({ period, botId }: StatsCardsProps) {
         label="Total PnL"
         value={formatCurrency(stats.total_pnl)}
         variant={stats.total_pnl >= 0 ? 'success' : 'danger'}
-        subValue={`${stats.total_pnl_pct >= 0 ? '+' : ''}${stats.total_pnl_pct.toFixed(2)}% ROI`}
+        subValue={`${stats.total_pnl_pct >= 0 ? '+' : ''}${stats.total_pnl_pct.toFixed(2)}% Equity`}
       />
 
       {/* Avg PnL */}
       <StatCard
         label="Avg PnL"
-        value={formatCurrency(stats.avg_pnl)}
+        value={`${stats.avg_pnl_pct >= 0 ? '+' : ''}${stats.avg_pnl_pct.toFixed(2)}%`}
         variant={stats.avg_pnl >= 0 ? 'success' : 'danger'}
+        subValue={`${formatCurrency(stats.avg_pnl)} • All trades`}
       />
 
       {/* Avg Win */}
