@@ -70,8 +70,8 @@ export const BOT_CONFIGS: Record<string, BotConfig> = {
     hasBreakeven: true,
     isActive: false,
   },
-  zei: {
-    id: 'zei',
+  zeii: {
+    id: 'zeii',
     name: 'ZEI',
     description: '2% equity, Dynamic leverage based on SL distance',
     tpCount: 3,
