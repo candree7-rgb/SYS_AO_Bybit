@@ -7,8 +7,9 @@ export async function GET(request: Request) {
     const daysParam = searchParams.get('days');
     const days = daysParam ? parseInt(daysParam) : undefined;
     const botId = searchParams.get('botId') || undefined;
+    const timeframe = searchParams.get('timeframe') || undefined;
 
-    const stats = await getStats(days, botId);
+    const stats = await getStats(days, botId, timeframe);
     return NextResponse.json(stats);
   } catch (error) {
     console.error('Failed to fetch stats:', error);

@@ -6,9 +6,10 @@ import { DCADistribution } from '@/lib/db';
 
 interface DCADistributionChartProps {
   botId?: string;
+  timeframe?: string;
 }
 
-export default function DCADistributionChart({ botId }: DCADistributionChartProps) {
+export default function DCADistributionChart({ botId, timeframe }: DCADistributionChartProps) {
   const [data, setData] = useState<DCADistribution[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -17,6 +18,7 @@ export default function DCADistributionChart({ botId }: DCADistributionChartProp
       try {
         const params = new URLSearchParams();
         if (botId) params.append('botId', botId);
+        if (timeframe && timeframe !== 'all') params.append('timeframe', timeframe);
 
         const url = `/api/dca-distribution${params.toString() ? `?${params.toString()}` : ''}`;
         const res = await fetch(url);
@@ -32,7 +34,7 @@ export default function DCADistributionChart({ botId }: DCADistributionChartProp
     fetchData();
     const interval = setInterval(fetchData, 60000); // Refresh every 60s
     return () => clearInterval(interval);
-  }, [botId]);
+  }, [botId, timeframe]);
 
   if (loading) {
     return (

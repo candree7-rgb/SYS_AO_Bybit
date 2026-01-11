@@ -9,11 +9,13 @@ export async function GET(request: Request) {
     const from = searchParams.get('from') || undefined;
     const to = searchParams.get('to') || undefined;
     const botId = searchParams.get('botId');
+    const timeframe = searchParams.get('timeframe') || undefined;
 
     // If specific bot is selected, calculate cumulative PnL from trades
     // If 'all' or no botId, use daily_equity table (account-wide equity)
+    // Note: timeframe filtering only applies to bot-specific equity (not account-wide)
     const equity = (botId && botId !== 'all')
-      ? await getBotCumulativePnL(botId, days, from, to)
+      ? await getBotCumulativePnL(botId, days, from, to, timeframe)
       : await getDailyEquity(days, from, to);
 
     return NextResponse.json(equity);

@@ -6,9 +6,10 @@ import { TPDistribution } from '@/lib/db';
 
 interface TPDistributionChartProps {
   botId?: string;
+  timeframe?: string;
 }
 
-export default function TPDistributionChart({ botId }: TPDistributionChartProps) {
+export default function TPDistributionChart({ botId, timeframe }: TPDistributionChartProps) {
   const [data, setData] = useState<TPDistribution[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -17,6 +18,7 @@ export default function TPDistributionChart({ botId }: TPDistributionChartProps)
       try {
         const params = new URLSearchParams();
         if (botId) params.append('botId', botId);
+        if (timeframe && timeframe !== 'all') params.append('timeframe', timeframe);
 
         const url = `/api/tp-distribution${params.toString() ? `?${params.toString()}` : ''}`;
         const res = await fetch(url);
@@ -32,7 +34,7 @@ export default function TPDistributionChart({ botId }: TPDistributionChartProps)
     fetchData();
     const interval = setInterval(fetchData, 60000); // Refresh every 60s
     return () => clearInterval(interval);
-  }, [botId]);
+  }, [botId, timeframe]);
 
   if (loading) {
     return (

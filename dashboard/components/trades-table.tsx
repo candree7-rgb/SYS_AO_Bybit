@@ -6,9 +6,10 @@ import { formatCurrency, formatDate, formatDuration, cn } from '@/lib/utils';
 
 interface TradesTableProps {
   botId?: string;
+  timeframe?: string;
 }
 
-export default function TradesTable({ botId }: TradesTableProps) {
+export default function TradesTable({ botId, timeframe }: TradesTableProps) {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [loading, setLoading] = useState(true);
   const [sortField, setSortField] = useState<keyof Trade>('closed_at');
@@ -19,6 +20,7 @@ export default function TradesTable({ botId }: TradesTableProps) {
       try {
         const params = new URLSearchParams({ limit: '50' });
         if (botId && botId !== 'all') params.append('botId', botId);
+        if (timeframe && timeframe !== 'all') params.append('timeframe', timeframe);
 
         const res = await fetch(`/api/trades?${params.toString()}`);
         const data = await res.json();
@@ -33,7 +35,7 @@ export default function TradesTable({ botId }: TradesTableProps) {
     fetchTrades();
     const interval = setInterval(fetchTrades, 30000); // Refresh every 30s
     return () => clearInterval(interval);
-  }, [botId]);
+  }, [botId, timeframe]);
 
   const handleSort = (field: keyof Trade) => {
     if (sortField === field) {

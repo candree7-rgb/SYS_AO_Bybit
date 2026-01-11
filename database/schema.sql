@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS trades (
     leverage INTEGER,                -- Leverage setting used (e.g. 5, 10)
 
     -- Trade Details
+    timeframe VARCHAR(10),           -- Signal timeframe (e.g. H1, M15, H4)
     exit_reason VARCHAR(50),
     tp_fills INTEGER DEFAULT 0,
     tp_count INTEGER DEFAULT 3,
@@ -66,6 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_trades_closed_at ON trades(closed_at);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_is_win ON trades(is_win);
 CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id);
+CREATE INDEX IF NOT EXISTS idx_trades_timeframe ON trades(timeframe);
 CREATE INDEX IF NOT EXISTS idx_daily_equity_date ON daily_equity(date);
 
 -- Function to update updated_at timestamp
@@ -100,5 +102,12 @@ BEGIN
         ALTER TABLE trades ADD COLUMN risk_amount DECIMAL(12, 2);
         ALTER TABLE trades ADD COLUMN equity_at_entry DECIMAL(12, 2);
         ALTER TABLE trades ADD COLUMN leverage INTEGER;
+    END IF;
+
+    -- Migration: Add timeframe column (2026-01-11)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'trades' AND column_name = 'timeframe') THEN
+        ALTER TABLE trades ADD COLUMN timeframe VARCHAR(10);
+        CREATE INDEX IF NOT EXISTS idx_trades_timeframe ON trades(timeframe);
     END IF;
 END $$;

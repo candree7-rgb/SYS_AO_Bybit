@@ -32,6 +32,7 @@ export interface Trade {
   risk_amount: number | null;
   equity_at_entry: number | null;
   leverage: number | null;
+  timeframe: string | null;
   tp_fills: number;
   tp_count: number;
   dca_fills: number;
@@ -87,26 +88,35 @@ export interface DCADistribution {
   count: number;
 }
 
-export async function getTrades(limit: number = 100, offset: number = 0, botId?: string): Promise<Trade[]> {
+export async function getTrades(limit: number = 100, offset: number = 0, botId?: string, timeframe?: string): Promise<Trade[]> {
   const client = await pool.connect();
   try {
     let query = `SELECT * FROM trades`;
     const params: any[] = [];
-    let whereClause = '';
+    const conditions: string[] = [];
 
     // Handle bot filtering
     if (!botId || botId === 'all') {
       const activeBotIds = getActiveBotIds();
       if (activeBotIds.length > 0) {
-        whereClause = ` WHERE bot_id = ANY($1)`;
+        conditions.push(`bot_id = ANY($${params.length + 1})`);
         params.push(activeBotIds);
       }
     } else if (botId) {
-      whereClause = ` WHERE bot_id = $1`;
+      conditions.push(`bot_id = $${params.length + 1}`);
       params.push(botId);
     }
 
-    query += whereClause;
+    // Handle timeframe filtering
+    if (timeframe && timeframe !== 'all') {
+      conditions.push(`timeframe = $${params.length + 1}`);
+      params.push(timeframe);
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(' AND ')}`;
+    }
+
     query += ` ORDER BY closed_at DESC NULLS LAST, placed_at DESC`;
 
     // Add limit and offset
@@ -161,7 +171,7 @@ export async function getDailyEquity(days?: number, from?: string, to?: string):
  * Get cumulative PnL curve for a specific bot by summing up realized_pnl from trades
  * This creates a pseudo-equity curve showing the bot's performance over time
  */
-export async function getBotCumulativePnL(botId: string, days?: number, from?: string, to?: string): Promise<DailyEquity[]> {
+export async function getBotCumulativePnL(botId: string, days?: number, from?: string, to?: string, timeframe?: string): Promise<DailyEquity[]> {
   const client = await pool.connect();
   try {
     // Use CTE to first aggregate by day, then apply window function for cumulative sum
@@ -186,6 +196,13 @@ export async function getBotCumulativePnL(botId: string, days?: number, from?: s
       params.push(from, to);
     } else if (days) {
       query += ` AND closed_at >= NOW() - INTERVAL '${days} days'`;
+    }
+
+    // Timeframe filtering
+    if (timeframe && timeframe !== 'all') {
+      const timeframeParam = params.length + 1;
+      query += ` AND timeframe = $${timeframeParam}`;
+      params.push(timeframe);
     }
 
     query += `
@@ -229,7 +246,7 @@ export async function getBotCumulativePnL(botId: string, days?: number, from?: s
   }
 }
 
-export async function getStats(days?: number, botId?: string): Promise<Stats> {
+export async function getStats(days?: number, botId?: string, timeframe?: string): Promise<Stats> {
   const client = await pool.connect();
   try {
     let query = `
@@ -272,6 +289,11 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
     } else if (botId) {
       // Specific bot
       conditions.push(`bot_id = '${botId}'`);
+    }
+
+    // Handle timeframe filtering
+    if (timeframe && timeframe !== 'all') {
+      conditions.push(`timeframe = '${timeframe}'`);
     }
 
     if (conditions.length > 0) {
@@ -353,25 +375,34 @@ export async function getStats(days?: number, botId?: string): Promise<Stats> {
   }
 }
 
-export async function getTPDistribution(tpCount: number = 3, botId?: string): Promise<TPDistribution[]> {
+export async function getTPDistribution(tpCount: number = 3, botId?: string, timeframe?: string): Promise<TPDistribution[]> {
   const client = await pool.connect();
   try {
-    // Handle bot filtering
-    let botFilter = '';
+    // Build filter conditions
+    const filters: string[] = [];
+
+    // Bot filtering
     if (!botId || botId === 'all') {
       const activeBotIds = getActiveBotIds();
       if (activeBotIds.length > 0) {
         const botList = activeBotIds.map(id => `'${id}'`).join(', ');
-        botFilter = `AND bot_id IN (${botList})`;
+        filters.push(`bot_id IN (${botList})`);
       }
     } else if (botId) {
-      botFilter = `AND bot_id = '${botId}'`;
+      filters.push(`bot_id = '${botId}'`);
     }
+
+    // Timeframe filtering
+    if (timeframe && timeframe !== 'all') {
+      filters.push(`timeframe = '${timeframe}'`);
+    }
+
+    const filterClause = filters.length > 0 ? `AND ${filters.join(' AND ')}` : '';
 
     // Build dynamic query based on tpCount
     const queries: string[] = [];
     for (let i = 1; i <= tpCount; i++) {
-      queries.push(`SELECT ${i} as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= ${i} AND closed_at IS NOT NULL ${botFilter}`);
+      queries.push(`SELECT ${i} as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= ${i} AND closed_at IS NOT NULL ${filterClause}`);
     }
 
     const result = await client.query(`
@@ -384,26 +415,35 @@ export async function getTPDistribution(tpCount: number = 3, botId?: string): Pr
   }
 }
 
-export async function getDCADistribution(dcaCount: number = 2, botId?: string): Promise<DCADistribution[]> {
+export async function getDCADistribution(dcaCount: number = 2, botId?: string, timeframe?: string): Promise<DCADistribution[]> {
   const client = await pool.connect();
   try {
-    // Handle bot filtering
-    let botFilter = '';
+    // Build filter conditions
+    const filters: string[] = [];
+
+    // Bot filtering
     if (!botId || botId === 'all') {
       const activeBotIds = getActiveBotIds();
       if (activeBotIds.length > 0) {
         const botList = activeBotIds.map(id => `'${id}'`).join(', ');
-        botFilter = `AND bot_id IN (${botList})`;
+        filters.push(`bot_id IN (${botList})`);
       }
     } else if (botId) {
-      botFilter = `AND bot_id = '${botId}'`;
+      filters.push(`bot_id = '${botId}'`);
     }
+
+    // Timeframe filtering
+    if (timeframe && timeframe !== 'all') {
+      filters.push(`timeframe = '${timeframe}'`);
+    }
+
+    const filterClause = filters.length > 0 ? `AND ${filters.join(' AND ')}` : '';
 
     // Build dynamic query based on dcaCount
     // DCA0 = exactly 0 DCAs filled, DCA1 = exactly 1 DCA filled, etc.
     const queries: string[] = [];
     for (let i = 0; i <= dcaCount; i++) {
-      queries.push(`SELECT ${i} as dca_level, COUNT(*) as count FROM trades WHERE dca_fills = ${i} AND closed_at IS NOT NULL ${botFilter}`);
+      queries.push(`SELECT ${i} as dca_level, COUNT(*) as count FROM trades WHERE dca_fills = ${i} AND closed_at IS NOT NULL ${filterClause}`);
     }
 
     const result = await client.query(`
@@ -411,6 +451,44 @@ export async function getDCADistribution(dcaCount: number = 2, botId?: string): 
       ORDER BY dca_level
     `);
     return result.rows;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get all available timeframes from trades
+ */
+export async function getAvailableTimeframes(botId?: string): Promise<string[]> {
+  const client = await pool.connect();
+  try {
+    let query = `
+      SELECT DISTINCT timeframe
+      FROM trades
+      WHERE timeframe IS NOT NULL AND closed_at IS NOT NULL
+    `;
+
+    const conditions: string[] = [];
+
+    // Handle bot filtering
+    if (!botId || botId === 'all') {
+      const activeBotIds = getActiveBotIds();
+      if (activeBotIds.length > 0) {
+        const botList = activeBotIds.map(id => `'${id}'`).join(', ');
+        conditions.push(`bot_id IN (${botList})`);
+      }
+    } else if (botId) {
+      conditions.push(`bot_id = '${botId}'`);
+    }
+
+    if (conditions.length > 0) {
+      query += ` AND ${conditions.join(' AND ')}`;
+    }
+
+    query += ` ORDER BY timeframe ASC`;
+
+    const result = await client.query(query);
+    return result.rows.map(row => row.timeframe);
   } finally {
     client.release();
   }

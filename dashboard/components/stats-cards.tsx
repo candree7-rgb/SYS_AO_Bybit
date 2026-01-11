@@ -7,9 +7,10 @@ import { formatCurrency, formatPercent } from '@/lib/utils';
 interface StatsCardsProps {
   period?: number; // days, undefined = all time
   botId?: string;
+  timeframe?: string;
 }
 
-export default function StatsCards({ period, botId }: StatsCardsProps) {
+export default function StatsCards({ period, botId, timeframe }: StatsCardsProps) {
   const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -19,6 +20,7 @@ export default function StatsCards({ period, botId }: StatsCardsProps) {
         const params = new URLSearchParams();
         if (period) params.append('days', period.toString());
         if (botId && botId !== 'all') params.append('botId', botId);
+        if (timeframe && timeframe !== 'all') params.append('timeframe', timeframe);
 
         const url = `/api/stats${params.toString() ? `?${params.toString()}` : ''}`;
         const res = await fetch(url);
@@ -34,7 +36,7 @@ export default function StatsCards({ period, botId }: StatsCardsProps) {
     fetchStats();
     const interval = setInterval(fetchStats, 30000); // Refresh every 30s
     return () => clearInterval(interval);
-  }, [period, botId]);
+  }, [period, botId, timeframe]);
 
   if (loading) {
     return (

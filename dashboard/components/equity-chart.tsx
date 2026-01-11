@@ -10,9 +10,10 @@ import DateRangePicker from '@/components/date-range-picker';
 
 interface EquityChartProps {
   botId?: string;
+  timeframe?: string;
 }
 
-export default function EquityChart({ botId = 'all' }: EquityChartProps) {
+export default function EquityChart({ botId = 'all', timeframe }: EquityChartProps) {
   const [data, setData] = useState<DailyEquity[]>([]);
   const [loading, setLoading] = useState(true);
   const [timeRange, setTimeRange] = useState<TimeRange>('1M');
@@ -35,6 +36,7 @@ export default function EquityChart({ botId = 'all' }: EquityChartProps) {
         }
 
         if (botId && botId !== 'all') params.append('botId', botId);
+        if (timeframe && timeframe !== 'all') params.append('timeframe', timeframe);
 
         const res = await fetch(`/api/equity?${params.toString()}`);
         const equity = await res.json();
@@ -49,7 +51,7 @@ export default function EquityChart({ botId = 'all' }: EquityChartProps) {
     fetchEquity();
     const interval = setInterval(fetchEquity, 60000); // Refresh every 60s
     return () => clearInterval(interval);
-  }, [timeRange, customDateRange, botId]);
+  }, [timeRange, customDateRange, botId, timeframe]);
 
   const handleCustomDateApply = (from: string, to: string) => {
     setCustomDateRange({ from, to });

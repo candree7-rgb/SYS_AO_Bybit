@@ -7,10 +7,12 @@ import TradesTable from '@/components/trades-table';
 import TPDistributionChart from '@/components/tp-distribution';
 import DCADistributionChart from '@/components/dca-distribution';
 import BotTabs from '@/components/bot-tabs';
+import TimeframeSelector from '@/components/timeframe-selector';
 import { getBotConfig } from '@/lib/bot-config';
 
 export default function Dashboard() {
   const [selectedBot, setSelectedBot] = useState<string>('all');
+  const [selectedTimeframe, setSelectedTimeframe] = useState<string>('all');
   const botConfig = getBotConfig(selectedBot);
 
   return (
@@ -24,26 +26,35 @@ export default function Dashboard() {
       {/* Bot Tabs */}
       <BotTabs selectedBot={selectedBot} onSelectBot={setSelectedBot} />
 
+      {/* Timeframe Selector */}
+      <div className="mb-6">
+        <TimeframeSelector
+          selectedTimeframe={selectedTimeframe}
+          onSelectTimeframe={setSelectedTimeframe}
+          botId={selectedBot}
+        />
+      </div>
+
       {/* Stats Cards - All Time */}
       <div className="mb-8">
         <h2 className="text-2xl font-bold mb-4">All Time Performance</h2>
-        <StatsCards botId={selectedBot} />
+        <StatsCards botId={selectedBot} timeframe={selectedTimeframe} />
       </div>
 
       {/* Equity Chart */}
       <div className="mb-8">
-        <EquityChart botId={selectedBot} />
+        <EquityChart botId={selectedBot} timeframe={selectedTimeframe} />
       </div>
 
       {/* TP & DCA Distribution */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-        <TPDistributionChart botId={selectedBot} />
-        {botConfig.dcaCount > 0 && <DCADistributionChart botId={selectedBot} />}
+        <TPDistributionChart botId={selectedBot} timeframe={selectedTimeframe} />
+        {botConfig.dcaCount > 0 && <DCADistributionChart botId={selectedBot} timeframe={selectedTimeframe} />}
       </div>
 
       {/* Trade History Table */}
       <div className="mb-8">
-        <TradesTable botId={selectedBot} />
+        <TradesTable botId={selectedBot} timeframe={selectedTimeframe} />
       </div>
 
       {/* Footer */}
