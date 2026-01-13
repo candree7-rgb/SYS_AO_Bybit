@@ -859,6 +859,69 @@ class TradeEngine:
                         self.log.warning(f"Cancel failed {tr['symbol']} ({tid}): {e}")
                 tr["status"] = "expired"
 
+    def check_entry_order_validity(self) -> None:
+        """Cancel entry orders if TP1 was already reached before entry filled.
+
+        This prevents entries from being filled AFTER the signal has already
+        moved past TP1 (signal is "expired").
+        """
+        for tid, tr in list(self.state.get("open_trades", {}).items()):
+            if tr.get("status") != "pending":
+                continue
+
+            symbol = tr["symbol"]
+            side = tr["order_side"]  # Buy/Sell
+            tp_prices = tr.get("tp_prices") or []
+
+            if not tp_prices:
+                continue
+
+            tp1_price = float(tp_prices[0])
+
+            try:
+                current_price = self.bybit.last_price(CATEGORY, symbol)
+                if not current_price:
+                    continue
+
+                tp1_reached = False
+
+                if side == "Buy":  # LONG: TP1 is above entry
+                    if current_price >= tp1_price:
+                        tp1_reached = True
+                        self.log.info(f"📈 TP1 reached before entry for {symbol} ({current_price} >= {tp1_price})")
+                else:  # SHORT: TP1 is below entry
+                    if current_price <= tp1_price:
+                        tp1_reached = True
+                        self.log.info(f"📉 TP1 reached before entry for {symbol} ({current_price} <= {tp1_price})")
+
+                if tp1_reached:
+                    # Cancel entry order
+                    oid = tr.get("entry_order_id")
+                    if oid and oid != "DRY_RUN":
+                        try:
+                            self.cancel_entry(symbol, oid)
+                            self.log.info(f"🚫 Canceled entry order for {symbol} - TP1 already reached")
+
+                            # Send Telegram notification
+                            if telegram_alerts.is_enabled():
+                                direction = "LONG" if side == "Buy" else "SHORT"
+                                message = (
+                                    f"⚠️ <b>Entry Order Canceled</b>\n\n"
+                                    f"<b>{symbol}</b> {direction}\n"
+                                    f"Reason: TP1 reached before entry\n"
+                                    f"Entry Price: ${tr.get('trigger', 0):.6f}\n"
+                                    f"Current Price: ${current_price:.6f}\n"
+                                    f"TP1 Price: ${tp1_price:.6f}"
+                                )
+                                telegram_alerts.send_message(message)
+                        except Exception as e:
+                            self.log.warning(f"Failed to cancel entry for {symbol}: {e}")
+
+                    tr["status"] = "cancelled_tp1_reached"
+
+            except Exception as e:
+                self.log.debug(f"Entry validity check failed for {symbol}: {e}")
+
     def check_position_alerts(self) -> None:
         """Check all open positions and send Telegram alerts if thresholds crossed."""
         if not telegram_alerts.is_enabled():

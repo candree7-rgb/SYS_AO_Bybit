@@ -223,6 +223,7 @@ def main():
 
             # maintenance first
             engine.cancel_expired_entries()
+            engine.check_entry_order_validity()  # Cancel entry if TP1 reached before entry filled
             engine.cleanup_closed_trades()
             engine.check_tp_fills_fallback()  # Catch TP1 fills if WS missed
             engine.check_position_alerts()    # Send Telegram alerts if position P&L crosses thresholds
