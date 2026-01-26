@@ -9,7 +9,7 @@ from config import (
     BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_DEMO, RECV_WINDOW, ACCOUNT_TYPE,
     CATEGORY, QUOTE, LEVERAGE, RISK_PCT,
     MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
-    POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC,
+    POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC, SIGNAL_UPDATE_INTERVAL_OPEN_SEC,
     STATE_FILE, DRY_RUN, LOG_LEVEL
 )
 from bybit_v5 import BybitV5
@@ -59,6 +59,37 @@ def check_signal_updates(discord, engine, st, log):
             if not txt:
                 continue
 
+            # Check for TRADE CLOSED (manual close by signal provider)
+            if "TRADE CLOSED" in txt.upper():
+                log.warning(f"🚫 Signal CLOSED for {tr['symbol']} - closing position")
+                if tr.get("status") == "open":
+                    try:
+                        # Force close position
+                        size, _ = engine.position_size_avg(tr["symbol"])
+                        if size > 0:
+                            engine._cancel_all_trade_orders(tr)
+                            close_side = "Buy" if tr["order_side"] == "Sell" else "Sell"
+                            engine.bybit.place_order({
+                                "category": CATEGORY,
+                                "symbol": tr["symbol"],
+                                "side": close_side,
+                                "orderType": "Market",
+                                "qty": str(size),
+                                "reduceOnly": True,
+                            })
+                            tr["exit_reason"] = "signal_closed"
+                            log.info(f"✅ Position closed via signal for {tr['symbol']}")
+                    except Exception as e:
+                        log.warning(f"Failed to close position for {tr['symbol']}: {e}")
+                elif tr.get("status") == "pending":
+                    # Cancel entry order
+                    entry_oid = tr.get("entry_order_id")
+                    if entry_oid:
+                        engine.cancel_entry(tr["symbol"], entry_oid)
+                    tr["status"] = "cancelled"
+                    tr["exit_reason"] = "signal_closed"
+                continue
+
             # Check for TRADE CANCELLED
             if "TRADE CANCELLED" in txt.upper() or "CLOSED WITHOUT ENTRY" in txt.upper():
                 log.warning(f"❌ Signal CANCELLED for {tr['symbol']} - cancelling all orders")
@@ -94,13 +125,16 @@ def check_signal_updates(discord, engine, st, log):
                 if is_open:
                     engine._move_sl(tr["symbol"], new_sl)
 
-            # TP Update Check
+            # TP Update Check (detect ANY change in TP prices)
             tps_changed = False
             if new_tps and len(new_tps) > 0:
+                # Limit to max 3 TPs (ignore TP4+ because we trail after TP3)
+                new_tps = new_tps[:3]
+
                 if len(new_tps) != len(old_tps):
                     tps_changed = True
                 elif any(abs(float(new_tps[i]) - float(old_tps[i])) > 0.0000001
-                         for i in range(len(new_tps))):
+                         for i in range(min(len(new_tps), len(old_tps)))):
                     tps_changed = True
 
             if tps_changed:
@@ -110,12 +144,24 @@ def check_signal_updates(discord, engine, st, log):
                 else:
                     tr["tp_prices"] = new_tps
 
-            # DCA Update Check (only if previously empty)
-            if new_dcas and not old_dcas:
-                log.info(f"🔄 Signal DCA added for {tr['symbol']}: {new_dcas}")
+            # DCA Update Check (detect ANY change in DCA prices, not just additions)
+            dcas_changed = False
+            if new_dcas:
+                # Always use all available DCAs (config allows up to 3)
+                if len(new_dcas) != len(old_dcas):
+                    dcas_changed = True
+                elif old_dcas and any(abs(float(new_dcas[i]) - float(old_dcas[i])) > 0.0000001
+                                     for i in range(min(len(new_dcas), len(old_dcas)))):
+                    dcas_changed = True
+
+            if dcas_changed or (new_dcas and not old_dcas):
+                log.info(f"🔄 Signal DCA updated for {tr['symbol']}: {old_dcas} → {new_dcas}")
                 tr["dca_prices"] = new_dcas
+                # If DCAs not placed yet or changed significantly, place/update them
                 if is_open and not tr.get("dca_orders_placed"):
                     engine.place_dca_orders(tr)
+                # Note: If DCAs change after placement, we log but don't cancel/replace
+                # (safer to let existing DCAs stay active)
 
         except Exception as e:
             log.debug(f"Signal update check failed for {tr.get('symbol')}: {e}")
@@ -168,8 +214,9 @@ def main():
     last_heartbeat = time.time()
     HEARTBEAT_INTERVAL = 300  # Log heartbeat every 5 minutes
 
-    # Signal update tracking
-    last_signal_update_check = time.time() - (SIGNAL_UPDATE_INTERVAL_SEC - 5)  # First check after 5 seconds
+    # Signal update tracking (dynamic intervals: 60s for pending, 10s for open)
+    last_signal_update_check_pending = time.time() - (SIGNAL_UPDATE_INTERVAL_SEC - 5)  # First check after 5 seconds
+    last_signal_update_check_open = time.time() - (SIGNAL_UPDATE_INTERVAL_OPEN_SEC - 3)  # First check after 3 seconds
 
     # ----- WS thread -----
     ws_err = {"err": None}
@@ -216,10 +263,20 @@ def main():
                 log.info(f"💓 Heartbeat: {len(active)} active trade(s), {trades_today()} today")
                 last_heartbeat = time.time()
 
-            # Check for signal updates
-            if time.time() - last_signal_update_check > SIGNAL_UPDATE_INTERVAL_SEC:
+            # Check for signal updates (dynamic interval: 60s for pending, 10s for open)
+            active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending", "open")]
+            has_open_trades = any(tr.get("status") == "open" for tr in active)
+            has_pending_trades = any(tr.get("status") == "pending" for tr in active)
+
+            # Check open trades every 10 seconds
+            if has_open_trades and time.time() - last_signal_update_check_open > SIGNAL_UPDATE_INTERVAL_OPEN_SEC:
                 check_signal_updates(discord, engine, st, log)
-                last_signal_update_check = time.time()
+                last_signal_update_check_open = time.time()
+                last_signal_update_check_pending = time.time()  # Also reset pending timer
+            # Check pending trades every 60 seconds (if no open trades)
+            elif has_pending_trades and time.time() - last_signal_update_check_pending > SIGNAL_UPDATE_INTERVAL_SEC:
+                check_signal_updates(discord, engine, st, log)
+                last_signal_update_check_pending = time.time()
 
             # maintenance first
             engine.cancel_expired_entries()

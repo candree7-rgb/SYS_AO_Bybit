@@ -79,7 +79,8 @@ DCA_QTY_MULTS = [float(x) for x in _get("DCA_QTY_MULTS","1.5,2.25").split(",") i
 # Timing
 POLL_SECONDS    = _get_int("POLL_SECONDS","15")
 POLL_JITTER_MAX = _get_int("POLL_JITTER_MAX","5")
-SIGNAL_UPDATE_INTERVAL_SEC = _get_int("SIGNAL_UPDATE_INTERVAL_SEC","60")  # Check for signal updates every 60s
+SIGNAL_UPDATE_INTERVAL_SEC = _get_int("SIGNAL_UPDATE_INTERVAL_SEC","60")  # Check for signal updates every 60s (pending trades)
+SIGNAL_UPDATE_INTERVAL_OPEN_SEC = _get_int("SIGNAL_UPDATE_INTERVAL_OPEN_SEC","10")  # Check every 10s for open trades
 
 # Misc
 DRY_RUN     = _get_bool("DRY_RUN","true")
