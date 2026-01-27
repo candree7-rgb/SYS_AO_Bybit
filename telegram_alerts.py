@@ -157,3 +157,50 @@ def send_trade_closed(
         f"TPs Hit: {tp_fills} | DCAs: {dca_fills}"
     )
     send_message(message)
+
+
+def send_entry_pending(symbol: str, side: str, entry: float, qty: float) -> None:
+    """Send notification when entry order is placed (pending)."""
+    if not is_enabled():
+        return
+
+    direction = "SHORT" if side == "Sell" else "LONG"
+    emoji = "⏳"
+    message = (
+        f"{emoji} <b>Entry Order Placed</b>\n\n"
+        f"<b>{symbol}</b> {direction}\n"
+        f"Entry: ${entry:.6f}\n"
+        f"Size: {qty}"
+    )
+    send_message(message)
+
+
+def send_dca_filled(symbol: str, side: str, dca_num: int, dca_fills: int, dca_count: int, avg_entry: float) -> None:
+    """Send notification when a DCA order is filled."""
+    if not is_enabled():
+        return
+
+    direction = "SHORT" if side == "Sell" else "LONG"
+    emoji = "📈"
+    message = (
+        f"{emoji} <b>DCA{dca_num} Filled</b>\n\n"
+        f"<b>{symbol}</b> {direction}\n"
+        f"DCAs: {dca_fills}/{dca_count}\n"
+        f"New Avg Entry: ${avg_entry:.6f}"
+    )
+    send_message(message)
+
+
+def send_order_canceled(symbol: str, side: str, reason: str) -> None:
+    """Send notification when an order is canceled."""
+    if not is_enabled():
+        return
+
+    direction = "SHORT" if side == "Sell" else "LONG"
+    emoji = "🚫"
+    message = (
+        f"{emoji} <b>Order Canceled</b>\n\n"
+        f"<b>{symbol}</b> {direction}\n"
+        f"Reason: {reason}"
+    )
+    send_message(message)

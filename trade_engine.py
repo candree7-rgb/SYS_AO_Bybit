@@ -632,6 +632,20 @@ class TradeEngine:
                         self._recalculate_tps_after_dca(tr)
                     except Exception as e:
                         self.log.warning(f"TP recalculation failed after DCA{dca_num}: {e}")
+
+                    # Send Telegram notification for DCA filled
+                    try:
+                        _, avg_entry = self.position_size_avg(tr["symbol"])
+                        telegram_alerts.send_dca_filled(
+                            symbol=tr["symbol"],
+                            side=tr["order_side"],
+                            dca_num=dca_num,
+                            dca_fills=tr["dca_fills"],
+                            dca_count=dca_count,
+                            avg_entry=avg_entry if avg_entry else float(tr.get("entry_price") or 0)
+                        )
+                    except Exception as e:
+                        self.log.debug(f"Failed to send DCA telegram alert: {e}")
             return
 
         # TP fills / other events: orderLinkId pattern "<trade_id>:TP1"
@@ -855,6 +869,12 @@ class TradeEngine:
                     try:
                         self.cancel_entry(tr["symbol"], oid)
                         self.log.info(f"⏳ Canceled expired entry {tr['symbol']} ({tid})")
+                        # Send Telegram notification
+                        telegram_alerts.send_order_canceled(
+                            symbol=tr["symbol"],
+                            side=tr["order_side"],
+                            reason=f"Entry expired ({ENTRY_EXPIRATION_MIN} min)"
+                        )
                     except Exception as e:
                         self.log.warning(f"Cancel failed {tr['symbol']} ({tid}): {e}")
                 tr["status"] = "expired"
@@ -903,17 +923,11 @@ class TradeEngine:
                             self.log.info(f"🚫 Canceled entry order for {symbol} - TP1 already reached")
 
                             # Send Telegram notification
-                            if telegram_alerts.is_enabled():
-                                direction = "LONG" if side == "Buy" else "SHORT"
-                                message = (
-                                    f"⚠️ <b>Entry Order Canceled</b>\n\n"
-                                    f"<b>{symbol}</b> {direction}\n"
-                                    f"Reason: TP1 reached before entry\n"
-                                    f"Entry Price: ${tr.get('trigger', 0):.6f}\n"
-                                    f"Current Price: ${current_price:.6f}\n"
-                                    f"TP1 Price: ${tp1_price:.6f}"
-                                )
-                                telegram_alerts.send_message(message)
+                            telegram_alerts.send_order_canceled(
+                                symbol=symbol,
+                                side=side,
+                                reason=f"TP1 reached before entry (Current: ${current_price:.6f}, TP1: ${tp1_price:.6f})"
+                            )
                         except Exception as e:
                             self.log.warning(f"Failed to cancel entry for {symbol}: {e}")
 

@@ -18,6 +18,7 @@ from signal_parser import parse_signal, signal_hash, parse_signal_update
 from state import load_state, save_state, utc_day_key
 from trade_engine import TradeEngine
 import db_export
+import telegram_alerts
 
 def setup_logger() -> logging.Logger:
     log = logging.getLogger("bot")
@@ -61,31 +62,32 @@ def check_signal_updates(discord, engine, st, log):
 
             # Check for TRADE CLOSED (manual close by signal provider)
             if "TRADE CLOSED" in txt.upper():
-                log.warning(f"🚫 Signal CLOSED for {tr['symbol']} - closing position")
+                log.warning(f"🚨 Signal CLOSED detected for {tr['symbol']} - sending Telegram alert")
+
+                # Send Telegram warning (don't auto-close position)
                 if tr.get("status") == "open":
-                    try:
-                        # Force close position
-                        size, _ = engine.position_size_avg(tr["symbol"])
-                        if size > 0:
-                            engine._cancel_all_trade_orders(tr)
-                            close_side = "Buy" if tr["order_side"] == "Sell" else "Sell"
-                            engine.bybit.place_order({
-                                "category": CATEGORY,
-                                "symbol": tr["symbol"],
-                                "side": close_side,
-                                "orderType": "Market",
-                                "qty": str(size),
-                                "reduceOnly": True,
-                            })
-                            tr["exit_reason"] = "signal_closed"
-                            log.info(f"✅ Position closed via signal for {tr['symbol']}")
-                    except Exception as e:
-                        log.warning(f"Failed to close position for {tr['symbol']}: {e}")
+                    direction = "SHORT" if tr["order_side"] == "Sell" else "LONG"
+                    message = (
+                        f"🚨 <b>Signal Provider Closed Trade</b>\n\n"
+                        f"<b>{tr['symbol']}</b> {direction}\n"
+                        f"Status: Position still OPEN\n\n"
+                        f"⚠️ Consider closing position manually"
+                    )
+                    telegram_alerts.send_message(message)
+                    log.info(f"   Telegram alert sent for {tr['symbol']}")
                 elif tr.get("status") == "pending":
-                    # Cancel entry order
+                    # Cancel entry order for pending trades
                     entry_oid = tr.get("entry_order_id")
-                    if entry_oid:
-                        engine.cancel_entry(tr["symbol"], entry_oid)
+                    if entry_oid and entry_oid != "DRY_RUN":
+                        try:
+                            engine.cancel_entry(tr["symbol"], entry_oid)
+                            telegram_alerts.send_order_canceled(
+                                symbol=tr["symbol"],
+                                side=tr["order_side"],
+                                reason="Signal provider closed trade"
+                            )
+                        except Exception as e:
+                            log.warning(f"Failed to cancel entry for {tr['symbol']}: {e}")
                     tr["status"] = "cancelled"
                     tr["exit_reason"] = "signal_closed"
                 continue
@@ -397,6 +399,14 @@ def main():
                     }
                     inc_trades_today()
                     log.info(f"🟡 ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")
+
+                    # Send Telegram notification for pending entry
+                    telegram_alerts.send_entry_pending(
+                        symbol=sig["symbol"],
+                        side="Sell" if sig["side"] == "sell" else "Buy",
+                        entry=float(sig["trigger"]),
+                        qty=st["open_trades"][trade_id]["base_qty"]
+                    )
 
                     # stop if we hit limits mid-batch
                     active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending","open")]
