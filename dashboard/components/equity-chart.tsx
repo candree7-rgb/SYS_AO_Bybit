@@ -19,6 +19,7 @@ export default function EquityChart({ botId = 'all', timeframe }: EquityChartPro
   const [timeRange, setTimeRange] = useState<TimeRange>('1M');
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [customDateRange, setCustomDateRange] = useState<{ from: string; to: string } | null>(null);
+  const [liveEquity, setLiveEquity] = useState<number | null>(null);
 
   useEffect(() => {
     async function fetchEquity() {
@@ -41,6 +42,21 @@ export default function EquityChart({ botId = 'all', timeframe }: EquityChartPro
         const res = await fetch(`/api/equity?${params.toString()}`);
         const equity = await res.json();
         setData(equity);
+
+        // For "all bots", fetch live equity from Bybit
+        if (botId === 'all') {
+          try {
+            const liveRes = await fetch('/api/live-equity');
+            const liveData = await liveRes.json();
+            if (liveData.equity) {
+              setLiveEquity(liveData.equity);
+            }
+          } catch (err) {
+            console.error('Failed to fetch live equity:', err);
+          }
+        } else {
+          setLiveEquity(null);
+        }
       } catch (error) {
         console.error('Failed to fetch equity:', error);
       } finally {
@@ -89,6 +105,10 @@ export default function EquityChart({ botId = 'all', timeframe }: EquityChartPro
   const totalPnL = currentEquity - startEquity;
   const totalPnLPct = startEquity > 0 ? ((totalPnL / startEquity) * 100) : 0;
 
+  // For "all bots", show live equity if available
+  const displayEquity = (botId === 'all' && liveEquity !== null) ? liveEquity : currentEquity;
+  const isAllBots = botId === 'all';
+
   const displayLabel = timeRange === 'CUSTOM' && customDateRange
     ? `${format(new Date(customDateRange.from), 'MMM dd, yyyy')} - ${format(new Date(customDateRange.to), 'MMM dd, yyyy')}`
     : timeRange;
@@ -106,7 +126,7 @@ export default function EquityChart({ botId = 'all', timeframe }: EquityChartPro
           {/* Header with Title and Time Range Selector */}
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <div>
-              <h2 className="text-xl font-bold">Equity Curve</h2>
+              <h2 className="text-xl font-bold">{isAllBots ? 'Account Equity' : 'Performance Curve'}</h2>
               {timeRange === 'CUSTOM' && customDateRange && (
                 <p className="text-sm text-muted-foreground mt-1">
                   {format(new Date(customDateRange.from), 'MMM dd, yyyy')} - {format(new Date(customDateRange.to), 'MMM dd, yyyy')}
@@ -123,10 +143,15 @@ export default function EquityChart({ botId = 'all', timeframe }: EquityChartPro
         {/* Equity Stats */}
         <div className="flex items-center justify-between p-4 bg-muted/50 rounded-lg">
           <div>
-            <div className="text-sm text-muted-foreground mb-1">Current Equity</div>
-            <div className="text-3xl font-bold text-foreground">
-              {formatCurrency(currentEquity)}
+            <div className="text-sm text-muted-foreground mb-1">
+              {isAllBots ? 'Current Equity' : 'Total P&L'}
             </div>
+            <div className="text-3xl font-bold text-foreground">
+              {formatCurrency(displayEquity)}
+            </div>
+            {isAllBots && liveEquity !== null && (
+              <div className="text-xs text-muted-foreground mt-1">Live from Bybit</div>
+            )}
           </div>
           <div className="text-right">
             <div className="text-sm text-muted-foreground mb-1">

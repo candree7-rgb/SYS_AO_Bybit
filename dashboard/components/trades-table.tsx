@@ -9,6 +9,45 @@ interface TradesTableProps {
   timeframe?: string;
 }
 
+// Format exit reason into compact badge labels
+function formatExitReason(exitReason: string): { label: string; variant: 'tp' | 'dca' | 'trail' | 'sl' | 'neutral' }[] {
+  if (!exitReason) return [{ label: '-', variant: 'neutral' }];
+
+  const reason = exitReason.toLowerCase();
+  const badges: { label: string; variant: 'tp' | 'dca' | 'trail' | 'sl' | 'neutral' }[] = [];
+
+  // TP exits
+  if (reason.includes('tp1')) badges.push({ label: 'TP1', variant: 'tp' });
+  if (reason.includes('tp2')) badges.push({ label: 'TP2', variant: 'tp' });
+  if (reason.includes('tp3')) badges.push({ label: 'TP3', variant: 'tp' });
+  if (reason.includes('tp4')) badges.push({ label: 'TP4', variant: 'tp' });
+  if (reason.includes('tp5')) badges.push({ label: 'TP5', variant: 'tp' });
+
+  // Trailing
+  if (reason.includes('trailing')) badges.push({ label: 'TRAIL', variant: 'trail' });
+
+  // Breakeven
+  if (reason.includes('breakeven')) badges.push({ label: 'BE', variant: 'neutral' });
+
+  // Stop loss
+  if (reason.includes('stop_loss') || reason === 'sl') badges.push({ label: 'SL', variant: 'sl' });
+
+  // Manual/Signal
+  if (reason.includes('manual')) badges.push({ label: 'MANUAL', variant: 'neutral' });
+  if (reason.includes('signal_closed')) badges.push({ label: 'CLOSED', variant: 'neutral' });
+
+  // Expired/Cancelled
+  if (reason.includes('expired')) badges.push({ label: 'EXPIRED', variant: 'neutral' });
+  if (reason.includes('cancelled')) badges.push({ label: 'CANCEL', variant: 'neutral' });
+
+  // If no matches, show capitalized reason
+  if (badges.length === 0) {
+    badges.push({ label: reason.replace(/_/g, ' ').toUpperCase().slice(0, 8), variant: 'neutral' });
+  }
+
+  return badges;
+}
+
 export default function TradesTable({ botId, timeframe }: TradesTableProps) {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [loading, setLoading] = useState(true);
@@ -100,7 +139,7 @@ export default function TradesTable({ botId, timeframe }: TradesTableProps) {
               <TableHeader onClick={() => handleSort('duration_minutes')}>Duration</TableHeader>
               <TableHeader onClick={() => handleSort('realized_pnl')}>P&L</TableHeader>
               <TableHeader onClick={() => handleSort('pnl_pct_equity')}>P&L %</TableHeader>
-              <TableHeader onClick={() => handleSort('exit_reason')}>Exit Reason</TableHeader>
+              <TableHeader onClick={() => handleSort('exit_reason')}>Exit</TableHeader>
               <TableHeader>TPs/DCAs</TableHeader>
             </tr>
           </thead>
@@ -187,11 +226,24 @@ export default function TradesTable({ botId, timeframe }: TradesTableProps) {
                   </span>
                 </td>
 
-                {/* Exit Reason */}
-                <td className="px-4 py-4 text-sm">
-                  <span className="capitalize">
-                    {trade.exit_reason.replace(/_/g, ' ')}
-                  </span>
+                {/* Exit */}
+                <td className="px-4 py-4">
+                  <div className="flex flex-wrap gap-1">
+                    {formatExitReason(trade.exit_reason).map((badge, idx) => (
+                      <span
+                        key={idx}
+                        className={cn(
+                          'px-2 py-0.5 rounded text-xs font-semibold',
+                          badge.variant === 'tp' && 'bg-success/20 text-success',
+                          badge.variant === 'trail' && 'bg-primary/20 text-primary',
+                          badge.variant === 'sl' && 'bg-danger/20 text-danger',
+                          badge.variant === 'neutral' && 'bg-muted text-muted-foreground'
+                        )}
+                      >
+                        {badge.label}
+                      </span>
+                    ))}
+                  </div>
                 </td>
 
                 {/* TPs/DCAs */}
