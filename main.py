@@ -18,6 +18,7 @@ from signal_parser import parse_signal, signal_hash, parse_signal_update
 from state import load_state, save_state, utc_day_key
 from trade_engine import TradeEngine
 import db_export
+import telegram_alerts
 
 def setup_logger() -> logging.Logger:
     log = logging.getLogger("bot")
@@ -397,6 +398,14 @@ def main():
                     }
                     inc_trades_today()
                     log.info(f"🟡 ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")
+
+                    # Send Telegram notification for pending entry
+                    telegram_alerts.send_entry_pending(
+                        symbol=sig["symbol"],
+                        side="Sell" if sig["side"] == "sell" else "Buy",
+                        entry=float(sig["trigger"]),
+                        qty=st["open_trades"][trade_id]["base_qty"]
+                    )
 
                     # stop if we hit limits mid-batch
                     active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending","open")]
