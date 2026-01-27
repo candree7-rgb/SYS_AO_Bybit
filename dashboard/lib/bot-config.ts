@@ -14,8 +14,8 @@ export const BOT_CONFIGS: Record<string, BotConfig> = {
     id: 'all',
     name: 'All Bots',
     description: 'Combined performance',
-    tpCount: 6,  // Max for display purposes (RVN has 6)
-    dcaCount: 2, // Max for display purposes
+    tpCount: 3,  // Max TPs for active bots (ao, zia)
+    dcaCount: 3, // Max DCAs for active bots (ao, zia)
     hasTrailing: true,
     hasBreakeven: true,
     isActive: true,
@@ -23,9 +23,9 @@ export const BOT_CONFIGS: Record<string, BotConfig> = {
   ao: {
     id: 'ao',
     name: 'AO',
-    description: '1.5% equity, 3 TPs +Trailing, 2 DCAs',
+    description: '1.5% equity, 3 TPs +Trailing, 3 DCAs',
     tpCount: 3,
-    dcaCount: 2,
+    dcaCount: 3,
     hasTrailing: true,
     hasBreakeven: true,
     isActive: true,
@@ -93,9 +93,9 @@ export const BOT_CONFIGS: Record<string, BotConfig> = {
   zia: {
     id: 'zia',
     name: 'ZIA',
-    description: 'Similar to AO: 3 TPs, 2 DCAs, no trailing',
+    description: 'Similar to AO: 3 TPs, 3 DCAs, no trailing',
     tpCount: 3,
-    dcaCount: 2,
+    dcaCount: 3,
     hasTrailing: false,
     hasBreakeven: true,
     isActive: true,
