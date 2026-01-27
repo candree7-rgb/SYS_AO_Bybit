@@ -93,10 +93,10 @@ export const BOT_CONFIGS: Record<string, BotConfig> = {
   zia: {
     id: 'zia',
     name: 'ZIA',
-    description: 'ZIA bot configuration',
+    description: 'Similar to AO: 3 TPs, 2 DCAs, no trailing',
     tpCount: 3,
     dcaCount: 2,
-    hasTrailing: true,
+    hasTrailing: false,
     hasBreakeven: true,
     isActive: true,
   },
