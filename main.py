@@ -117,6 +117,40 @@ def check_signal_updates(discord, engine, st, log):
                 tr["exit_reason"] = "signal_cancelled"
                 continue
 
+            # Check for TP1 HIT while entry is still pending
+            if tr.get("status") == "pending":
+                # Check if TP1 is marked as HIT in Discord message
+                # Examples: "TP1: $0.13798 ✅ HIT (+20.00%)" or "TP1 ✅" or "✅ TP1 HIT"
+                txt_upper = txt.upper()
+                tp1_hit = False
+
+                # Check for various TP1 HIT patterns
+                if "TP1" in txt_upper and ("HIT" in txt_upper or "✅" in txt):
+                    # Verify it's actually marked as hit, not just mentioned
+                    # Look for patterns like "TP1 ✅", "TP1: ... ✅", "TP1 HIT"
+                    import re
+                    # Match: TP1 followed (within ~50 chars) by either ✅ or HIT
+                    if re.search(r'TP1.{0,50}(✅|HIT)', txt_upper):
+                        tp1_hit = True
+
+                if tp1_hit:
+                    log.warning(f"🚫 TP1 marked as HIT in Discord for {tr['symbol']} - cancelling pending entry")
+                    entry_oid = tr.get("entry_order_id")
+                    if entry_oid and entry_oid != "DRY_RUN":
+                        try:
+                            engine.cancel_entry(tr["symbol"], entry_oid)
+                            telegram_alerts.send_order_canceled(
+                                symbol=tr["symbol"],
+                                side=tr["order_side"],
+                                reason="TP1 marked as HIT in signal (entry not filled)"
+                            )
+                            log.info(f"   Entry order cancelled for {tr['symbol']}")
+                        except Exception as e:
+                            log.warning(f"Failed to cancel entry for {tr['symbol']}: {e}")
+                    tr["status"] = "cancelled_tp1_hit"
+                    tr["exit_reason"] = "tp1_hit_before_entry"
+                    continue
+
             # Parse SL/TP/DCA from the text
             sig = parse_signal_update(txt)
 
