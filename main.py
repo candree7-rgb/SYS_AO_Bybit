@@ -52,7 +52,17 @@ def check_signal_updates(discord, engine, st, log):
             # Fetch the current Discord message
             msg = discord.fetch_message(str(msg_id))
             if not msg:
-                log.warning(f"   {tr.get('symbol')}: Could not fetch msg {msg_id}")
+                # Track failed fetch attempts to avoid log spam
+                failed_fetches = tr.get("discord_fetch_failures", 0)
+                failed_fetches += 1
+                tr["discord_fetch_failures"] = failed_fetches
+
+                # Log only first time and every 10th attempt
+                if failed_fetches == 1:
+                    log.warning(f"   {tr.get('symbol')}: Could not fetch Discord msg {msg_id} (message deleted or API issue)")
+                elif failed_fetches >= 10:
+                    log.warning(f"   {tr.get('symbol')}: Still unable to fetch msg {msg_id} after {failed_fetches} attempts - removing discord_msg_id")
+                    tr["discord_msg_id"] = None  # Stop trying after 10 failed attempts
                 continue
 
             # Extract text from the message
