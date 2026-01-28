@@ -885,6 +885,12 @@ class TradeEngine:
         This prevents entries from being filled AFTER the signal has already
         moved past TP1 (signal is "expired").
         """
+        pending_entries = [tr for tr in self.state.get("open_trades", {}).values() if tr.get("status") == "pending"]
+        if not pending_entries:
+            return
+
+        self.log.debug(f"Checking {len(pending_entries)} pending entry order(s) for TP1 validity...")
+
         for tid, tr in list(self.state.get("open_trades", {}).items()):
             if tr.get("status") != "pending":
                 continue
@@ -894,6 +900,7 @@ class TradeEngine:
             tp_prices = tr.get("tp_prices") or []
 
             if not tp_prices:
+                self.log.debug(f"   {symbol}: No TP prices, skipping TP1 check")
                 continue
 
             tp1_price = float(tp_prices[0])
@@ -901,6 +908,7 @@ class TradeEngine:
             try:
                 current_price = self.bybit.last_price(CATEGORY, symbol)
                 if not current_price:
+                    self.log.warning(f"   {symbol}: Could not fetch current price for TP1 check")
                     continue
 
                 tp1_reached = False
@@ -934,7 +942,7 @@ class TradeEngine:
                     tr["status"] = "cancelled_tp1_reached"
 
             except Exception as e:
-                self.log.debug(f"Entry validity check failed for {symbol}: {e}")
+                self.log.warning(f"Entry validity check failed for {symbol}: {e}")
 
     def check_position_alerts(self) -> None:
         """Check all open positions and send Telegram alerts if thresholds crossed."""

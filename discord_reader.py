@@ -53,15 +53,53 @@ class DiscordReader:
         return collected
 
     def fetch_message(self, message_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch a single message by ID."""
+        """Fetch a single message by ID with rate limit handling."""
         url = f"https://discord.com/api/v10/channels/{self.channel_id}/messages/{message_id}"
-        try:
-            r = requests.get(url, headers=self.headers, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-            return None
-        except Exception:
-            return None
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(url, headers=self.headers, timeout=10)
+
+                # Success
+                if r.status_code == 200:
+                    return r.json()
+
+                # Rate limited - retry with backoff
+                if r.status_code == 429:
+                    retry_after = 5.0
+                    try:
+                        retry_after = float((r.json() or {}).get("retry_after", 5))
+                    except Exception:
+                        pass
+                    print(f"[Discord] Rate limited, waiting {retry_after}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(retry_after + 0.25)
+                    continue
+
+                # Other errors - log and return None
+                if r.status_code == 403:
+                    print(f"[Discord] 403 Forbidden - Token invalid or no permissions for msg {message_id}")
+                elif r.status_code == 404:
+                    print(f"[Discord] 404 Not Found - Message {message_id} was deleted")
+                elif r.status_code >= 500:
+                    print(f"[Discord] {r.status_code} Server Error - Discord API issue")
+                else:
+                    print(f"[Discord] {r.status_code} - Failed to fetch msg {message_id}")
+
+                return None
+
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    print(f"[Discord] Timeout fetching msg {message_id}, retrying... ({attempt+1}/{max_retries})")
+                    time.sleep(1)
+                    continue
+                print(f"[Discord] Timeout after {max_retries} retries for msg {message_id}")
+                return None
+            except Exception as e:
+                print(f"[Discord] Error fetching msg {message_id}: {e}")
+                return None
+
+        return None
 
     @staticmethod
     def message_timestamp_unix(msg: Dict[str, Any]) -> float:
