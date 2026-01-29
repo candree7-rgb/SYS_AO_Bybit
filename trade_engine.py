@@ -104,6 +104,22 @@ class TradeEngine:
             # Log full performance report once per day
             self.log_performance_report()
 
+        # Update daily equity snapshot (always, even if no trades)
+        if db_export.is_enabled():
+            try:
+                equity = self.bybit.wallet_equity(ACCOUNT_TYPE)
+                # Count yesterday's closed trades (use yesterday, not today)
+                yesterday_day = self._last_stats_day if self._last_stats_day else utc_day_key(time.time() - 86400)
+                yesterday_closed_trades = sum(1 for tr in self.state.get("open_trades", {}).values()
+                                            if utc_day_key(tr.get("closed_ts") or 0) == yesterday_day)
+                yesterday_wins = sum(1 for tr in self.state.get("open_trades", {}).values()
+                                   if utc_day_key(tr.get("closed_ts") or 0) == yesterday_day and tr.get("is_win"))
+                yesterday_losses = yesterday_closed_trades - yesterday_wins
+                db_export.update_daily_equity(equity, yesterday_closed_trades, yesterday_wins, yesterday_losses)
+                self.log.debug(f"Updated daily equity: ${equity:.2f} ({yesterday_closed_trades} trades yesterday)")
+            except Exception as e:
+                self.log.debug(f"Failed to update daily equity: {e}")
+
         self._last_stats_day = today
 
     # ---------- precision helpers ----------
@@ -1332,21 +1348,7 @@ class TradeEngine:
         self.log.info("")
         self.log.info("=" * 60)
 
-        # Update daily equity snapshot
-        if db_export.is_enabled():
-            try:
-                equity = self.bybit.wallet_equity(ACCOUNT_TYPE)
-                # Count today's trades
-                from state import utc_day_key
-                today = utc_day_key()
-                today_trades = sum(1 for tr in self.state.get("open_trades", {}).values()
-                                 if utc_day_key(tr.get("closed_ts") or 0) == today)
-                today_wins = sum(1 for tr in self.state.get("open_trades", {}).values()
-                               if utc_day_key(tr.get("closed_ts") or 0) == today and tr.get("is_win"))
-                today_losses = today_trades - today_wins
-                db_export.update_daily_equity(equity, today_trades, today_wins, today_losses)
-            except Exception as e:
-                self.log.debug(f"Failed to update daily equity: {e}")
+        # Note: Daily equity update moved to log_daily_stats() to ensure it runs daily even without trades
 
     # ---------- signal update methods ----------
     def _move_sl(self, symbol: str, new_sl: float) -> bool:
