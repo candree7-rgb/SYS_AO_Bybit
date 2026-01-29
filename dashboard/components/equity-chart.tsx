@@ -96,8 +96,8 @@ export default function EquityChart({ botId = 'all', timeframe }: EquityChartPro
 
   const chartData = data.map(d => ({
     date: format(new Date(d.date), 'MMM dd'),
-    equity: parseFloat(d.equity.toString()),
-    pnl: parseFloat(d.daily_pnl.toString()),
+    equity: parseFloat((d.equity || 0).toString()),
+    pnl: parseFloat((d.daily_pnl || 0).toString()),
   }));
 
   const currentEquity = data[data.length - 1]?.equity || 0;
