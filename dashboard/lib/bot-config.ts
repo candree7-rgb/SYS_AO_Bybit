@@ -100,6 +100,16 @@ export const BOT_CONFIGS: Record<string, BotConfig> = {
     hasBreakeven: true,
     isActive: true,
   },
+  h: {
+    id: 'h',
+    name: 'H',
+    description: 'Bot H',
+    tpCount: 3,
+    dcaCount: 2,
+    hasTrailing: true,
+    hasBreakeven: true,
+    isActive: true,
+  },
 };
 
 export function getBotConfig(botId: string): BotConfig {
