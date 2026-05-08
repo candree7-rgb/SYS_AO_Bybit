@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import crypto from 'crypto';
 
-// Bybit API credentials from environment
 const BYBIT_API_KEY = process.env.BYBIT_API_KEY || '';
 const BYBIT_API_SECRET = process.env.BYBIT_API_SECRET || '';
 const BYBIT_TESTNET = process.env.BYBIT_TESTNET === 'true';
@@ -49,7 +48,6 @@ export async function GET() {
     }
 
     const data = await response.json();
-
     if (data.retCode !== 0) {
       throw new Error(`Bybit error: ${data.retMsg}`);
     }
@@ -59,20 +57,18 @@ export async function GET() {
       throw new Error('No wallet balance data');
     }
 
-    const equity = parseFloat(list[0].totalEquity || list[0].totalWalletBalance || list[0].totalAvailableBalance || '0');
+    const equity = parseFloat(list[0].totalEquity || list[0].totalWalletBalance || '0');
 
     return NextResponse.json({
       equity,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error('Failed to fetch live equity from Bybit:', error);
+    console.error('Failed to fetch live equity:', error);
 
-    // Fallback: Get latest equity from database
     try {
       const { getDailyEquity } = await import('@/lib/db');
       const dailyEquity = await getDailyEquity(1);
-
       if (dailyEquity.length > 0) {
         return NextResponse.json({
           equity: parseFloat(dailyEquity[0].equity.toString()),
@@ -84,13 +80,9 @@ export async function GET() {
       console.error('Failed to fetch from database:', dbError);
     }
 
-    return NextResponse.json(
-      { error: 'Failed to fetch equity', equity: 0 },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: 'Failed to fetch equity', equity: 0 }, { status: 500 });
   }
 }
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
-

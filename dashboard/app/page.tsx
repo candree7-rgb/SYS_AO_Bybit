@@ -1,66 +1,130 @@
-'use client';
+'use client'
 
-import { useState } from 'react';
-import StatsCards from '@/components/stats-cards';
-import EquityChart from '@/components/equity-chart';
-import TradesTable from '@/components/trades-table';
-import TPDistributionChart from '@/components/tp-distribution';
-import DCADistributionChart from '@/components/dca-distribution';
-import BotTabs from '@/components/bot-tabs';
-import TimeframeSelector from '@/components/timeframe-selector';
-import { getBotConfig } from '@/lib/bot-config';
+import { useState, useCallback } from 'react'
+import { format } from 'date-fns'
+import StatsCards from '@/components/stats-cards'
+import EquityChart from '@/components/equity-chart'
+import TradesTable from '@/components/trades-table'
+import TPDistributionChart from '@/components/tp-distribution'
+import TimeRangeSelector, { TimeRange } from '@/components/time-range-selector'
+import DateRangePicker from '@/components/date-range-picker'
+import EquitySimulator from '@/components/equity-simulator'
+import { SimSettings } from '@/lib/simulation'
+import Image from 'next/image'
+import UptimeBadge from '@/components/uptime-badge'
+
+const isSimulated = process.env.NEXT_PUBLIC_SIMULATED_MODE !== 'false'
 
 export default function Dashboard() {
-  const [selectedBot, setSelectedBot] = useState<string>('all');
-  const [selectedTimeframe, setSelectedTimeframe] = useState<string>('all');
-  const botConfig = getBotConfig(selectedBot);
+  const [timeRange, setTimeRange] = useState<TimeRange>('1M')
+  const [showDatePicker, setShowDatePicker] = useState(false)
+  const [customDateRange, setCustomDateRange] = useState<{ from: string; to: string } | null>(null)
+  const [simSettings, setSimSettings] = useState<SimSettings>({
+    equity: Number(process.env.NEXT_PUBLIC_DEFAULT_EQUITY) || 10000,
+    tradePct: Number(process.env.NEXT_PUBLIC_DEFAULT_TRADE_PCT) || 5,
+    compounding: true,
+    excludeWeekends: true,
+    singlePerBatch: false,
+  })
+
+  const handleSimChange = useCallback((settings: SimSettings) => {
+    setSimSettings(settings)
+  }, [])
+
+  const handleCustomDateApply = (from: string, to: string) => {
+    setCustomDateRange({ from, to })
+    setTimeRange('CUSTOM')
+  }
+
+  const customLabel = customDateRange
+    ? `${format(new Date(customDateRange.from), 'MMM dd')} - ${format(new Date(customDateRange.to), 'MMM dd')}`
+    : undefined
 
   return (
-    <main className="min-h-screen bg-background p-4 md:p-8">
+    <main className="min-h-screen bg-background">
+      {/* Date Picker Modal */}
+      <DateRangePicker
+        isOpen={showDatePicker}
+        onClose={() => setShowDatePicker(false)}
+        onApply={handleCustomDateApply}
+      />
+
       {/* Header */}
-      <div className="mb-8">
-        <h1 className="text-4xl font-bold mb-2">Systemic*</h1>
-        <p className="text-muted-foreground">Multi-bot trading dashboard</p>
+      <header className="border-b border-border bg-background sticky top-0 z-40">
+        <div className="container mx-auto px-4 py-4">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <div>
+              <Image
+                src="/images/sys_logo.svg"
+                alt="Systemic"
+                width={194}
+                height={39}
+                className="hidden dark:block"
+                priority
+              />
+              <Image
+                src="/images/sys_logo_pos.svg"
+                alt="Systemic"
+                width={194}
+                height={39}
+                className="block dark:hidden"
+                priority
+              />
+              <div className="flex items-center gap-3 mt-0.5">
+                <p className="text-sm text-muted-foreground">
+                  Bybit Futures &bull; Live Execution &bull; 20x Leverage
+                </p>
+                <UptimeBadge />
+              </div>
+            </div>
+            <TimeRangeSelector
+              selected={timeRange}
+              onSelect={setTimeRange}
+              onCustomClick={() => setShowDatePicker(true)}
+              customLabel={customLabel}
+            />
+          </div>
+        </div>
+      </header>
+
+      {/* Simulator Controls */}
+      <div className="border-b border-border bg-background">
+        <div className="container mx-auto px-4 py-3">
+          <EquitySimulator onChange={handleSimChange} isSimulated={isSimulated} />
+        </div>
       </div>
 
-      {/* Bot Tabs */}
-      <BotTabs selectedBot={selectedBot} onSelectBot={setSelectedBot} />
+      {/* Content */}
+      <div className="container mx-auto px-4 py-6 space-y-6">
+        {/* Stats Cards */}
+        <section>
+          <StatsCards timeRange={timeRange} customDateRange={customDateRange} simSettings={simSettings} isSimulated={isSimulated} />
+        </section>
 
-      {/* Timeframe Selector */}
-      <div className="mb-6">
-        <TimeframeSelector
-          selectedTimeframe={selectedTimeframe}
-          onSelectTimeframe={setSelectedTimeframe}
-          botId={selectedBot}
-        />
-      </div>
+        {/* Charts Row */}
+        <section className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2">
+            <EquityChart timeRange={timeRange} customDateRange={customDateRange} simSettings={simSettings} isSimulated={isSimulated} />
+          </div>
+          <div>
+            <TPDistributionChart timeRange={timeRange} customDateRange={customDateRange} simSettings={simSettings} />
+          </div>
+        </section>
 
-      {/* Stats Cards - All Time */}
-      <div className="mb-8">
-        <h2 className="text-2xl font-bold mb-4">All Time Performance</h2>
-        <StatsCards botId={selectedBot} timeframe={selectedTimeframe} />
-      </div>
-
-      {/* Equity Chart */}
-      <div className="mb-8">
-        <EquityChart botId={selectedBot} timeframe={selectedTimeframe} />
-      </div>
-
-      {/* TP & DCA Distribution */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-        <TPDistributionChart botId={selectedBot} timeframe={selectedTimeframe} />
-        {botConfig.dcaCount > 0 && <DCADistributionChart botId={selectedBot} timeframe={selectedTimeframe} />}
-      </div>
-
-      {/* Trade History Table */}
-      <div className="mb-8">
-        <TradesTable botId={selectedBot} timeframe={selectedTimeframe} />
+        {/* Trades Table */}
+        <section>
+          <TradesTable timeRange={timeRange} customDateRange={customDateRange} simSettings={simSettings} isSimulated={isSimulated} />
+        </section>
       </div>
 
       {/* Footer */}
-      <div className="text-center text-sm text-muted-foreground mt-12">
-        <p>Trading Dashboard • Last updated: {new Date().toLocaleString()}</p>
-      </div>
+      <footer className="border-t border-border py-4 mt-8">
+        <div className="container mx-auto px-4 text-center text-sm text-muted-foreground">
+          <Image src="/images/sys_logo.svg" alt="Systemic" width={100} height={20} className="hidden dark:inline" />
+          <Image src="/images/sys_logo_pos.svg" alt="Systemic" width={100} height={20} className="inline dark:hidden" />
+          &bull; Auto-refreshes every 30s
+        </div>
+      </footer>
     </main>
-  );
+  )
 }

@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en" style="background:#030711">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#030711">
+  <title>Systemic Trading Systems</title>
+  <link rel="icon" href="/images/favicon.svg" type="image/svg+xml">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root { color-scheme: dark; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html {
+      background: #030711;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, sans-serif;
+      color: hsl(213 31% 91%);
+    }
+
+    /* Fixed to viewport edges — no own background, html canvas shows through */
+    .container {
+      position: fixed;
+      inset: 0;
+      overflow-y: auto;
+      display: grid;
+      place-content: center;
+      justify-items: center;
+      gap: 1.5rem;
+      text-align: center;
+      padding: 2rem;
+    }
+
+    .logo {
+      width: clamp(240px, 50vw, 360px);
+      opacity: 0.85;
+    }
+
+    .title {
+      font-size: clamp(1.1rem, 3vw, 1.4rem);
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: hsl(215 16% 57%);
+    }
+
+    .subtitle {
+      font-size: clamp(0.85rem, 2vw, 0.95rem);
+      font-weight: 400;
+      color: hsl(215 16% 42%);
+      letter-spacing: 0.02em;
+      margin-top: -0.75rem;
+    }
+
+    /* ── Stats tiles ── */
+    .stats {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin-top: 0.5rem;
+    }
+
+    .stat-card {
+      border: 1px solid hsl(216 34% 17%);
+      border-radius: 0.75rem;
+      padding: 1.25rem 1.75rem;
+      min-width: 140px;
+      transition: opacity 0.3s;
+    }
+
+    .stat-card.loading {
+      opacity: 0.4;
+    }
+
+    .stat-label {
+      font-size: 0.75rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: hsl(215 16% 57%);
+      margin-bottom: 0.35rem;
+    }
+
+    .stat-value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #12d393;
+    }
+
+    .stat-value.neutral {
+      color: hsl(213 31% 91%);
+    }
+
+    /* ── Button ── */
+    .btn {
+      display: inline-block;
+      margin-top: 0.5rem;
+      padding: 0.85rem 2.5rem;
+      background: #12d393;
+      color: #030711;
+      font-family: 'Inter', sans-serif;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 9999px;
+      cursor: pointer;
+      text-decoration: none;
+      transition: opacity 0.2s, transform 0.2s;
+    }
+
+    .btn:hover {
+      opacity: 0.9;
+      transform: translateY(-1px);
+    }
+
+    .btn:active {
+      transform: translateY(0);
+    }
+
+    /* ── Beta badge ── */
+    .beta {
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: hsl(210 80% 65%);
+      border: 1.5px solid hsl(210 60% 45%);
+      border-radius: 4px;
+      padding: 0.1rem 0.45rem;
+      vertical-align: 1px;
+    }
+
+    /* ── Uptime dot ── */
+    .uptime-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #12d393;
+      margin-right: 0.4rem;
+      vertical-align: middle;
+      position: relative;
+    }
+
+    .uptime-dot::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background: #12d393;
+      animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
+    }
+
+    @keyframes ping {
+      75%, 100% { transform: scale(2.2); opacity: 0; }
+    }
+
+    /* ── Notice box ── */
+    .notice {
+      max-width: 380px;
+      font-size: 0.78rem;
+      line-height: 1.5;
+      color: hsl(45 80% 70%);
+      background: hsla(45 80% 40% / 0.08);
+      border: 1px solid hsla(45 80% 50% / 0.25);
+      border-radius: 0.6rem;
+      padding: 0.75rem 1.25rem;
+      margin-top: 0.25rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <img src="/images/sys_logo.svg" alt="Systemic Trading Systems" class="logo">
+
+    <h1 class="title">Trading Systems</h1>
+    <p class="subtitle">by Andr&eacute; Carva &nbsp;&middot;&nbsp; <span class="beta">Beta</span></p>
+
+    <div class="stats">
+      <div class="stat-card loading" id="card-trades">
+        <div class="stat-label">Total Trades</div>
+        <div class="stat-value neutral" id="val-trades">&mdash;</div>
+      </div>
+      <div class="stat-card loading" id="card-wr">
+        <div class="stat-label">Win Rate</div>
+        <div class="stat-value" id="val-wr">&mdash;</div>
+      </div>
+      <div class="stat-card" id="card-uptime">
+        <div class="stat-label">Uptime</div>
+        <div class="stat-value neutral" id="val-uptime">
+          <span class="uptime-dot"></span>
+          <span id="uptime-text"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="notice">Not a public product &mdash; family &amp; friends only. ❤️</div>
+
+    <a href="https://trades.systemic.systems/" class="btn">See Results</a>
+  </div>
+
+  <script>
+    const API = 'https://trades.systemic.systems/api/stats';
+
+    async function loadStats() {
+      try {
+        const res = await fetch(API);
+        if (!res.ok) return;
+        const s = await res.json();
+
+        document.getElementById('val-trades').textContent = s.total_trades ?? '—';
+        document.getElementById('val-wr').textContent =
+          parseFloat(s.win_rate).toFixed(1) + '%';
+
+        document.querySelectorAll('.stat-card').forEach(c => c.classList.remove('loading'));
+      } catch (e) {
+        // silently keep dashes on error
+      }
+    }
+
+    loadStats();
+
+    // Uptime (start: 2026-02-12)
+    (function() {
+      const start = new Date('2026-02-12T00:00:00Z');
+      const now = new Date();
+      const days = Math.floor((now - start) / 864e5);
+      if (days < 0) { document.getElementById('uptime-text').textContent = 'soon'; return; }
+
+      const y = Math.floor(days / 365);
+      const rem = days - y * 365;
+      const mo = Math.floor(rem / 30);
+      const rem2 = rem - mo * 30;
+      const w = Math.floor(rem2 / 7);
+      const d = rem2 - w * 7;
+
+      const p = [];
+      if (y) p.push(y + 'y');
+      if (mo) p.push(mo + 'mo');
+      if (p.length < 2 && w) p.push(w + 'w');
+      if (p.length < 2 && d) p.push(d + 'd');
+      if (!p.length) p.push('today');
+
+      document.getElementById('uptime-text').textContent = p.join(' ');
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "name": "sys-landingpage",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Static landing page for Systemic Trading Systems (Railway service)",
+  "scripts": {
+    "start": "serve -s . -l ${PORT:-3000}"
+  },
+  "dependencies": {
+    "serve": "^14.2.4"
+  }
+}

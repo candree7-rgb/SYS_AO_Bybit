@@ -9,11 +9,19 @@ This guide explains how to deploy the trading bot and dashboard to Railway.
 
 ## Architecture
 
-The deployment consists of 3 services:
+The deployment consists of 4 services:
 
 1. **PostgreSQL Database** - Stores trades and daily equity
 2. **Trading Bot** (Python) - Runs the bot, writes to database
 3. **Dashboard** (Next.js) - Visualizes trading data
+4. **Landing Page** (static) - Public-facing splash page (`landingpage/`)
+
+> **Schema migration note:** The DB schema was redesigned (see
+> `database/schema.sql` and `database/README.md`). Column names changed
+> (e.g. `id` → `trade_id`, `placed_at`/`filled_at` → `opened_at`,
+> `exit_reason` → `close_reason`, DCA/zone columns dropped). For an existing
+> Postgres instance run `DROP TABLE trades, daily_equity` or provision a fresh
+> Postgres add-on; the bot will recreate the schema on next start.
 
 ## Deployment Steps
 
@@ -77,6 +85,18 @@ The deployment consists of 3 services:
 2. Click "Settings" → "Generate Domain"
 3. Railway will give you a URL like: `https://your-dashboard.up.railway.app`
 4. Open the URL to see your dashboard! 🎉
+
+### 6. Deploy Landing Page (optional)
+
+1. In your project, click "+ New" → "GitHub Repo"
+2. Select your repo (creates a fourth service)
+3. Configure:
+   - **Root Directory**: `landingpage`
+   - **Build Command**: `npm install`
+   - **Start Command**: `npm start`
+   - No env vars required
+4. Generate a public domain — `index.html` is served by `serve` on `$PORT`.
+   The page calls the dashboard's `/api/stats` for live total trades + win rate.
 
 ## Database Initialization
 
