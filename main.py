@@ -10,10 +10,12 @@ from config import (
     CATEGORY, QUOTE, LEVERAGE, RISK_PCT,
     MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
     POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC, SIGNAL_UPDATE_INTERVAL_OPEN_SEC,
+    USE_GATEWAY_WS, GATEWAY_FALLBACK_FAILURES, GATEWAY_LOOP_SLEEP_SEC, GATEWAY_INITIAL_BACKFILL,
     STATE_FILE, DRY_RUN, LOG_LEVEL
 )
 from bybit_v5 import BybitV5
 from discord_reader import DiscordReader
+from discord_gateway import DiscordGateway
 from signal_parser import parse_signal, signal_hash, parse_signal_update
 from state import load_state, save_state, utc_day_key
 from trade_engine import TradeEngine
@@ -204,6 +206,13 @@ def main():
     bybit = BybitV5(BYBIT_API_KEY, BYBIT_API_SECRET, testnet=BYBIT_TESTNET, demo=BYBIT_DEMO, recv_window=RECV_WINDOW)
     discord = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
 
+    # Discord Gateway WebSocket: push-based new-message receiver. Replaces
+    # REST polling for new signals (~50-300ms vs 0-4s). REST fetch_after
+    # below stays as fallback if the gateway exceeds GATEWAY_FALLBACK_FAILURES.
+    gateway: "DiscordGateway | None" = None
+    if USE_GATEWAY_WS:
+        gateway = DiscordGateway(DISCORD_TOKEN, CHANNEL_ID, log)
+
     # Live TP1-cross watcher: cancels pending conditional entries the moment
     # the market last-price crosses TP1 (so we never enter into a trade where
     # the opportunity is already gone). Pure Bybit WS — no Discord polling.
@@ -231,6 +240,27 @@ def main():
     engine = TradeEngine(bybit, st, log, entry_watcher=entry_watcher)
     entry_watcher.start()
 
+    # Backfill via REST once before connecting Gateway so messages posted
+    # during downtime aren't lost. Pre-load them straight into the gateway
+    # queue if WS is enabled, so the main loop processes them via the same
+    # drain path as live messages.
+    if gateway and GATEWAY_INITIAL_BACKFILL:
+        try:
+            after = st.get("last_discord_id")
+            backfill = discord.fetch_after(after, limit=50)
+            if backfill:
+                log.info(f"[gateway] backfilling {len(backfill)} message(s) from REST")
+                for m in sorted(backfill, key=lambda x: int(x.get("id", "0"))):
+                    try:
+                        gateway.msg_queue.put_nowait(m)
+                    except Exception:
+                        break
+        except Exception as e:
+            log.warning(f"[gateway] backfill failed: {e}")
+
+    if gateway:
+        gateway.start()
+
     log.info("="*58)
     mode_str = " | DRY_RUN" if DRY_RUN else ""
     mode_str += " | DEMO" if BYBIT_DEMO else ""
@@ -240,6 +270,7 @@ def main():
     log.info(f"Config: CATEGORY={CATEGORY}, QUOTE={QUOTE}, LEVERAGE={LEVERAGE}x")
     log.info(f"Config: RISK_PCT={RISK_PCT}%, MAX_CONCURRENT={MAX_CONCURRENT_TRADES}, MAX_DAILY={MAX_TRADES_PER_DAY}")
     log.info(f"Config: POLL_SECONDS={POLL_SECONDS}, TC_MAX_LAG_SEC={TC_MAX_LAG_SEC}")
+    log.info(f"Config: USE_GATEWAY_WS={USE_GATEWAY_WS} (fallback after {GATEWAY_FALLBACK_FAILURES} failures)")
     log.info(f"Config: DRY_RUN={DRY_RUN}, LOG_LEVEL={LOG_LEVEL}")
 
     # Initialize database if enabled
@@ -303,7 +334,10 @@ def main():
             # Heartbeat log every 5 minutes
             if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
                 active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending","open")]
-                log.info(f"💓 Heartbeat: {len(active)} active trade(s), {trades_today()} today")
+                gw_state = "off"
+                if gateway is not None:
+                    gw_state = "healthy" if gateway.is_healthy() else f"down(fail={gateway.consecutive_failures()})"
+                log.info(f"💓 Heartbeat: {len(active)} active trade(s), {trades_today()} today, gateway={gw_state}")
                 last_heartbeat = time.time()
 
             # Check for signal updates (dynamic interval: 60s for pending, 10s for open)
@@ -349,16 +383,34 @@ def main():
             elif trades_today() >= MAX_TRADES_PER_DAY:
                 log.info(f"Trades today {trades_today()}/{MAX_TRADES_PER_DAY} → skip new signals")
             else:
-                # read discord
+                # read discord — prefer Gateway WS push, fall back to REST
+                # polling if the gateway is unhealthy or has hit the failure
+                # threshold.
+                use_gateway_now = (
+                    gateway is not None
+                    and gateway.consecutive_failures() < GATEWAY_FALLBACK_FAILURES
+                )
                 after = st.get("last_discord_id")
-                log.debug(f"Polling Discord (after={after})...")
-                try:
-                    msgs = discord.fetch_after(after, limit=50)
-                except Exception as e:
-                    log.warning(f"Discord fetch failed: {e}")
-                    msgs = []
+                msgs = []
 
-                log.debug(f"Fetched {len(msgs)} message(s) from Discord")
+                if use_gateway_now:
+                    # Drain everything queued since last loop iteration.
+                    while True:
+                        m = gateway.get_message_nowait()
+                        if m is None:
+                            break
+                        msgs.append(m)
+                    if msgs:
+                        log.debug(f"[gateway] drained {len(msgs)} message(s) from queue")
+                else:
+                    log.debug(f"Polling Discord REST (after={after})...")
+                    try:
+                        msgs = discord.fetch_after(after, limit=50)
+                    except Exception as e:
+                        log.warning(f"Discord fetch failed: {e}")
+                        msgs = []
+                    log.debug(f"Fetched {len(msgs)} message(s) from Discord")
+
                 msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id","0")))
                 max_seen = int(after or 0)
 
@@ -468,12 +520,27 @@ def main():
 
         except KeyboardInterrupt:
             log.info("Bye")
+            if gateway is not None:
+                try:
+                    gateway.stop()
+                except Exception:
+                    pass
             break
         except Exception as e:
             log.exception(f"Loop error: {e}")
             time.sleep(3)
 
-        time.sleep(max(1, POLL_SECONDS + random.uniform(0, max(0, POLL_JITTER_MAX))))
+        # When Gateway WS is healthy the loop is just queue-drain + maintenance,
+        # so sleep short. Otherwise fall back to REST polling cadence.
+        gw_healthy = (
+            gateway is not None
+            and gateway.is_healthy()
+            and gateway.consecutive_failures() < GATEWAY_FALLBACK_FAILURES
+        )
+        if gw_healthy:
+            time.sleep(max(0.1, GATEWAY_LOOP_SLEEP_SEC))
+        else:
+            time.sleep(max(1, POLL_SECONDS + random.uniform(0, max(0, POLL_JITTER_MAX))))
 
 if __name__ == "__main__":
     main()

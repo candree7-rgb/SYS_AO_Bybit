@@ -80,7 +80,16 @@ DCA_QTY_MULTS = [float(x) for x in _get("DCA_QTY_MULTS","1.5,2.25").split(",") i
 POLL_SECONDS    = _get_int("POLL_SECONDS","15")
 POLL_JITTER_MAX = _get_int("POLL_JITTER_MAX","5")
 SIGNAL_UPDATE_INTERVAL_SEC = _get_int("SIGNAL_UPDATE_INTERVAL_SEC","60")  # Check for signal updates every 60s (pending trades)
-SIGNAL_UPDATE_INTERVAL_OPEN_SEC = _get_int("SIGNAL_UPDATE_INTERVAL_OPEN_SEC","10")  # Check every 10s for open trades
+SIGNAL_UPDATE_INTERVAL_OPEN_SEC = _get_int("SIGNAL_UPDATE_INTERVAL_OPEN_SEC","60")  # Check every 60s for open trades (only TRADE CLOSED/CANCELLED detection)
+
+# Discord Gateway WebSocket (push instead of REST polling for new messages).
+# When enabled, new-message detection happens via Gateway WS (~50-300ms push
+# latency) instead of REST polling (POLL_SECONDS). Edit polling above stays on
+# REST for TRADE CLOSED/CANCELLED detection.
+USE_GATEWAY_WS              = _get_bool("USE_GATEWAY_WS","true")
+GATEWAY_FALLBACK_FAILURES   = _get_int("GATEWAY_FALLBACK_FAILURES","3")  # after N consecutive connect failures, fall back to REST polling
+GATEWAY_LOOP_SLEEP_SEC      = _get_float("GATEWAY_LOOP_SLEEP_SEC","0.5") # main-loop sleep when WS is healthy (drain-only mode)
+GATEWAY_INITIAL_BACKFILL    = _get_bool("GATEWAY_INITIAL_BACKFILL","true") # one REST fetch on startup so messages during downtime aren't lost
 
 # Misc
 DRY_RUN     = _get_bool("DRY_RUN","true")

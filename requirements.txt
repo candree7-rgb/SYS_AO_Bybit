@@ -4,3 +4,4 @@ websocket-client==1.8.0
 psycopg2-binary==2.9.9
 gspread==6.1.4
 google-auth==2.37.0
+discord.py-self==2.1.0
