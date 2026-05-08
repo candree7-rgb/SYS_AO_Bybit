@@ -157,7 +157,21 @@ class DiscordGateway:
             try:
                 if int(message.channel.id) != self.channel_id:
                     return
-                self._last_event_ts = time.time()
+                now = time.time()
+                self._last_event_ts = now
+                # Discord-server → bot push latency. created_at is the
+                # Discord-server timestamp of the message; subtract from
+                # local time. Assumes NTP-synced clock (Railway is).
+                lag_ms = -1.0
+                try:
+                    if message.created_at is not None:
+                        lag_ms = (now - message.created_at.timestamp()) * 1000.0
+                except Exception:
+                    pass
+                self.log.info(
+                    f"[gateway] msg {message.id} received "
+                    f"(push_lag={lag_ms:.0f}ms, qsize={self.msg_queue.qsize()})"
+                )
                 raw = self._message_to_dict(message)
                 self._enqueue(raw)
             except Exception as e:

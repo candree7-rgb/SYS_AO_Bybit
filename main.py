@@ -16,7 +16,7 @@ from config import (
 from bybit_v5 import BybitV5
 from discord_reader import DiscordReader
 from discord_gateway import DiscordGateway
-from signal_parser import parse_signal, signal_hash, parse_signal_update
+from signal_parser import parse_signal, signal_hash, parse_signal_update, is_trade_closed
 from state import load_state, save_state, utc_day_key
 from trade_engine import TradeEngine
 from entry_watcher import EntryWatcher
@@ -27,7 +27,7 @@ def setup_logger() -> logging.Logger:
     log = logging.getLogger("bot")
     log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     h = logging.StreamHandler(sys.stdout)  # stdout so Railway shows INFO as normal (not red)
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
+    fmt = logging.Formatter("%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s", "%H:%M:%S")
     h.setFormatter(fmt)
     log.handlers[:] = [h]
     return log
@@ -73,8 +73,9 @@ def check_signal_updates(discord, engine, st, log):
             if not txt:
                 continue
 
-            # Check for TRADE CLOSED (manual close by signal provider)
-            if "TRADE CLOSED" in txt.upper():
+            # Check for TRADE CLOSED (manual close by signal provider).
+            # Detects both "TRADE CLOSED" (legacy) and "Closed P&L:" (AO Crusher).
+            if is_trade_closed(txt):
                 log.warning(f"🚨 Signal CLOSED detected for {tr['symbol']} - sending Telegram alert")
 
                 # Send Telegram warning (don't auto-close position)
@@ -442,7 +443,8 @@ def main():
                             log.debug(f"Message {mid}: not a signal")
                         continue
 
-                    log.info(f"📨 Signal parsed: {sig['symbol']} {sig['side'].upper()} @ {sig['trigger']}")
+                    age_ms = age * 1000.0 if ts else -1
+                    log.info(f"📨 Signal parsed: {sig['symbol']} {sig['side'].upper()} @ {sig['trigger']} (discord_age={age_ms:.0f}ms)")
 
                     sh = signal_hash(sig)
                     seen = set(st.get("seen_signal_hashes", []))
@@ -456,7 +458,11 @@ def main():
 
                     trade_id = f"{sig['symbol']}|{sig['side']}|{int(time.time())}"
                     log.info(f"🔄 Placing entry order for {sig['symbol']}...")
+                    _t_place = time.time()
                     oid = engine.place_conditional_entry(sig, trade_id)
+                    place_ms = (time.time() - _t_place) * 1000.0
+                    e2e_ms = (time.time() - ts) * 1000.0 if ts else -1
+                    log.info(f"⏱  place_order took {place_ms:.0f}ms | e2e Discord→Order: {e2e_ms:.0f}ms")
                     if not oid:
                         log.warning(f"❌ Entry order failed for {sig['symbol']}")
                         continue
