@@ -23,10 +23,11 @@ def _pos_side(side: str) -> str:
     return "Long" if side == "Buy" else "Short"
 
 class TradeEngine:
-    def __init__(self, bybit, state: dict, logger):
+    def __init__(self, bybit, state: dict, logger, entry_watcher=None):
         self.bybit = bybit
         self.state = state
         self.log = logger
+        self.entry_watcher = entry_watcher
         self._instrument_cache: Dict[str, Dict[str, float]] = {}  # symbol -> rules
         self._cache_ttl = 300  # 5 min cache
         self._cache_times: Dict[str, float] = {}
@@ -299,8 +300,10 @@ class TradeEngine:
         body = {"category": CATEGORY, "symbol": symbol, "orderId": order_id}
         if DRY_RUN:
             self.log.info(f"DRY_RUN cancel entry: {body}")
-            return
-        self.bybit.cancel_order(body)
+        else:
+            self.bybit.cancel_order(body)
+        if self.entry_watcher:
+            self.entry_watcher.unwatch(symbol)
 
     def _generate_fallback_tps(self, entry: float, side: str, tick_size: float) -> List[float]:
         """Generate fallback TP prices based on % distance from entry."""
@@ -608,6 +611,9 @@ class TradeEngine:
                 tr.setdefault("tp_fills", 0)
                 tr.setdefault("tp_fills_list", [])
                 self.log.info(f"✅ ENTRY FILLED {tr['symbol']} @ {tr.get('entry_price')}")
+                # Stop watching this entry — it's filled, no longer pending.
+                if self.entry_watcher:
+                    self.entry_watcher.unwatch(tr["symbol"], tr.get("id"))
 
                 # Send Telegram notification
                 telegram_alerts.send_trade_opened(

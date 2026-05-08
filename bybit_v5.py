@@ -16,12 +16,15 @@ class BybitV5:
         if demo:
             self.base = "https://api-demo.bybit.com"
             self.ws   = "wss://stream-demo.bybit.com/v5/private"
+            self.ws_public = "wss://stream.bybit.com/v5/public/linear"  # demo has no public stream — use mainnet
         elif testnet:
             self.base = "https://api-testnet.bybit.com"
             self.ws   = "wss://stream-testnet.bybit.com/v5/private"
+            self.ws_public = "wss://stream-testnet.bybit.com/v5/public/linear"
         else:
             self.base = "https://api.bybit.com"
             self.ws   = "wss://stream.bybit.com/v5/private"
+            self.ws_public = "wss://stream.bybit.com/v5/public/linear"
 
     # ---------- signing ----------
     def _sign(self, ts: str, recv_window: str, payload: str) -> str:
@@ -213,4 +216,32 @@ class BybitV5:
                 on_error(err)
 
         ws = WebSocketApp(self.ws, on_open=_on_open, on_message=_on_message, on_error=_on_err)
+        ws.run_forever(ping_interval=20, ping_timeout=10)
+
+    # ---------- WebSocket (public market data) ----------
+    def run_public_ws(self, on_open, on_message_raw, on_error=None):
+        """Run a public market WebSocket. Caller manages subscriptions via on_open
+        (which receives the WSApp so it can ws.send subscribe payloads).
+
+        on_message_raw(ws, parsed_json_msg) — called for every parsed message.
+        Caller is responsible for filtering by topic.
+        """
+        def _on_open(ws):
+            try:
+                on_open(ws)
+            except Exception:
+                pass
+
+        def _on_message(ws, message):
+            try:
+                msg = json.loads(message)
+            except Exception:
+                return
+            on_message_raw(ws, msg)
+
+        def _on_err(ws, err):
+            if on_error:
+                on_error(err)
+
+        ws = WebSocketApp(self.ws_public, on_open=_on_open, on_message=_on_message, on_error=_on_err)
         ws.run_forever(ping_interval=20, ping_timeout=10)

@@ -45,6 +45,10 @@ def parse_signal(text: str, quote: str = "USDT") -> Optional[Dict[str, Any]]:
             tps.append(0.0)
         tps[idx-1] = price
     tps = [p for p in tps if p > 0]
+    # TP4 is intentionally ignored — the signal's TP4 is at ~40% which never
+    # realistically fills. Take only TP1-TP3; the rest of the position runs
+    # as a trail after TP3.
+    tps = tps[:3]
 
     dcas: List[float] = []
     for m in RE_DCA.finditer(text):
@@ -92,13 +96,12 @@ def parse_signal_update(text: str) -> Dict[str, Any]:
     if msl:
         result["sl_price"] = float(msl.group(1))
 
-    # Extract TPs (can be multiple)
+    # Extract TPs — max 3 (TP4 from signal is ignored)
     tp_matches = list(RE_TP.finditer(text))
     if tp_matches:
-        # Sort by TP number
         tps = [(int(m.group(1)), float(m.group(2))) for m in tp_matches]
         tps.sort(key=lambda x: x[0])
-        result["tp_prices"] = [tp[1] for tp in tps]
+        result["tp_prices"] = [tp[1] for tp in tps][:3]
 
     # Extract DCAs
     dca_matches = list(RE_DCA.finditer(text))

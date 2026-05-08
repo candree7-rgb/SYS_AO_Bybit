@@ -17,6 +17,7 @@ from discord_reader import DiscordReader
 from signal_parser import parse_signal, signal_hash, parse_signal_update
 from state import load_state, save_state, utc_day_key
 from trade_engine import TradeEngine
+from entry_watcher import EntryWatcher
 import db_export
 import telegram_alerts
 
@@ -117,39 +118,9 @@ def check_signal_updates(discord, engine, st, log):
                 tr["exit_reason"] = "signal_cancelled"
                 continue
 
-            # Check for TP1 HIT while entry is still pending
-            if tr.get("status") == "pending":
-                # Check if TP1 is marked as HIT in Discord message
-                # Examples: "TP1: $0.13798 ✅ HIT (+20.00%)" or "TP1 ✅" or "✅ TP1 HIT"
-                txt_upper = txt.upper()
-                tp1_hit = False
-
-                # Check for various TP1 HIT patterns
-                if "TP1" in txt_upper and ("HIT" in txt_upper or "✅" in txt):
-                    # Verify it's actually marked as hit, not just mentioned
-                    # Look for patterns like "TP1 ✅", "TP1: ... ✅", "TP1 HIT"
-                    import re
-                    # Match: TP1 followed (within ~50 chars) by either ✅ or HIT
-                    if re.search(r'TP1.{0,50}(✅|HIT)', txt_upper):
-                        tp1_hit = True
-
-                if tp1_hit:
-                    log.warning(f"🚫 TP1 marked as HIT in Discord for {tr['symbol']} - cancelling pending entry")
-                    entry_oid = tr.get("entry_order_id")
-                    if entry_oid and entry_oid != "DRY_RUN":
-                        try:
-                            engine.cancel_entry(tr["symbol"], entry_oid)
-                            telegram_alerts.send_order_canceled(
-                                symbol=tr["symbol"],
-                                side=tr["order_side"],
-                                reason="TP1 marked as HIT in signal (entry not filled)"
-                            )
-                            log.info(f"   Entry order cancelled for {tr['symbol']}")
-                        except Exception as e:
-                            log.warning(f"Failed to cancel entry for {tr['symbol']}: {e}")
-                    tr["status"] = "cancelled_tp1_hit"
-                    tr["exit_reason"] = "tp1_hit_before_entry"
-                    continue
+            # TP1-hit detection runs via Bybit public WS (entry_watcher.py),
+            # not via Discord polling — the watcher cancels pending entries
+            # the moment the live last-price crosses TP1.
 
             # Parse SL/TP/DCA from the text
             sig = parse_signal_update(txt)
@@ -232,7 +203,33 @@ def main():
 
     bybit = BybitV5(BYBIT_API_KEY, BYBIT_API_SECRET, testnet=BYBIT_TESTNET, demo=BYBIT_DEMO, recv_window=RECV_WINDOW)
     discord = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
-    engine = TradeEngine(bybit, st, log)
+
+    # Live TP1-cross watcher: cancels pending conditional entries the moment
+    # the market last-price crosses TP1 (so we never enter into a trade where
+    # the opportunity is already gone). Pure Bybit WS — no Discord polling.
+    def on_tp1_cross(trade_id, symbol, side, entry_oid):
+        try:
+            if entry_oid and entry_oid != "DRY_RUN":
+                engine.cancel_entry(symbol, entry_oid)
+        except Exception as e:
+            log.warning(f"on_tp1_cross: cancel_entry failed for {symbol}: {e}")
+        tr = st.get("open_trades", {}).get(trade_id)
+        if tr:
+            tr["status"] = "cancelled_tp1_hit"
+            tr["exit_reason"] = "tp1_hit_before_entry"
+        try:
+            telegram_alerts.send_order_canceled(
+                symbol=symbol,
+                side=side,
+                reason="TP1 reached on live ticker before entry filled",
+            )
+        except Exception:
+            pass
+        save_state(STATE_FILE, st)
+
+    entry_watcher = EntryWatcher(bybit, on_tp1_cross, log)
+    engine = TradeEngine(bybit, st, log, entry_watcher=entry_watcher)
+    entry_watcher.start()
 
     log.info("="*58)
     mode_str = " | DRY_RUN" if DRY_RUN else ""
@@ -443,6 +440,14 @@ def main():
                     }
                     inc_trades_today()
                     log.info(f"🟡 ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")
+
+                    # Watch live last-price for TP1 cross — cancels entry if
+                    # TP1 is hit before our conditional triggers.
+                    tps = sig.get("tp_prices") or []
+                    tp1 = float(tps[0]) if tps else None
+                    if tp1:
+                        order_side = "Sell" if sig["side"] == "sell" else "Buy"
+                        entry_watcher.watch(trade_id, sig["symbol"], order_side, tp1, oid)
 
                     # Send Telegram notification for pending entry
                     telegram_alerts.send_entry_pending(
