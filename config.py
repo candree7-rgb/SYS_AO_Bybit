@@ -38,6 +38,17 @@ QUOTE    = _get("QUOTE","USDT").upper()
 LEVERAGE = _get_int("LEVERAGE","5")
 RISK_PCT = _get_float("RISK_PCT","5")
 
+# Fixed risk profile — overrides any SL/TPs from the signal with hardcoded
+# percentages. The AO Crusher provider is consistent (TP1=0.8% TP2=1.6%
+# TP3=4% SL=1% on scalp signals). Setting this to true makes the bot
+# ignore the signal's SL/TPs entirely and use these fixed values, which:
+#   - keeps risk fixed regardless of swing/scalp signal variants
+#   - makes the bot robust against signal format changes
+#   - minimal speed gain (parsing is sub-ms either way)
+FIXED_RISK_PROFILE = _get_bool("FIXED_RISK_PROFILE","true")
+FIXED_SL_PCT       = _get_float("FIXED_SL_PCT","1.0")
+FIXED_TP_PCTS      = [float(x) for x in _get("FIXED_TP_PCTS","0.8,1.6,4.0").split(",") if x.strip()]
+
 # Limits / Safety
 MAX_CONCURRENT_TRADES = _get_int("MAX_CONCURRENT_TRADES","3")
 MAX_TRADES_PER_DAY    = _get_int("MAX_TRADES_PER_DAY","20")

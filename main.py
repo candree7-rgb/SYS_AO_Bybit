@@ -3,6 +3,7 @@ import time
 import random
 import threading
 import logging
+import queue as _queue
 
 from config import (
     DISCORD_TOKEN, CHANNEL_ID,
@@ -395,7 +396,10 @@ def main():
                 msgs = []
 
                 if use_gateway_now:
-                    # Drain everything queued since last loop iteration.
+                    # Drain everything queued — the throttle at the bottom
+                    # of the loop blocks on gateway.msg_event so we only
+                    # get here when there's something to process (or every
+                    # GATEWAY_LOOP_SLEEP_SEC for maintenance).
                     while True:
                         m = gateway.get_message_nowait()
                         if m is None:
@@ -484,6 +488,7 @@ def main():
                         "tp_splits": None,  # engine uses config
                         "dca_prices": sig.get("dca_prices") or [],
                         "sl_price": sig.get("sl_price"),
+                        "sl_set_inline": bool(sig.get("_sl_inline")),
                         "entry_order_id": oid,
                         "status": "pending",
                         "placed_ts": time.time(),
@@ -536,15 +541,19 @@ def main():
             log.exception(f"Loop error: {e}")
             time.sleep(3)
 
-        # When Gateway WS is healthy the loop is just queue-drain + maintenance,
-        # so sleep short. Otherwise fall back to REST polling cadence.
+        # ── Throttle ──
+        # Gateway healthy: block on msg_event so an inbound Discord push
+        # wakes the loop instantly (event-driven, ~0ms wait). The timeout
+        # also caps maintenance interval at GATEWAY_LOOP_SLEEP_SEC.
+        # Gateway down: REST polling cadence.
         gw_healthy = (
             gateway is not None
             and gateway.is_healthy()
             and gateway.consecutive_failures() < GATEWAY_FALLBACK_FAILURES
         )
         if gw_healthy:
-            time.sleep(max(0.1, GATEWAY_LOOP_SLEEP_SEC))
+            gateway.msg_event.wait(timeout=max(0.05, GATEWAY_LOOP_SLEEP_SEC))
+            gateway.msg_event.clear()
         else:
             time.sleep(max(1, POLL_SECONDS + random.uniform(0, max(0, POLL_JITTER_MAX))))
 

@@ -13,6 +13,7 @@ from config import (
     TP_SPLITS, DCA_QTY_MULTS, INITIAL_SL_PCT, FALLBACK_TP_PCT,
     MOVE_SL_TO_BE_ON_TP1, BREAKEVEN_PROFIT_BUFFER_PCT,
     TRAIL_AFTER_TP_INDEX, TRAIL_DISTANCE_PCT, TRAIL_ACTIVATE_ON_TP,
+    FIXED_RISK_PROFILE, FIXED_SL_PCT, FIXED_TP_PCTS,
     DRY_RUN
 )
 
@@ -32,6 +33,10 @@ class TradeEngine:
         self._cache_ttl = 300  # 5 min cache
         self._cache_times: Dict[str, float] = {}
         self._last_stats_day: str = ""
+        # Symbols whose leverage we have already set this session — avoids
+        # a redundant set_leverage Bybit call on every trade. Bybit error
+        # 110043 ("leverage not modified") is also treated as cached-success.
+        self._leverage_set: set = set()
 
     # ---------- startup sync ----------
     def startup_sync(self) -> None:
@@ -226,24 +231,46 @@ class TradeEngine:
                 self.log.info(f"⏭️  SKIP {symbol} – already managed by bot '{other_bot}' (symbol locked)")
                 return None
 
-        # ensure leverage set
-        try:
-            if not DRY_RUN:
-                self.bybit.set_leverage(CATEGORY, symbol, LEVERAGE)
-        except Exception as e:
-            self.log.warning(f"set_leverage failed for {symbol}: {e}")
+        rules = self._get_instrument_rules(symbol)
+        tick_size = rules["tick_size"]
 
-        last = self.bybit.last_price(CATEGORY, symbol)
+        # ── Apply fixed risk profile (overrides signal SL/TPs) ──────────────
+        # Mutates `sig` so main.py persists the final values into trade state.
+        if FIXED_RISK_PROFILE:
+            if side == "Sell":
+                sl_price = trigger * (1 + FIXED_SL_PCT / 100.0)
+                tp_prices = [trigger * (1 - p / 100.0) for p in FIXED_TP_PCTS]
+            else:
+                sl_price = trigger * (1 - FIXED_SL_PCT / 100.0)
+                tp_prices = [trigger * (1 + p / 100.0) for p in FIXED_TP_PCTS]
+            sl_price = self._round_price(sl_price, tick_size)
+            tp_prices = [self._round_price(p, tick_size) for p in tp_prices]
+            sig["sl_price"] = sl_price
+            sig["tp_prices"] = tp_prices
+        else:
+            sl_price = float(sig.get("sl_price") or 0) or None
+            if sl_price:
+                sl_price = self._round_price(sl_price, tick_size)
+
+        # ── Parallel: set_leverage (if needed) + last_price ─────────────────
+        # set_leverage is skipped on symbols we've already configured this
+        # session (Bybit persists leverage per account+symbol).
+        need_lev = (symbol not in self._leverage_set) and not DRY_RUN
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_lev = ex.submit(self._set_leverage_safe, symbol) if need_lev else None
+            f_last = ex.submit(self.bybit.last_price, CATEGORY, symbol)
+            last = f_last.result()
+            if f_lev:
+                lev_ok = f_lev.result()
+                if lev_ok:
+                    self._leverage_set.add(symbol)
+
         if self._too_far(side, last, trigger):
             self.log.info(f"SKIP {symbol} – too far past trigger (last={last}, trigger={trigger})")
             return None
         if self._beyond_expiry_price(side, last, trigger):
             self.log.info(f"SKIP {symbol} – beyond expiry-price rule (last={last}, trigger={trigger})")
             return None
-
-        # Get instrument rules for price/qty rounding
-        rules = self._get_instrument_rules(symbol)
-        tick_size = rules["tick_size"]
 
         # buffer: slightly earlier trigger if desired
         trigger_adj = trigger * (1 - ENTRY_TRIGGER_BUFFER_PCT / 100.0) if side == "Buy" else trigger * (1 + ENTRY_TRIGGER_BUFFER_PCT / 100.0)
@@ -278,6 +305,17 @@ class TradeEngine:
             "orderLinkId": trade_id,
         }
 
+        # ── Inline stopLoss in the entry order ──────────────────────────────
+        # Bybit attaches the SL to the position once the conditional fills,
+        # which means we save a separate set_trading_stop call (~150ms).
+        sl_inline = False
+        if sl_price:
+            body["stopLoss"] = f"{sl_price:.10f}"
+            body["slTriggerBy"] = "LastPrice"
+            body["tpslMode"] = "Full"
+            sl_inline = True
+        sig["_sl_inline"] = sl_inline  # consumed by main.py to flag the trade
+
         if DRY_RUN:
             self.log.info(f"DRY_RUN ENTRY {symbol}: {body}")
             return "DRY_RUN"
@@ -288,13 +326,25 @@ class TradeEngine:
             self.log.debug(f"Bybit place_order response: {resp}")
             oid = (resp.get("result") or {}).get("orderId")
             if oid:
-                self.log.info(f"✅ Bybit order created: {symbol} orderId={oid}")
+                self.log.info(f"✅ Bybit order created: {symbol} orderId={oid} (SL inline @ {sl_price})")
             else:
                 self.log.warning(f"⚠️ Bybit response has no orderId: {resp}")
             return oid
         except Exception as e:
             self.log.error(f"❌ Bybit place_order FAILED for {symbol}: {e}")
             return None
+
+    def _set_leverage_safe(self, symbol: str) -> bool:
+        """Set leverage; treat 110043 (not modified) as success."""
+        try:
+            self.bybit.set_leverage(CATEGORY, symbol, LEVERAGE)
+            return True
+        except Exception as e:
+            msg = str(e)
+            if "110043" in msg:
+                return True  # already set to the target leverage
+            self.log.warning(f"set_leverage failed for {symbol}: {e}")
+            return False
 
     def cancel_entry(self, symbol: str, order_id: str) -> None:
         body = {"category": CATEGORY, "symbol": symbol, "orderId": order_id}
@@ -340,10 +390,19 @@ class TradeEngine:
             return
 
         # ---- Calculate SL price ----
-        sl_pct = INITIAL_SL_PCT / 100.0
-        sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
-        sl_price = self._round_price(sl_price, tick_size)
-        self.log.info(f"📍 SL at {INITIAL_SL_PCT}% from entry: {sl_price}")
+        # If the SL was already attached inline to the entry order
+        # (FIXED_RISK_PROFILE or signal had its own SL), Bybit picks it up
+        # automatically when the conditional fills. Skip the redundant
+        # set_trading_stop call (~150ms saved).
+        sl_already_inline = bool(trade.get("sl_set_inline"))
+        if sl_already_inline:
+            sl_price = float(trade.get("sl_price") or 0)
+            self.log.info(f"📍 SL inline from entry order @ {sl_price} (skipping set_trading_stop)")
+        else:
+            sl_pct = INITIAL_SL_PCT / 100.0
+            sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
+            sl_price = self._round_price(sl_price, tick_size)
+            self.log.info(f"📍 SL at {INITIAL_SL_PCT}% from entry: {sl_price}")
 
         tp_prices: List[float] = trade.get("tp_prices") or []
         splits: List[float] = trade.get("tp_splits") or TP_SPLITS
@@ -453,19 +512,19 @@ class TradeEngine:
                 self.bybit.set_trading_stop(ts_body)
                 return "SL", 0, None
 
-            # Run SL + all orders in parallel (max 6 workers: 1 SL + 3 TPs + 2 DCAs)
+            # Run SL (if not inline) + all orders in parallel
             with ThreadPoolExecutor(max_workers=6) as executor:
-                # Submit SL first (highest priority)
-                sl_future = executor.submit(set_sl)
-                # Submit all TP and DCA orders
+                sl_future = None
+                if not sl_already_inline:
+                    sl_future = executor.submit(set_sl)
                 order_futures = [executor.submit(place_order, o) for o in all_orders]
 
-                # Wait for SL first
-                try:
-                    sl_future.result()
-                    self.log.info(f"✅ SL set successfully")
-                except Exception as e:
-                    self.log.warning(f"SL setting failed: {e}")
+                if sl_future is not None:
+                    try:
+                        sl_future.result()
+                        self.log.info(f"✅ SL set successfully")
+                    except Exception as e:
+                        self.log.warning(f"SL setting failed: {e}")
 
                 # Process order results
                 for future in as_completed(order_futures):

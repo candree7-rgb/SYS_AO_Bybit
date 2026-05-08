@@ -40,6 +40,9 @@ class DiscordGateway:
         self._consecutive_failures = 0
         self._last_event_ts = 0.0
         self._ready_ts = 0.0
+        # Fires on every newly-received message; main loop blocks on this
+        # so that pushes wake processing instantly without busy-polling.
+        self.msg_event = threading.Event()
 
     # ---------- public API ----------
 
@@ -200,6 +203,9 @@ class DiscordGateway:
                 self.log.warning("[gateway] queue full — dropped oldest message")
             except queue.Full:
                 pass
+        finally:
+            # Wake the main loop regardless of put outcome.
+            self.msg_event.set()
 
     @staticmethod
     def _message_to_dict(message) -> Dict[str, Any]:
