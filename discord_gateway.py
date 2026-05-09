@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 
 class DiscordGateway:
     def __init__(self, token: str, channel_id: str, log, max_queue_size: int = 200,
-                 on_signal_callback=None):
+                 on_signal_callback=None, on_edit_callback=None):
         self.token = token
         self.channel_id = int(channel_id)
         self.log = log
@@ -36,6 +36,11 @@ class DiscordGateway:
         # Bybit-order path. The callback is responsible for its own state
         # locking; the gateway just dispatches.
         self.on_signal_callback = on_signal_callback
+        # Optional: same dispatch pattern but for MESSAGE_UPDATE events
+        # (provider edits an existing message — usually adding TRADE CLOSED
+        # or changing SL/TP). Handler should look up the trade by
+        # discord_msg_id and apply diff.
+        self.on_edit_callback = on_edit_callback
 
         self.msg_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max_queue_size)
 
@@ -194,6 +199,20 @@ class DiscordGateway:
                     asyncio.create_task(asyncio.to_thread(cb, raw))
             except Exception as e:
                 self.log.warning(f"[gateway] on_message handler error: {e}")
+
+        @client.event
+        async def on_message_edit(before, after):
+            try:
+                if int(after.channel.id) != self.channel_id:
+                    return
+                self._last_event_ts = time.time()
+                raw = self._message_to_dict(after)
+                self.log.debug(f"[gateway] msg {after.id} edited")
+                cb = self.on_edit_callback
+                if cb is not None:
+                    asyncio.create_task(asyncio.to_thread(cb, raw))
+            except Exception as e:
+                self.log.warning(f"[gateway] on_message_edit error: {e}")
 
         try:
             loop.run_until_complete(client.start(self.token))

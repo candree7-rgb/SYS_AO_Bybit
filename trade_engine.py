@@ -253,7 +253,14 @@ class TradeEngine:
                 return p
         return None
 
-    def position_size_avg(self, symbol: str) -> tuple[float, float]:
+    def position_size_avg(self, symbol: str, fresh: bool = False) -> tuple[float, float]:
+        # Prefer WS-cached position (sub-ms) over REST. Pass fresh=True for
+        # safety-critical paths (orphan detection in cleanup_closed_trades)
+        # where we need ground-truth from Bybit, not a possibly-stale cache.
+        if not fresh:
+            cached = self.bybit.get_cached_position(symbol)
+            if cached is not None:
+                return cached
         p = self._position(symbol)
         if not p:
             return 0.0, 0.0
@@ -401,6 +408,20 @@ class TradeEngine:
             self.log.error(f"❌ Bybit place_order FAILED for {symbol}: {e}")
             return None
 
+    def _last_price(self, symbol: str) -> float:
+        """Fetch last price, preferring entry_watcher's WS ticker cache.
+        Falls back to REST. Subscribes the symbol on first miss so subsequent
+        reads hit the WS cache (sub-ms)."""
+        if self.entry_watcher is not None:
+            cached = self.entry_watcher.get_last_price(symbol)
+            if cached is not None:
+                return cached
+            try:
+                self.entry_watcher.ensure_subscribed(symbol)
+            except Exception:
+                pass
+        return self._last_price(symbol)
+
     def _safe_equity_refresh(self):
         """Background equity cache refresh — swallows errors silently
         because the next REST call will retry anyway."""
@@ -538,7 +559,7 @@ class TradeEngine:
         dca_prices: List[float] = trade.get("dca_prices") or []
         dca_to_place = min(len(dca_prices), len(DCA_QTY_MULTS))
         self.log.info(f"📊 Placing {dca_to_place} DCAs (mults: {DCA_QTY_MULTS[:dca_to_place]})")
-        last = self.bybit.last_price(CATEGORY, symbol)
+        last = self._last_price(symbol)
 
         for j in range(1, dca_to_place + 1):
             price = self._round_price(float(dca_prices[j-1]), tick_size)
@@ -914,7 +935,7 @@ class TradeEngine:
         tick_size = rules["tick_size"]
 
         # Get current market price
-        current_price = self.bybit.last_price(CATEGORY, symbol)
+        current_price = self._last_price(symbol)
 
         if len(tp_prices) < tp_num:
             anchor = current_price
@@ -1008,7 +1029,7 @@ class TradeEngine:
             # Check 2: Did price go THROUGH TP1 level? (even if order wasn't filled)
             if not should_move_to_be:
                 try:
-                    current_price = self.bybit.last_price(CATEGORY, symbol)
+                    current_price = self._last_price(symbol)
                     if side == "Buy":  # LONG: TP1 is above entry
                         if current_price >= tp1_price:
                             should_move_to_be = True
@@ -1079,7 +1100,7 @@ class TradeEngine:
             tp1_price = float(tp_prices[0])
 
             try:
-                current_price = self.bybit.last_price(CATEGORY, symbol)
+                current_price = self._last_price(symbol)
                 if not current_price:
                     self.log.warning(f"   {symbol}: Could not fetch current price for TP1 check")
                     continue
@@ -1134,7 +1155,7 @@ class TradeEngine:
                 continue
 
             try:
-                current_price = self.bybit.last_price(CATEGORY, symbol)
+                current_price = self._last_price(symbol)
                 if not current_price:
                     continue
 
@@ -1169,9 +1190,11 @@ class TradeEngine:
                     # Position closed - cancel all pending orders for this trade!
                     self._cancel_all_trade_orders(tr)
 
-                    # SAFETY CHECK: Verify position is REALLY closed after canceling orders
-                    # (prevents leaving unprotected positions open)
-                    size_verify, _ = self.position_size_avg(tr["symbol"])
+                    # SAFETY CHECK: Verify position is REALLY closed after canceling orders.
+                    # fresh=True forces a Bybit REST call here (not WS cache) — the WS
+                    # event for the close might be in-flight while we read, leading us
+                    # to falsely conclude the position is closed.
+                    size_verify, _ = self.position_size_avg(tr["symbol"], fresh=True)
                     if size_verify > 0:
                         self.log.error(f"🚨 CRITICAL: Position {tr['symbol']} still open ({size_verify}) after cleanup!")
                         self.log.error(f"   Forcing MARKET CLOSE to protect position...")
@@ -1636,7 +1659,7 @@ class TradeEngine:
         min_qty = rules["min_qty"]
 
         dca_to_place = min(len(dca_prices), len(DCA_QTY_MULTS))
-        last = self.bybit.last_price(CATEGORY, symbol)
+        last = self._last_price(symbol)
 
         self.log.info(f"📊 Placing {dca_to_place} DCAs for {symbol}")
 

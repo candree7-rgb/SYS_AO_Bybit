@@ -37,6 +37,13 @@ class EntryWatcher:
         self._lock = threading.Lock()
         # symbol -> { trade_id: {"side": "Buy"/"Sell", "tp1": float, "entry_oid": str} }
         self._watches: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # symbol -> (last_price, ts) — populated on every ticker tick.
+        # Other code (trade_engine) reads this to skip last_price REST.
+        self._last_prices: Dict[str, Any] = {}
+        self._lp_max_age = 5.0
+        # symbols subscribed for price-cache only (no TP1-cross watch).
+        # Kept across reconnects via _on_open resubscribe.
+        self._kept_symbols: set = set()
         self._ws = None  # active WebSocketApp instance
         self._subscribed: set = set()
         self._stop = threading.Event()
@@ -79,7 +86,8 @@ class EntryWatcher:
             self.log.info(f"[watcher] subscribed tickers.{symbol} (tp1={tp1_price}, side={side})")
 
     def unwatch(self, symbol: str, trade_id: Optional[str] = None):
-        """Remove one trade (if trade_id given) or all trades for a symbol."""
+        """Remove one trade (if trade_id given) or all trades for a symbol.
+        Does NOT unsubscribe if the symbol is in _kept_symbols (price-cache use)."""
         with self._lock:
             trades = self._watches.get(symbol)
             if not trades:
@@ -89,10 +97,14 @@ class EntryWatcher:
             else:
                 trades.clear()
             symbol_empty = not trades
+            keep_for_cache = symbol in self._kept_symbols
             if symbol_empty:
                 self._watches.pop(symbol, None)
-                already_subscribed = symbol in self._subscribed
-                self._subscribed.discard(symbol)
+                if not keep_for_cache:
+                    already_subscribed = symbol in self._subscribed
+                    self._subscribed.discard(symbol)
+                else:
+                    already_subscribed = False  # keep subscribed for cache
             else:
                 already_subscribed = False
         if symbol_empty and already_subscribed and self._ws:
@@ -113,7 +125,9 @@ class EntryWatcher:
     def _on_open(self, ws):
         self._ws = ws
         with self._lock:
-            symbols = list(self._watches.keys())
+            # Resubscribe to BOTH active watches AND price-cache-only symbols
+            # so the cache survives WS reconnect.
+            symbols = list(set(self._watches.keys()) | self._kept_symbols)
             self._subscribed.clear()
         # Bybit allows up to 10 args per subscribe message — chunk to be safe.
         for i in range(0, len(symbols), 10):
@@ -141,7 +155,30 @@ class EntryWatcher:
             last = float(last_str)
         except (TypeError, ValueError):
             return
+        # Cache last-price for any other consumer (trade_engine) to read.
+        with self._lock:
+            self._last_prices[symbol] = (last, time.time())
         self._check_cross(symbol, last)
+
+    def get_last_price(self, symbol: str):
+        """Return cached last-price if fresh (< _lp_max_age), else None.
+        Read by trade_engine to skip last_price REST."""
+        with self._lock:
+            t = self._last_prices.get(symbol)
+        if t and (time.time() - t[1]) < self._lp_max_age:
+            return t[0]
+        return None
+
+    def ensure_subscribed(self, symbol: str):
+        """Subscribe to a symbol's ticker for price-cache only (no TP1-cross
+        watch). Idempotent. Survives WS reconnect via _kept_symbols."""
+        with self._lock:
+            self._kept_symbols.add(symbol)
+            already = symbol in self._subscribed or self._ws is None
+            if not already:
+                self._subscribed.add(symbol)
+        if not already and self._ws:
+            self._send({"op": "subscribe", "args": [f"tickers.{symbol}"]})
 
     def _check_cross(self, symbol: str, last: float):
         with self._lock:

@@ -28,6 +28,18 @@ class BybitV5:
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
 
+        # Private-WS pushed caches — Bybit pushes wallet/position updates
+        # over the same WS that delivers `execution`. When fresh, these
+        # eliminate REST roundtrips entirely. Both have their own lock to
+        # avoid contention with the equity TTL cache above.
+        import threading as _t
+        self._ws_equity: Dict[str, Tuple[float, float]] = {}     # acct -> (equity, ts)
+        self._ws_equity_lock = _t.Lock()
+        self._ws_equity_max_age = 30.0
+        self._ws_positions: Dict[str, Tuple[float, float, float]] = {}  # symbol -> (size, avgPrice, ts)
+        self._ws_pos_lock = _t.Lock()
+        self._ws_pos_max_age = 10.0
+
         # Demo trading uses different endpoints (paper trading on live market data)
         if demo:
             self.base = "https://api-demo.bybit.com"
@@ -89,9 +101,22 @@ class BybitV5:
         return lst[0]
 
     # ---------- Account ----------
+    def get_cached_position(self, symbol: str):
+        """Return (size, avgPrice) from WS cache if fresh, else None.
+        Reads are lock-protected so the WS thread can write atomically."""
+        with self._ws_pos_lock:
+            t = self._ws_positions.get(symbol)
+        if t and (time.time() - t[2]) < self._ws_pos_max_age:
+            return t[0], t[1]
+        return None
+
     def wallet_equity(self, account_type: str = "UNIFIED", force_refresh: bool = False) -> float:
-        # Return cached value if fresh — saves ~150ms per trade.
+        # Prefer the WS-pushed value if it's fresh — sub-ms read, no REST.
         if not force_refresh:
+            with self._ws_equity_lock:
+                ws = self._ws_equity.get(account_type)
+            if ws and (time.time() - ws[1]) < self._ws_equity_max_age:
+                return ws[0]
             cached = self._equity_cache.get(account_type)
             if cached is not None and (time.time() - cached[1]) < self._equity_ttl:
                 return cached[0]
@@ -212,14 +237,19 @@ class BybitV5:
         return ((data.get("result") or {}).get("list") or [])
 
     # ---------- WebSocket (private executions & orders) ----------
-    def run_private_ws(self, on_execution, on_order=None, on_error=None):
+    def run_private_ws(self, on_execution, on_order=None, on_wallet=None,
+                       on_position=None, on_error=None, account_type: str = "UNIFIED"):
         expires = int(time.time() * 1000) + 10_000
         sign_payload = f"GET/realtime{expires}"
         sig = hmac.new(self.api_secret, sign_payload.encode(), hashlib.sha256).hexdigest()
 
         def _on_open(ws):
             ws.send(json.dumps({"op": "auth", "args": [self.api_key, expires, sig]}))
-            ws.send(json.dumps({"op": "subscribe", "args": ["execution", "order"]}))
+            # Subscribe to all 4 topics we care about. wallet+position
+            # eliminate REST polls in the hot path; Bybit pushes a
+            # snapshot on auth-success so caches re-seed automatically
+            # after every reconnect.
+            ws.send(json.dumps({"op": "subscribe", "args": ["execution", "order", "wallet", "position"]}))
 
         def _on_message(ws, message):
             try:
@@ -237,6 +267,34 @@ class BybitV5:
             if topic.startswith("order") and data and on_order:
                 for ev in (data if isinstance(data, list) else [data]):
                     on_order(ev)
+            if topic == "wallet" and data:
+                for ev in (data if isinstance(data, list) else [data]):
+                    try:
+                        val = float(ev.get("totalEquity") or 0)
+                        if val > 0:
+                            acct = ev.get("accountType", account_type)
+                            ts = time.time()
+                            with self._ws_equity_lock:
+                                self._ws_equity[acct] = (val, ts)
+                            # Also poke the TTL cache so REST callers hit hot
+                            self._equity_cache[acct] = (val, ts)
+                    except (TypeError, ValueError):
+                        pass
+                    if on_wallet:
+                        on_wallet(ev)
+            if topic.startswith("position") and data:
+                for ev in (data if isinstance(data, list) else [data]):
+                    sym = ev.get("symbol")
+                    if sym:
+                        try:
+                            size = float(ev.get("size") or 0)
+                            avg = float(ev.get("avgPrice") or ev.get("entryPrice") or 0)
+                            with self._ws_pos_lock:
+                                self._ws_positions[sym] = (size, avg, time.time())
+                        except (TypeError, ValueError):
+                            pass
+                    if on_position:
+                        on_position(ev)
 
         def _on_err(ws, err):
             if on_error:

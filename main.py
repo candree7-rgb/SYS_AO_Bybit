@@ -34,161 +34,139 @@ def setup_logger() -> logging.Logger:
     log.handlers[:] = [h]
     return log
 
-def check_signal_updates(discord, engine, st, log):
-    """Re-read Discord messages for open/pending trades and apply SL/TP/DCA updates."""
+def _apply_signal_update_to_trade(tr, txt, engine, log):
+    """Apply parsed-from-text signal-update logic to a single trade.
+    Used by both REST polling (check_signal_updates) and Gateway WS edit
+    push (fast_edit_handler in main()). Caller holds state_lock."""
+    try:
+        # Check for TRADE CLOSED (manual close by signal provider).
+        # Detects both "TRADE CLOSED" (legacy) and "Closed P&L:" (AO Crusher).
+        if is_trade_closed(txt):
+            log.warning(f"🚨 Signal CLOSED detected for {tr['symbol']} - sending Telegram alert")
+            if tr.get("status") == "open":
+                direction = "SHORT" if tr["order_side"] == "Sell" else "LONG"
+                message = (
+                    f"🚨 <b>Signal Provider Closed Trade</b>\n\n"
+                    f"<b>{tr['symbol']}</b> {direction}\n"
+                    f"Status: Position still OPEN\n\n"
+                    f"⚠️ Consider closing position manually"
+                )
+                telegram_alerts.send_message(message)
+                log.info(f"   Telegram alert sent for {tr['symbol']}")
+            elif tr.get("status") == "pending":
+                entry_oid = tr.get("entry_order_id")
+                if entry_oid and entry_oid != "DRY_RUN":
+                    try:
+                        engine.cancel_entry(tr["symbol"], entry_oid)
+                        telegram_alerts.send_order_canceled(
+                            symbol=tr["symbol"],
+                            side=tr["order_side"],
+                            reason="Signal provider closed trade"
+                        )
+                    except Exception as e:
+                        log.warning(f"Failed to cancel entry for {tr['symbol']}: {e}")
+                tr["status"] = "cancelled"
+                tr["exit_reason"] = "signal_closed"
+            return
 
-    # Find all active trades that have a discord_msg_id
+        # Check for TRADE CANCELLED
+        if "TRADE CANCELLED" in txt.upper() or "CLOSED WITHOUT ENTRY" in txt.upper():
+            log.warning(f"❌ Signal CANCELLED for {tr['symbol']} - cancelling all orders")
+            if tr.get("status") == "pending":
+                entry_oid = tr.get("entry_order_id")
+                if entry_oid:
+                    engine.cancel_entry(tr["symbol"], entry_oid)
+            if tr.get("status") == "open":
+                engine._cancel_all_trade_orders(tr)
+            tr["status"] = "cancelled"
+            tr["exit_reason"] = "signal_cancelled"
+            return
+
+        # Parse SL/TP/DCA from the text
+        sig = parse_signal_update(txt)
+        new_sl = sig.get("sl_price")
+        new_tps = sig.get("tp_prices") or []
+        new_dcas = sig.get("dca_prices") or []
+        old_sl = tr.get("sl_price")
+        old_tps = tr.get("tp_prices") or []
+        old_dcas = tr.get("dca_prices") or []
+        is_open = tr.get("status") == "open"
+
+        # SL Update Check
+        if new_sl and new_sl != old_sl and not tr.get("sl_moved_to_be"):
+            log.info(f"🔄 Signal SL updated for {tr['symbol']}: {old_sl} → {new_sl}")
+            tr["sl_price"] = new_sl
+            if is_open:
+                engine._move_sl(tr["symbol"], new_sl)
+
+        # TP Update Check (detect ANY change in TP prices)
+        tps_changed = False
+        if new_tps and len(new_tps) > 0:
+            new_tps = new_tps[:3]
+            if len(new_tps) != len(old_tps):
+                tps_changed = True
+            elif any(abs(float(new_tps[i]) - float(old_tps[i])) > 0.0000001
+                     for i in range(min(len(new_tps), len(old_tps)))):
+                tps_changed = True
+        if tps_changed:
+            log.info(f"🔄 Signal TPs changed for {tr['symbol']}: {old_tps} → {new_tps}")
+            if is_open and tr.get("post_orders_placed"):
+                engine.update_tp_orders(tr, new_tps)
+            else:
+                tr["tp_prices"] = new_tps
+
+        # DCA Update Check
+        dcas_changed = False
+        if new_dcas:
+            if len(new_dcas) != len(old_dcas):
+                dcas_changed = True
+            elif old_dcas and any(abs(float(new_dcas[i]) - float(old_dcas[i])) > 0.0000001
+                                 for i in range(min(len(new_dcas), len(old_dcas)))):
+                dcas_changed = True
+        if dcas_changed or (new_dcas and not old_dcas):
+            log.info(f"🔄 Signal DCA updated for {tr['symbol']}: {old_dcas} → {new_dcas}")
+            tr["dca_prices"] = new_dcas
+            if is_open and not tr.get("dca_orders_placed"):
+                engine.place_dca_orders(tr)
+    except Exception as e:
+        log.debug(f"Signal update apply failed for {tr.get('symbol')}: {e}")
+
+
+def check_signal_updates(discord, engine, st, log):
+    """REST-fallback signal-update poller. Re-fetches Discord messages
+    for active trades and applies updates via _apply_signal_update_to_trade.
+    The Gateway WS MESSAGE_UPDATE push is the primary path; this runs at
+    a slower cadence (60s) as a safety net."""
     active_trades = [
         tr for tr in st.get("open_trades", {}).values()
         if tr.get("status") in ("pending", "open") and tr.get("discord_msg_id")
     ]
-
     if not active_trades:
         return
 
-    log.info(f"🔍 Checking {len(active_trades)} trade(s) for signal updates...")
-
+    log.info(f"🔍 Checking {len(active_trades)} trade(s) for signal updates (REST poll)...")
     for tr in active_trades:
         try:
             msg_id = tr.get("discord_msg_id")
             if not msg_id:
                 continue
-
-            # Fetch the current Discord message
             msg = discord.fetch_message(str(msg_id))
             if not msg:
-                # Track failed fetch attempts to avoid log spam
-                failed_fetches = tr.get("discord_fetch_failures", 0)
-                failed_fetches += 1
+                failed_fetches = tr.get("discord_fetch_failures", 0) + 1
                 tr["discord_fetch_failures"] = failed_fetches
-
-                # Log only first time and every 10th attempt
                 if failed_fetches == 1:
-                    log.warning(f"   {tr.get('symbol')}: Could not fetch Discord msg {msg_id} (message deleted or API issue)")
+                    log.warning(f"   {tr.get('symbol')}: Could not fetch Discord msg {msg_id}")
                 elif failed_fetches >= 10:
-                    log.warning(f"   {tr.get('symbol')}: Still unable to fetch msg {msg_id} after {failed_fetches} attempts - removing discord_msg_id")
-                    tr["discord_msg_id"] = None  # Stop trying after 10 failed attempts
+                    log.warning(f"   {tr.get('symbol')}: Removing discord_msg_id after {failed_fetches} failures")
+                    tr["discord_msg_id"] = None
                 continue
-
-            # Extract text from the message
             txt = discord.extract_text(msg)
             if not txt:
                 continue
-
-            # Check for TRADE CLOSED (manual close by signal provider).
-            # Detects both "TRADE CLOSED" (legacy) and "Closed P&L:" (AO Crusher).
-            if is_trade_closed(txt):
-                log.warning(f"🚨 Signal CLOSED detected for {tr['symbol']} - sending Telegram alert")
-
-                # Send Telegram warning (don't auto-close position)
-                if tr.get("status") == "open":
-                    direction = "SHORT" if tr["order_side"] == "Sell" else "LONG"
-                    message = (
-                        f"🚨 <b>Signal Provider Closed Trade</b>\n\n"
-                        f"<b>{tr['symbol']}</b> {direction}\n"
-                        f"Status: Position still OPEN\n\n"
-                        f"⚠️ Consider closing position manually"
-                    )
-                    telegram_alerts.send_message(message)
-                    log.info(f"   Telegram alert sent for {tr['symbol']}")
-                elif tr.get("status") == "pending":
-                    # Cancel entry order for pending trades
-                    entry_oid = tr.get("entry_order_id")
-                    if entry_oid and entry_oid != "DRY_RUN":
-                        try:
-                            engine.cancel_entry(tr["symbol"], entry_oid)
-                            telegram_alerts.send_order_canceled(
-                                symbol=tr["symbol"],
-                                side=tr["order_side"],
-                                reason="Signal provider closed trade"
-                            )
-                        except Exception as e:
-                            log.warning(f"Failed to cancel entry for {tr['symbol']}: {e}")
-                    tr["status"] = "cancelled"
-                    tr["exit_reason"] = "signal_closed"
-                continue
-
-            # Check for TRADE CANCELLED
-            if "TRADE CANCELLED" in txt.upper() or "CLOSED WITHOUT ENTRY" in txt.upper():
-                log.warning(f"❌ Signal CANCELLED for {tr['symbol']} - cancelling all orders")
-                # Cancel Entry Order if pending
-                if tr.get("status") == "pending":
-                    entry_oid = tr.get("entry_order_id")
-                    if entry_oid:
-                        engine.cancel_entry(tr["symbol"], entry_oid)
-                # Cancel all TP/DCA Orders if open
-                if tr.get("status") == "open":
-                    engine._cancel_all_trade_orders(tr)
-                tr["status"] = "cancelled"
-                tr["exit_reason"] = "signal_cancelled"
-                continue
-
-            # TP1-hit detection runs via Bybit public WS (entry_watcher.py),
-            # not via Discord polling — the watcher cancels pending entries
-            # the moment the live last-price crosses TP1.
-
-            # Parse SL/TP/DCA from the text
-            sig = parse_signal_update(txt)
-
-            new_sl = sig.get("sl_price")
-            new_tps = sig.get("tp_prices") or []
-            new_dcas = sig.get("dca_prices") or []
-
-            old_sl = tr.get("sl_price")
-            old_tps = tr.get("tp_prices") or []
-            old_dcas = tr.get("dca_prices") or []
-
-            is_open = tr.get("status") == "open"
-
-            # SL Update Check
-            if new_sl and new_sl != old_sl and not tr.get("sl_moved_to_be"):
-                log.info(f"🔄 Signal SL updated for {tr['symbol']}: {old_sl} → {new_sl}")
-                tr["sl_price"] = new_sl
-                if is_open:
-                    engine._move_sl(tr["symbol"], new_sl)
-
-            # TP Update Check (detect ANY change in TP prices)
-            tps_changed = False
-            if new_tps and len(new_tps) > 0:
-                # Limit to max 3 TPs (ignore TP4+ because we trail after TP3)
-                new_tps = new_tps[:3]
-
-                if len(new_tps) != len(old_tps):
-                    tps_changed = True
-                elif any(abs(float(new_tps[i]) - float(old_tps[i])) > 0.0000001
-                         for i in range(min(len(new_tps), len(old_tps)))):
-                    tps_changed = True
-
-            if tps_changed:
-                log.info(f"🔄 Signal TPs changed for {tr['symbol']}: {old_tps} → {new_tps}")
-                if is_open and tr.get("post_orders_placed"):
-                    engine.update_tp_orders(tr, new_tps)
-                else:
-                    tr["tp_prices"] = new_tps
-
-            # DCA Update Check (detect ANY change in DCA prices, not just additions)
-            dcas_changed = False
-            if new_dcas:
-                # Always use all available DCAs (config allows up to 3)
-                if len(new_dcas) != len(old_dcas):
-                    dcas_changed = True
-                elif old_dcas and any(abs(float(new_dcas[i]) - float(old_dcas[i])) > 0.0000001
-                                     for i in range(min(len(new_dcas), len(old_dcas)))):
-                    dcas_changed = True
-
-            if dcas_changed or (new_dcas and not old_dcas):
-                log.info(f"🔄 Signal DCA updated for {tr['symbol']}: {old_dcas} → {new_dcas}")
-                tr["dca_prices"] = new_dcas
-                # If DCAs not placed yet or changed significantly, place/update them
-                if is_open and not tr.get("dca_orders_placed"):
-                    engine.place_dca_orders(tr)
-                # Note: If DCAs change after placement, we log but don't cancel/replace
-                # (safer to let existing DCAs stay active)
-
+            with state_lock:
+                _apply_signal_update_to_trade(tr, txt, engine, log)
         except Exception as e:
             log.debug(f"Signal update check failed for {tr.get('symbol')}: {e}")
-
-    # Save state
     save_state(STATE_FILE, st)
 
 def main():
@@ -381,7 +359,15 @@ def main():
     def ws_loop():
         while True:
             try:
-                bybit.run_private_ws(on_execution=on_execution, on_order=on_order, on_error=on_ws_error)
+                # wallet/position cache writes happen inside bybit_v5.py.
+                # No callbacks needed — engine reads from get_cached_position()
+                # and bybit.wallet_equity() (which checks WS cache first).
+                bybit.run_private_ws(
+                    on_execution=on_execution,
+                    on_order=on_order,
+                    on_error=on_ws_error,
+                    account_type=ACCOUNT_TYPE,
+                )
             except Exception as e:
                 on_ws_error(e)
             time.sleep(3)
@@ -557,10 +543,40 @@ def main():
         except Exception:
             log.exception("[WS] fast_signal_handler crashed")
 
-    # Now that fast_signal_handler is defined, wire it into the gateway and
+    # ============================================================
+    # Fast edit handler — invoked DIRECTLY from the gateway thread
+    # via asyncio.to_thread on every Discord MESSAGE_UPDATE event.
+    # Cuts TRADE CLOSED / SL-edit detection from up-to-60s polling
+    # to ~50ms push.
+    # ============================================================
+    def fast_edit_handler(raw_msg):
+        try:
+            mid_str = str(raw_msg.get("id") or "")
+            if not mid_str:
+                return
+            txt = discord.extract_text(raw_msg)
+            if not txt:
+                return
+            with state_lock:
+                tr = None
+                for t in st.get("open_trades", {}).values():
+                    if str(t.get("discord_msg_id") or "") == mid_str \
+                       and t.get("status") in ("pending", "open"):
+                        tr = t
+                        break
+                if tr is None:
+                    return  # not a tracked message — ignore
+                log.info(f"📝 [WS-edit] msg {mid_str} (tracked: {tr.get('symbol')})")
+                _apply_signal_update_to_trade(tr, txt, engine, log)
+            save_state(STATE_FILE, st)
+        except Exception:
+            log.exception("[WS-edit] fast_edit_handler crashed")
+
+    # Now that both handlers are defined, wire them into the gateway and
     # start the WS thread.
     if gateway:
         gateway.on_signal_callback = fast_signal_handler
+        gateway.on_edit_callback = fast_edit_handler
         gateway.start()
 
     # ----- main loop -----
