@@ -294,6 +294,17 @@ def main():
     last_signal_update_check_pending = time.time() - (SIGNAL_UPDATE_INTERVAL_SEC - 5)  # First check after 5 seconds
     last_signal_update_check_open = time.time() - (SIGNAL_UPDATE_INTERVAL_OPEN_SEC - 3)  # First check after 3 seconds
 
+    # State-write throttle: writing state.json on every loop iteration adds
+    # 50-200ms on slow filesystems and is wasteful when nothing changed.
+    # Throttle to once per second; trade-mutating paths force a save.
+    last_state_save = 0.0
+    STATE_SAVE_INTERVAL_SEC = 1.0
+    def _save_state_throttled(force: bool = False):
+        nonlocal last_state_save
+        if force or (time.time() - last_state_save) >= STATE_SAVE_INTERVAL_SEC:
+            save_state(STATE_FILE, st)
+            last_state_save = time.time()
+
     # ----- WS thread -----
     ws_err = {"err": None}
 
@@ -502,6 +513,7 @@ def main():
                         "leverage": LEVERAGE,
                     }
                     inc_trades_today()
+                    _save_state_throttled(force=True)  # persist new trade immediately
                     log.info(f"🟡 ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")
 
                     # Watch live last-price for TP1 cross — cancels entry if
@@ -527,7 +539,7 @@ def main():
 
                 st["last_discord_id"] = str(max_seen) if max_seen else after
 
-            save_state(STATE_FILE, st)
+            _save_state_throttled()
 
         except KeyboardInterrupt:
             log.info("Bye")

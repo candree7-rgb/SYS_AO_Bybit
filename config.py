@@ -56,7 +56,9 @@ TC_MAX_LAG_SEC        = _get_int("TC_MAX_LAG_SEC","300")
 
 # Entry rules
 ENTRY_EXPIRATION_MIN         = _get_int("ENTRY_EXPIRATION_MIN","180")
-ENTRY_TOO_FAR_PCT            = _get_float("ENTRY_TOO_FAR_PCT","0.5")
+# Skip entry if market is already further past trigger than TP1 — at that
+# point the trade has no upside left. Default 0.8% matches FIXED_TP_PCTS[0].
+ENTRY_TOO_FAR_PCT            = _get_float("ENTRY_TOO_FAR_PCT","0.8")
 ENTRY_TRIGGER_BUFFER_PCT     = _get_float("ENTRY_TRIGGER_BUFFER_PCT","0.0")
 ENTRY_LIMIT_PRICE_OFFSET_PCT = _get_float("ENTRY_LIMIT_PRICE_OFFSET_PCT","0.0")
 ENTRY_EXPIRATION_PRICE_PCT   = _get_float("ENTRY_EXPIRATION_PRICE_PCT","0.6")
