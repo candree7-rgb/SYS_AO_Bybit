@@ -147,11 +147,20 @@ class TradeEngine:
         info = self.bybit.instruments_info(CATEGORY, symbol)
         lot = info.get("lotSizeFilter") or {}
         price_filter = info.get("priceFilter") or {}
+        leverage_filter = info.get("leverageFilter") or {}
         qty_step = float(lot.get("qtyStep") or lot.get("basePrecision") or "0.000001")
         min_qty  = float(lot.get("minOrderQty") or "0")
         tick_size = float(price_filter.get("tickSize") or "0.0001")
+        # Bybit returns this as a string like "12.5" or "100"; default to a
+        # large value so unknown returns don't accidentally cap leverage.
+        max_leverage = float(leverage_filter.get("maxLeverage") or "100")
 
-        rules = {"qty_step": qty_step, "min_qty": min_qty, "tick_size": tick_size}
+        rules = {
+            "qty_step": qty_step,
+            "min_qty": min_qty,
+            "tick_size": tick_size,
+            "max_leverage": max_leverage,
+        }
         self._instrument_cache[symbol] = rules
         self._cache_times[symbol] = now
         return rules
@@ -169,15 +178,30 @@ class TradeEngine:
             qty = min_qty
         return float(f"{qty:.10f}")
 
-    def _effective_leverage(self, symbol: str) -> int:
-        """Look up per-symbol leverage override; fall back to LEVERAGE."""
+    def _effective_leverage(self, symbol: str):
+        """Effective leverage = min(env LEVERAGE, override, exchange max).
+
+        Resolution order:
+          1. LEVERAGE_OVERRIDES env (manually configured per symbol)
+          2. Bybit instrument-info maxLeverage (auto-detected, cached)
+          3. fall back to env LEVERAGE
+        Whichever is smallest wins — we never exceed what Bybit allows."""
         base = symbol.replace(QUOTE, "").upper()
-        return LEVERAGE_OVERRIDES.get(base, LEVERAGE)
+        manual = LEVERAGE_OVERRIDES.get(base)
+        try:
+            exchange_max = self._get_instrument_rules(symbol).get("max_leverage", LEVERAGE)
+        except Exception:
+            exchange_max = LEVERAGE
+        candidates = [LEVERAGE]
+        if manual is not None:
+            candidates.append(manual)
+        candidates.append(exchange_max)
+        return min(candidates)
 
     def _effective_risk_pct(self, symbol: str) -> float:
         """Scale risk_pct so that notional stays constant when leverage is
-        overridden. e.g. default 10%/20x → SIREN with 5x → 40%/5x.
-        Both have the same notional exposure and the same $-risk per trade."""
+        capped below the env default. e.g. default 10%/20x → SIREN at 5x →
+        40%/5x. Same notional exposure, same $-risk per trade."""
         eff_lev = self._effective_leverage(symbol)
         if eff_lev == LEVERAGE:
             return RISK_PCT

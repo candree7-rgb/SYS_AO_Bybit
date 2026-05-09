@@ -106,12 +106,15 @@ class BybitV5:
         self._equity_cache[account_type] = (value, time.time())
         return value
 
-    def set_leverage(self, category: str, symbol: str, leverage: int) -> Dict[str, Any]:
+    def set_leverage(self, category: str, symbol: str, leverage) -> Dict[str, Any]:
+        # leverage may be int (e.g. 20) or float (e.g. 12.5 for B/FHE/HIGH).
+        # Bybit accepts both as strings; format float without trailing zeros.
+        lev_str = f"{leverage:g}" if isinstance(leverage, float) else str(leverage)
         body = {
             "category": category,
             "symbol": symbol,
-            "buyLeverage": str(leverage),
-            "sellLeverage": str(leverage),
+            "buyLeverage": lev_str,
+            "sellLeverage": lev_str,
         }
         payload = json.dumps(body, separators=(",", ":"))
         r = requests.post(f"{self.base}/v5/position/set-leverage", headers=self._headers(payload), data=payload, timeout=15)

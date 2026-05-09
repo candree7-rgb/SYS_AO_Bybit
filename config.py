@@ -53,7 +53,9 @@ if _lev_override_str:
         if ":" in _pair:
             _sym, _lev = _pair.split(":", 1)
             try:
-                LEVERAGE_OVERRIDES[_sym.strip().upper()] = int(_lev.strip())
+                # float() so 12.5 works (e.g. B, FHE, HIGH on Bybit)
+                _val = float(_lev.strip())
+                LEVERAGE_OVERRIDES[_sym.strip().upper()] = int(_val) if _val.is_integer() else _val
             except ValueError:
                 pass
 
