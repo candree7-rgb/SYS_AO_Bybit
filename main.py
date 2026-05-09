@@ -19,7 +19,7 @@ from bybit_v5 import BybitV5
 from discord_reader import DiscordReader
 from discord_gateway import DiscordGateway
 from signal_parser import parse_signal, signal_hash, parse_signal_update, is_trade_closed
-from state import load_state, save_state, utc_day_key
+from state import load_state, save_state, utc_day_key, state_lock
 from trade_engine import TradeEngine
 from entry_watcher import EntryWatcher
 import db_export
@@ -222,15 +222,19 @@ def main():
     # the market last-price crosses TP1 (so we never enter into a trade where
     # the opportunity is already gone). Pure Bybit WS — no Discord polling.
     def on_tp1_cross(trade_id, symbol, side, entry_oid):
+        # Called from EntryWatcher's WS thread — must hold state_lock
+        # around state mutations to stay consistent with main loop and
+        # fast_signal_handler readers.
         try:
             if entry_oid and entry_oid != "DRY_RUN":
                 engine.cancel_entry(symbol, entry_oid)
         except Exception as e:
             log.warning(f"on_tp1_cross: cancel_entry failed for {symbol}: {e}")
-        tr = st.get("open_trades", {}).get(trade_id)
-        if tr:
-            tr["status"] = "cancelled_tp1_hit"
-            tr["exit_reason"] = "tp1_hit_before_entry"
+        with state_lock:
+            tr = st.get("open_trades", {}).get(trade_id)
+            if tr:
+                tr["status"] = "cancelled_tp1_hit"
+                tr["exit_reason"] = "tp1_hit_before_entry"
         try:
             telegram_alerts.send_order_canceled(
                 symbol=symbol,
@@ -393,11 +397,11 @@ def main():
         k = utc_day_key()
         st.setdefault("daily_counts", {})[k] = int(st.get("daily_counts", {}).get(k, 0)) + 1
 
-    # State mutations from the gateway thread (fast path) and the main loop
-    # (REST fallback / maintenance) need to serialize so dedupe + limit
-    # checks stay atomic. Lock is held only around the check+mark phase,
-    # not across the Bybit place_order call (200ms — would serialize trades).
-    state_lock = threading.Lock()
+    # state_lock is the shared module-level RLock from state.py — every
+    # state mutation across all threads (main loop, fast_signal_handler,
+    # WS callbacks, on_tp1_cross) acquires the same lock so save_state
+    # never sees a dict mid-mutation. RLock allows the same thread to
+    # re-enter (e.g. fast_signal_handler holds it across check+persist).
 
     # ============================================================
     # Fast signal handler — invoked DIRECTLY from the gateway thread
@@ -431,6 +435,16 @@ def main():
             mid_str = str(raw_msg.get("id", ""))
 
             # ── Atomic check-and-mark: dedupe + limits + reserve a slot ──
+            trade_id = f"{sig['symbol']}|{sig['side']}|{int(time.time())}"
+
+            # ── Atomic check-and-RESERVE: dedupe + limits + reserve a slot ──
+            # Race fix: we add a placeholder trade with status="reserving"
+            # under the lock so a concurrent fast_signal_handler counts us
+            # in its active-trades total. inc_trades_today() also runs here
+            # so the daily counter is correct before the Bybit place call.
+            # On any subsequent failure path (place_order returns None,
+            # exception, etc.) we MUST roll back: remove the placeholder
+            # and decrement the daily counter.
             with state_lock:
                 seen = set(st.get("seen_signal_hashes", []))
                 if sh in seen:
@@ -439,13 +453,23 @@ def main():
                 seen.add(sh)
                 st["seen_signal_hashes"] = list(seen)[-500:]
 
-                active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending", "open")]
+                active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending", "open", "reserving")]
                 if len(active) >= MAX_CONCURRENT_TRADES:
                     log.info(f"Active trades {len(active)}/{MAX_CONCURRENT_TRADES} → skip {sig['symbol']}")
                     return
                 if trades_today() >= MAX_TRADES_PER_DAY:
                     log.info(f"Trades today {trades_today()}/{MAX_TRADES_PER_DAY} → skip {sig['symbol']}")
                     return
+
+                # Reserve the slot atomically. Counter goes up here too so
+                # parallel handlers see the new total.
+                st.setdefault("open_trades", {})[trade_id] = {
+                    "id": trade_id,
+                    "symbol": sig["symbol"],
+                    "status": "reserving",
+                    "placed_ts": time.time(),
+                }
+                inc_trades_today()
 
                 # Update last_discord_id so REST backfill doesn't re-deliver
                 try:
@@ -455,19 +479,29 @@ def main():
                     pass
 
             # ── Place order (outside lock — Bybit ~200ms shouldn't block other threads) ──
-            trade_id = f"{sig['symbol']}|{sig['side']}|{int(time.time())}"
             log.info(f"🔄 [WS] Placing entry order for {sig['symbol']}...")
             _t = time.time()
-            oid = engine.place_conditional_entry(sig, trade_id)
+            try:
+                oid = engine.place_conditional_entry(sig, trade_id)
+            except Exception:
+                log.exception(f"❌ place_conditional_entry crashed for {sig['symbol']}")
+                oid = None
             place_ms = (time.time() - _t) * 1000.0
             e2e_ms = (time.time() - ts) * 1000.0 if ts else -1
             log.info(f"⏱  [WS] place_order took {place_ms:.0f}ms | e2e Discord→Order: {e2e_ms:.0f}ms")
 
             if not oid:
-                log.warning(f"❌ Entry order failed for {sig['symbol']}")
+                log.warning(f"❌ Entry order failed for {sig['symbol']} — rolling back reserved slot")
+                with state_lock:
+                    st.get("open_trades", {}).pop(trade_id, None)
+                    # Decrement daily counter (we incremented it pre-place)
+                    k = utc_day_key()
+                    cur = int(st.get("daily_counts", {}).get(k, 0))
+                    if cur > 0:
+                        st.setdefault("daily_counts", {})[k] = cur - 1
                 return
 
-            # ── Persist trade ──
+            # ── Promote placeholder to real trade ──
             try:
                 equity_now = bybit.wallet_equity(ACCOUNT_TYPE)  # cached
             except Exception:
@@ -475,7 +509,7 @@ def main():
 
             mid = int(mid_str or "0")
             with state_lock:
-                st.setdefault("open_trades", {})[trade_id] = {
+                st["open_trades"][trade_id] = {
                     "id": trade_id,
                     "symbol": sig["symbol"],
                     "order_side": "Sell" if sig["side"] == "sell" else "Buy",
@@ -498,8 +532,7 @@ def main():
                     "equity_at_entry": round(equity_now, 2) if equity_now > 0 else None,
                     "leverage": engine._effective_leverage(sig["symbol"]),
                 }
-                inc_trades_today()
-            save_state(STATE_FILE, st)
+                save_state(STATE_FILE, st)
             log.info(f"🟡 [WS] ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")
 
             # ── Watch TP1 cross + Telegram (parallel ok, off critical path) ──

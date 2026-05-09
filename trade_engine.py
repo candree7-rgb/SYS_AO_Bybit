@@ -7,7 +7,7 @@ import db_export
 import telegram_alerts
 
 from config import (
-    CATEGORY, ACCOUNT_TYPE, QUOTE, LEVERAGE, RISK_PCT,
+    CATEGORY, ACCOUNT_TYPE, QUOTE, LEVERAGE, RISK_PCT, BOT_ID,
     ENTRY_EXPIRATION_MIN, ENTRY_TOO_FAR_PCT, ENTRY_TRIGGER_BUFFER_PCT, ENTRY_LIMIT_PRICE_OFFSET_PCT,
     ENTRY_EXPIRATION_PRICE_PCT,
     TP_SPLITS, DCA_QTY_MULTS, INITIAL_SL_PCT, FALLBACK_TP_PCT,
@@ -310,18 +310,29 @@ class TradeEngine:
         # On a fresh symbol both set_leverage and wallet_equity may be cold
         # (each ~150ms). They're independent — fire them in parallel via a
         # tiny thread pool. Warm path: both return instantly from cache.
+        # SAFETY: if set_leverage fails (and it's not the "already set"
+        # 110043 path), we ABORT the trade rather than place at unknown
+        # leverage. Otherwise Bybit could open the position with the
+        # account-default leverage (e.g. 10x when we wanted 5x for SIREN),
+        # which silently breaks the qty calc and risks margin call.
         need_lev = symbol not in self._leverage_set and not DRY_RUN
         if need_lev:
             with ThreadPoolExecutor(max_workers=2) as ex:
                 f_lev = ex.submit(self._set_leverage_safe, symbol)
                 f_eq  = ex.submit(self.bybit.wallet_equity, ACCOUNT_TYPE)
-                if f_lev.result():
-                    self._leverage_set.add(symbol)
+                lev_ok = f_lev.result()
                 # equity result discarded — cached for calc_base_qty below
                 try:
                     f_eq.result()
                 except Exception:
                     pass
+                if not lev_ok:
+                    self.log.error(
+                        f"❌ ABORT {symbol}: set_leverage failed and we don't "
+                        f"know what leverage Bybit will apply — refusing to place"
+                    )
+                    return None
+                self._leverage_set.add(symbol)
 
         # buffer: slightly earlier trigger if desired
         trigger_adj = trigger * (1 - ENTRY_TRIGGER_BUFFER_PCT / 100.0) if side == "Buy" else trigger * (1 + ENTRY_TRIGGER_BUFFER_PCT / 100.0)
@@ -721,6 +732,15 @@ class TradeEngine:
 
     # ---------- reactive events ----------
     def on_execution(self, ev: Dict[str, Any]) -> None:
+        # Called from Bybit private WS thread. Hold state_lock around the
+        # whole method so concurrent main-loop / fast_signal_handler
+        # readers don't see partial mutations and save_state never
+        # serializes a half-updated dict.
+        from state import state_lock as _state_lock
+        with _state_lock:
+            self._on_execution_locked(ev)
+
+    def _on_execution_locked(self, ev: Dict[str, Any]) -> None:
         link = ev.get("orderLinkId") or ev.get("orderLinkID") or ""
         if not link:
             return
@@ -1498,29 +1518,10 @@ class TradeEngine:
         # Note: Daily equity update moved to log_daily_stats() to ensure it runs daily even without trades
 
     # ---------- signal update methods ----------
-    def _move_sl(self, symbol: str, new_sl: float) -> bool:
-        """Move stop loss to new price."""
-        if DRY_RUN:
-            self.log.info(f"DRY_RUN: Would move SL for {symbol} to {new_sl}")
-            return True
-
-        try:
-            rules = self._get_instrument_rules(symbol)
-            new_sl = self._round_price(new_sl, rules["tick_size"])
-
-            body = {
-                "category": CATEGORY,
-                "symbol": symbol,
-                "positionIdx": 0,
-                "stopLoss": f"{new_sl:.10f}",
-                "tpslMode": "Full",
-            }
-            self.bybit.set_trading_stop(body)
-            self.log.info(f"✅ SL moved to {new_sl} for {symbol}")
-            return True
-        except Exception as e:
-            self.log.warning(f"Failed to move SL for {symbol}: {e}")
-            return False
+    # NOTE: a second `_move_sl` definition used to live here. It silently
+    # overrode the retry-enabled implementation above (line ~849), causing
+    # the TP1→BE move to lose its 3-attempt retry on volatile markets.
+    # Removed — use the canonical `_move_sl(symbol, sl_price, max_retries=3)`.
 
     def update_tp_orders(self, trade: Dict[str, Any], new_tps: List[float]) -> bool:
         """Cancel old TP orders and place new ones with updated prices."""
