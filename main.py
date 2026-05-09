@@ -183,28 +183,39 @@ def main():
     if missing:
         raise SystemExit(f"Missing ENV(s): {', '.join(missing)}")
 
-    # ── EXPORT_HISTORY one-shot mode ──────────────────────────────────────
-    # Triggered by setting EXPORT_HISTORY=1 in Railway env. Runs the full
-    # Discord-channel-history exporter into the discord_signals Postgres
-    # table, then exits. Idempotent: re-running just refreshes the table
-    # (upsert per msg_id). Operator unsets the env afterwards to resume
-    # normal trading.
-    if os.getenv("EXPORT_HISTORY", "").strip().lower() in ("1", "true", "yes"):
-        log.info("📤 EXPORT_HISTORY=1 — running one-shot signal-history exporter…")
+    # ── EXPORT_HISTORY / ANALYZE_HISTORY one-shot modes ──────────────────
+    # Setting either flag in Railway env runs that one-shot job at startup
+    # then exits cleanly. Both can be set together: export populates DB,
+    # analyze reads from DB, prints results, sends Telegram summary, dumps
+    # analysis.json. Idempotent — re-running EXPORT just refreshes rows.
+    do_export   = os.getenv("EXPORT_HISTORY", "").strip().lower() in ("1", "true", "yes")
+    do_analyze  = os.getenv("ANALYZE_HISTORY", "").strip().lower() in ("1", "true", "yes")
+    if do_export or do_analyze:
         if db_export.is_enabled():
-            log.info("   db_export is enabled — initializing schema first")
+            log.info("   db_export enabled — initializing schema")
             db_export.init_database()
-        from export_signals import run_export
-        try:
-            limit = int(os.getenv("LIMIT", "0"))
-        except ValueError:
-            limit = 0
-        after_id = os.getenv("AFTER_ID", "").strip() or None
-        skip_files = os.getenv("SKIP_FILES", "1").strip().lower() in ("1", "true", "yes")
-        reader = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
-        run_export(reader, CHANNEL_ID, limit_total=limit,
-                   after_id=after_id, skip_files=skip_files, logger=log)
-        log.info("📤 EXPORT_HISTORY done. Unset EXPORT_HISTORY in Railway and redeploy to resume trading.")
+
+        if do_export:
+            log.info("📤 EXPORT_HISTORY=1 — dumping channel history to discord_signals table…")
+            from export_signals import run_export
+            try:
+                limit = int(os.getenv("LIMIT", "0"))
+            except ValueError:
+                limit = 0
+            after_id = os.getenv("AFTER_ID", "").strip() or None
+            skip_files = os.getenv("SKIP_FILES", "1").strip().lower() in ("1", "true", "yes")
+            reader = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
+            run_export(reader, CHANNEL_ID, limit_total=limit,
+                       after_id=after_id, skip_files=skip_files, logger=log)
+            log.info("📤 EXPORT_HISTORY done.")
+
+        if do_analyze:
+            log.info("📊 ANALYZE_HISTORY=1 — running strategy analysis…")
+            from analyze_signals import run_analysis
+            run_analysis(logger=log)
+
+        log.info("🏁 One-shot job complete. Unset EXPORT_HISTORY / ANALYZE_HISTORY in Railway "
+                 "and redeploy to resume normal trading.")
         return  # exit cleanly
 
     st = load_state(STATE_FILE)
