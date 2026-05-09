@@ -12,6 +12,7 @@ from config import (
     MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
     POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC, SIGNAL_UPDATE_INTERVAL_OPEN_SEC,
     USE_GATEWAY_WS, GATEWAY_FALLBACK_FAILURES, GATEWAY_LOOP_SLEEP_SEC, GATEWAY_INITIAL_BACKFILL,
+    WARMUP_SYMBOLS,
     STATE_FILE, DRY_RUN, LOG_LEVEL
 )
 from bybit_v5 import BybitV5
@@ -288,6 +289,54 @@ def main():
 
     # Startup sync - check for orphaned positions
     engine.startup_sync()
+
+    # ── Bybit cache pre-warm ───────────────────────────────────────────────
+    # Pre-fetch wallet_equity + (instrument_rules + set_leverage) for the
+    # symbols we'll likely trade, all in parallel. Eliminates the ~300ms
+    # cold-path penalty on the first trade per symbol after bot start.
+    def _bybit_warmup():
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        if not WARMUP_SYMBOLS and not DRY_RUN:
+            # Always pre-warm equity even if no symbol list provided
+            try:
+                bybit.wallet_equity(ACCOUNT_TYPE, force_refresh=True)
+                log.info("🔥 Warmup: equity cached")
+            except Exception as e:
+                log.warning(f"warmup: equity failed: {e}")
+            return
+        if DRY_RUN:
+            log.info("🔥 Warmup skipped (DRY_RUN)")
+            return
+
+        log.info(f"🔥 Warming up Bybit caches: equity + {len(WARMUP_SYMBOLS)} symbols...")
+        t0 = time.time()
+
+        def warm_symbol(base):
+            symbol = f"{base}{QUOTE}"
+            try:
+                engine._get_instrument_rules(symbol)  # populates _instrument_cache
+                if engine._set_leverage_safe(symbol):  # populates _leverage_set
+                    engine._leverage_set.add(symbol)
+                return (symbol, True, None)
+            except Exception as e:
+                return (symbol, False, str(e))
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            eq_f = ex.submit(bybit.wallet_equity, ACCOUNT_TYPE, True)
+            sym_futures = [ex.submit(warm_symbol, b) for b in WARMUP_SYMBOLS]
+            try:
+                eq_f.result()
+            except Exception as e:
+                log.warning(f"warmup: equity failed: {e}")
+            ok = sum(1 for f in sym_futures if (r := f.result())[1])
+            failed = [r[0] for f in sym_futures if not (r := f.result())[1]]
+        elapsed = (time.time() - t0) * 1000.0
+        msg = f"🔥 Warmup done: {ok}/{len(WARMUP_SYMBOLS)} symbols + equity, {elapsed:.0f}ms"
+        if failed:
+            msg += f" (failed: {','.join(failed[:5])})"
+        log.info(msg)
+
+    _bybit_warmup()
 
     # Heartbeat tracking
     last_heartbeat = time.time()

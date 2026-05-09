@@ -306,12 +306,22 @@ class TradeEngine:
             if sl_price:
                 sl_price = self._round_price(sl_price, tick_size)
 
-        # ── Cold-path leverage set ──────────────────────────────────────────
-        # Only call Bybit for unfamiliar symbols. After the first trade we
-        # remember that the leverage is configured and skip the call.
-        if symbol not in self._leverage_set and not DRY_RUN:
-            if self._set_leverage_safe(symbol):
-                self._leverage_set.add(symbol)
+        # ── Cold-path: parallelize set_leverage + wallet_equity ────────────
+        # On a fresh symbol both set_leverage and wallet_equity may be cold
+        # (each ~150ms). They're independent — fire them in parallel via a
+        # tiny thread pool. Warm path: both return instantly from cache.
+        need_lev = symbol not in self._leverage_set and not DRY_RUN
+        if need_lev:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_lev = ex.submit(self._set_leverage_safe, symbol)
+                f_eq  = ex.submit(self.bybit.wallet_equity, ACCOUNT_TYPE)
+                if f_lev.result():
+                    self._leverage_set.add(symbol)
+                # equity result discarded — cached for calc_base_qty below
+                try:
+                    f_eq.result()
+                except Exception:
+                    pass
 
         # buffer: slightly earlier trigger if desired
         trigger_adj = trigger * (1 - ENTRY_TRIGGER_BUFFER_PCT / 100.0) if side == "Buy" else trigger * (1 + ENTRY_TRIGGER_BUFFER_PCT / 100.0)
@@ -379,6 +389,14 @@ class TradeEngine:
         except Exception as e:
             self.log.error(f"❌ Bybit place_order FAILED for {symbol}: {e}")
             return None
+
+    def _safe_equity_refresh(self):
+        """Background equity cache refresh — swallows errors silently
+        because the next REST call will retry anyway."""
+        try:
+            self.bybit.wallet_equity(ACCOUNT_TYPE, force_refresh=True)
+        except Exception:
+            pass
 
     def _set_leverage_safe(self, symbol: str) -> bool:
         """Set leverage; treat 110043 (not modified) as success.
@@ -1169,6 +1187,16 @@ class TradeEngine:
                     # Export to Database IMMEDIATELY (not waiting for archive)
                     if db_export.is_enabled():
                         self._export_trade_to_db(tr)
+
+                    # Background-refresh equity cache so the NEXT signal's
+                    # qty calc uses the fresh post-trade balance (not the
+                    # stale 60s-old cached value). Fire-and-forget thread,
+                    # doesn't block the maintenance loop.
+                    import threading as _t
+                    _t.Thread(
+                        target=lambda: self._safe_equity_refresh(),
+                        daemon=True,
+                    ).start()
 
                     # Send Telegram notification
                     telegram_alerts.send_trade_closed(

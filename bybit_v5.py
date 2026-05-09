@@ -18,6 +18,16 @@ class BybitV5:
         self._equity_cache: Dict[str, Tuple[float, float]] = {}  # account_type -> (value, ts)
         self._equity_ttl = 60.0
 
+        # Shared HTTP session: reuses TCP connections + TLS handshake,
+        # saves 30-80ms on cold calls and 5-10ms on warm calls. The default
+        # urllib3 pool size is 10 — bump to 20 since we fire several
+        # concurrent calls at once during warmup and trade placement.
+        from requests.adapters import HTTPAdapter
+        self._session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+
         # Demo trading uses different endpoints (paper trading on live market data)
         if demo:
             self.base = "https://api-demo.bybit.com"
@@ -61,7 +71,7 @@ class BybitV5:
 
     # ---------- Market data ----------
     def last_price(self, category: str, symbol: str) -> float:
-        r = requests.get(f"{self.base}/v5/market/tickers", params={"category": category, "symbol": symbol}, timeout=10)
+        r = self._session.get(f"{self.base}/v5/market/tickers", params={"category": category, "symbol": symbol}, timeout=10)
         r.raise_for_status()
         data = self._check(r.json())
         lst = (data.get("result") or {}).get("list") or []
@@ -70,7 +80,7 @@ class BybitV5:
         return float(lst[0]["lastPrice"])
 
     def instruments_info(self, category: str, symbol: str) -> Dict[str, Any]:
-        r = requests.get(f"{self.base}/v5/market/instruments-info", params={"category": category, "symbol": symbol}, timeout=10)
+        r = self._session.get(f"{self.base}/v5/market/instruments-info", params={"category": category, "symbol": symbol}, timeout=10)
         r.raise_for_status()
         data = self._check(r.json())
         lst = (data.get("result") or {}).get("list") or []
@@ -89,7 +99,7 @@ class BybitV5:
         params = {"accountType": account_type}
         query_string = self._build_query_string(params)
         # Use query string in URL (not params=) to ensure order matches signature
-        r = requests.get(
+        r = self._session.get(
             f"{self.base}/v5/account/wallet-balance?{query_string}",
             headers=self._headers(query_string),
             timeout=15,
@@ -117,27 +127,27 @@ class BybitV5:
             "sellLeverage": lev_str,
         }
         payload = json.dumps(body, separators=(",", ":"))
-        r = requests.post(f"{self.base}/v5/position/set-leverage", headers=self._headers(payload), data=payload, timeout=15)
+        r = self._session.post(f"{self.base}/v5/position/set-leverage", headers=self._headers(payload), data=payload, timeout=15)
         r.raise_for_status()
         return self._check(r.json())
 
     # ---------- Orders ----------
     def place_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
         payload = json.dumps(body, separators=(",", ":"))
-        r = requests.post(f"{self.base}/v5/order/create", headers=self._headers(payload), data=payload, timeout=15)
+        r = self._session.post(f"{self.base}/v5/order/create", headers=self._headers(payload), data=payload, timeout=15)
         r.raise_for_status()
         return self._check(r.json())
 
     def cancel_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
         payload = json.dumps(body, separators=(",", ":"))
-        r = requests.post(f"{self.base}/v5/order/cancel", headers=self._headers(payload), data=payload, timeout=15)
+        r = self._session.post(f"{self.base}/v5/order/cancel", headers=self._headers(payload), data=payload, timeout=15)
         r.raise_for_status()
         return self._check(r.json())
 
     def open_orders(self, category: str, symbol: str) -> List[Dict[str, Any]]:
         params = {"category": category, "symbol": symbol}
         query_string = self._build_query_string(params)
-        r = requests.get(
+        r = self._session.get(
             f"{self.base}/v5/order/realtime?{query_string}",
             headers=self._headers(query_string),
             timeout=15,
@@ -151,7 +161,7 @@ class BybitV5:
         if order_link_id:
             params["orderLinkId"] = order_link_id
         query_string = self._build_query_string(params)
-        r = requests.get(
+        r = self._session.get(
             f"{self.base}/v5/order/history?{query_string}",
             headers=self._headers(query_string),
             timeout=15,
@@ -167,7 +177,7 @@ class BybitV5:
             params["symbol"] = symbol
         params["settleCoin"] = "USDT"  # Required for fetching all positions
         query_string = self._build_query_string(params)
-        r = requests.get(
+        r = self._session.get(
             f"{self.base}/v5/position/list?{query_string}",
             headers=self._headers(query_string),
             timeout=15,
@@ -178,7 +188,7 @@ class BybitV5:
 
     def set_trading_stop(self, body: Dict[str, Any]) -> Dict[str, Any]:
         payload = json.dumps(body, separators=(",", ":"))
-        r = requests.post(f"{self.base}/v5/position/trading-stop", headers=self._headers(payload), data=payload, timeout=15)
+        r = self._session.post(f"{self.base}/v5/position/trading-stop", headers=self._headers(payload), data=payload, timeout=15)
         r.raise_for_status()
         data = r.json()
         # 34040 = "not modified" - SL/TP already set to same value, ignore this
@@ -192,7 +202,7 @@ class BybitV5:
         if start_time:
             params["startTime"] = start_time
         query_string = self._build_query_string(params)
-        r = requests.get(
+        r = self._session.get(
             f"{self.base}/v5/position/closed-pnl?{query_string}",
             headers=self._headers(query_string),
             timeout=15,

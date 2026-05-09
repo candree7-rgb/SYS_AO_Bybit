@@ -59,6 +59,13 @@ if _lev_override_str:
             except ValueError:
                 pass
 
+# Symbols to pre-warm Bybit caches for at bot start. For each listed symbol
+# the bot fetches instrument-info AND issues set_leverage in parallel before
+# the first signal arrives — eliminates the ~300ms cold-path penalty on
+# the first trade per symbol. Format: comma-separated base symbols,
+# e.g. "BTC,ETH,SOL,SIREN,UB,B,FHE,HIGH".
+WARMUP_SYMBOLS = [s.strip().upper() for s in _get("WARMUP_SYMBOLS", "").split(",") if s.strip()]
+
 # Fixed risk profile — overrides any SL/TPs from the signal with hardcoded
 # percentages. The AO Crusher provider is consistent (TP1=0.8% TP2=1.6%
 # TP3=4% SL=1% on scalp signals). Setting this to true makes the bot
