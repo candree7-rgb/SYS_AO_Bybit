@@ -14,6 +14,7 @@ from config import (
     MOVE_SL_TO_BE_ON_TP1, BREAKEVEN_PROFIT_BUFFER_PCT,
     TRAIL_AFTER_TP_INDEX, TRAIL_DISTANCE_PCT, TRAIL_ACTIVATE_ON_TP,
     FIXED_RISK_PROFILE, FIXED_SL_PCT, FIXED_TP_PCTS,
+    LEVERAGE_OVERRIDES,
     DRY_RUN
 )
 
@@ -168,11 +169,30 @@ class TradeEngine:
             qty = min_qty
         return float(f"{qty:.10f}")
 
+    def _effective_leverage(self, symbol: str) -> int:
+        """Look up per-symbol leverage override; fall back to LEVERAGE."""
+        base = symbol.replace(QUOTE, "").upper()
+        return LEVERAGE_OVERRIDES.get(base, LEVERAGE)
+
+    def _effective_risk_pct(self, symbol: str) -> float:
+        """Scale risk_pct so that notional stays constant when leverage is
+        overridden. e.g. default 10%/20x → SIREN with 5x → 40%/5x.
+        Both have the same notional exposure and the same $-risk per trade."""
+        eff_lev = self._effective_leverage(symbol)
+        if eff_lev == LEVERAGE:
+            return RISK_PCT
+        # notional_default = RISK_PCT * LEVERAGE; keep equal:
+        return RISK_PCT * LEVERAGE / eff_lev
+
     def calc_base_qty(self, symbol: str, entry_price: float) -> float:
-        # Risk model: margin = equity * RISK_PCT; notional = margin * LEVERAGE; qty = notional / price
-        equity = self.bybit.wallet_equity(ACCOUNT_TYPE)
-        margin = equity * (RISK_PCT / 100.0)
-        notional = margin * LEVERAGE
+        # Risk model: margin = equity * effective_risk_pct;
+        #             notional = margin * effective_leverage;
+        #             qty = notional / price
+        equity = self.bybit.wallet_equity(ACCOUNT_TYPE)  # cached
+        eff_risk = self._effective_risk_pct(symbol)
+        eff_lev = self._effective_leverage(symbol)
+        margin = equity * (eff_risk / 100.0)
+        notional = margin * eff_lev
         qty = notional / entry_price
 
         rules = self._get_instrument_rules(symbol)
@@ -337,9 +357,17 @@ class TradeEngine:
             return None
 
     def _set_leverage_safe(self, symbol: str) -> bool:
-        """Set leverage; treat 110043 (not modified) as success."""
+        """Set leverage; treat 110043 (not modified) as success.
+        Uses per-symbol override from LEVERAGE_OVERRIDES if configured."""
+        eff_lev = self._effective_leverage(symbol)
+        if eff_lev != LEVERAGE:
+            self.log.info(
+                f"[engine] {symbol}: leverage override {eff_lev}x "
+                f"(default {LEVERAGE}x), risk {self._effective_risk_pct(symbol):.1f}% "
+                f"(default {RISK_PCT}%) — same notional"
+            )
         try:
-            self.bybit.set_leverage(CATEGORY, symbol, LEVERAGE)
+            self.bybit.set_leverage(CATEGORY, symbol, eff_lev)
             return True
         except Exception as e:
             msg = str(e)

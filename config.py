@@ -38,6 +38,25 @@ QUOTE    = _get("QUOTE","USDT").upper()
 LEVERAGE = _get_int("LEVERAGE","5")
 RISK_PCT = _get_float("RISK_PCT","5")
 
+# Per-symbol leverage overrides for coins that don't support our default
+# leverage. Format: "SIREN:5,DOGE:10" (base symbol → max leverage).
+# When matched, the bot:
+#   - calls set_leverage with the override value (avoids Bybit error)
+#   - scales risk_pct UP so notional stays constant (i.e. same position
+#     size and same dollar-risk per trade as default leverage trades).
+# Example: default 5%/20x = 100% notional. SIREN:5 → 20%/5x = 100% notional.
+LEVERAGE_OVERRIDES: dict = {}
+_lev_override_str = _get("LEVERAGE_OVERRIDES", "")
+if _lev_override_str:
+    for _pair in _lev_override_str.split(","):
+        _pair = _pair.strip()
+        if ":" in _pair:
+            _sym, _lev = _pair.split(":", 1)
+            try:
+                LEVERAGE_OVERRIDES[_sym.strip().upper()] = int(_lev.strip())
+            except ValueError:
+                pass
+
 # Fixed risk profile — overrides any SL/TPs from the signal with hardcoded
 # percentages. The AO Crusher provider is consistent (TP1=0.8% TP2=1.6%
 # TP3=4% SL=1% on scalp signals). Setting this to true makes the bot

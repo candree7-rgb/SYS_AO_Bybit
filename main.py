@@ -443,10 +443,11 @@ def main():
                     "base_qty": sig.get("_base_qty") or engine.calc_base_qty(sig["symbol"], float(sig["trigger"])),
                     "raw": sig.get("raw", ""),
                     "discord_msg_id": mid,
-                    "risk_pct": RISK_PCT,
-                    "risk_amount": round(equity_now * RISK_PCT / 100, 2) if equity_now > 0 else None,
+                    # Per-symbol effective values (account for LEVERAGE_OVERRIDES)
+                    "risk_pct": engine._effective_risk_pct(sig["symbol"]),
+                    "risk_amount": round(equity_now * engine._effective_risk_pct(sig["symbol"]) / 100, 2) if equity_now > 0 else None,
                     "equity_at_entry": round(equity_now, 2) if equity_now > 0 else None,
-                    "leverage": LEVERAGE,
+                    "leverage": engine._effective_leverage(sig["symbol"]),
                 }
                 inc_trades_today()
             save_state(STATE_FILE, st)
