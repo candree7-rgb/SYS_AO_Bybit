@@ -188,15 +188,17 @@ class DiscordGateway:
                     f"(push_lag={lag_ms:.0f}ms, qsize={self.msg_queue.qsize()})"
                 )
                 raw = self._message_to_dict(message)
-                self._enqueue(raw)
 
-                # Direct fast path: dispatch to thread-pool worker so the
-                # Bybit place_order doesn't block the asyncio event loop
-                # (which would stall the WS heartbeat). Fire-and-forget —
-                # the callback owns its own error handling and state lock.
+                # Dispatch is mutually exclusive: when a direct callback is
+                # registered, ONLY that path runs (it's the fast lane and
+                # owns dedupe via state_lock + signal_hash). The queue path
+                # is reserved for REST-fallback / startup-backfill — never
+                # for live pushes — to avoid double-processing the same msg.
                 cb = self.on_signal_callback
                 if cb is not None:
                     asyncio.create_task(asyncio.to_thread(cb, raw))
+                else:
+                    self._enqueue(raw)
             except Exception as e:
                 self.log.warning(f"[gateway] on_message handler error: {e}")
 

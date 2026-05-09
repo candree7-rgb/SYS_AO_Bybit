@@ -356,11 +356,19 @@ class TradeEngine:
         limit_price = self._round_price(limit_price, tick_size)
 
         qty = self.calc_base_qty(symbol, trigger)  # uses cached equity (sub-ms warm)
-        # Hardcoded triggerDirection by side — fresh signals always have
-        # trigger in the natural direction (SHORT trigger below current,
-        # LONG above). Saves a last_price API call. If wrong (rare edge),
-        # Bybit returns an error and we log it.
-        td = 2 if side == "Sell" else 1  # 2 = fall, 1 = rise
+        # triggerDirection: must be CORRECT relative to current market
+        # price or Bybit rejects with 110093 ("expect Falling, but
+        # trigger_price >= current"). We previously hardcoded by side,
+        # but for signals where the market has already passed the
+        # trigger that's wrong. Resolve from the entry_watcher's WS
+        # ticker cache (sub-ms, warm path); fall back to one REST
+        # last_price call if not cached.
+        try:
+            last = self._last_price(symbol)
+            td = 2 if last >= trigger_adj else 1  # market above → fall; below → rise
+        except Exception as e:
+            self.log.warning(f"last_price lookup failed for {symbol}: {e} — defaulting triggerDirection by side")
+            td = 2 if side == "Sell" else 1
 
         body = {
             "category": CATEGORY,

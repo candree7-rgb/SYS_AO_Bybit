@@ -293,17 +293,31 @@ def main():
         log.info(f"🔥 Warming up Bybit caches: equity + {len(WARMUP_SYMBOLS)} symbols...")
         t0 = time.time()
 
+        # Per-call light delay to stay under Bybit's per-second POST limit.
+        # Each warm_symbol does 2 REST calls (instruments_info GET + set_
+        # leverage POST). Bybit's POST limit is ~10/s shared across the
+        # account; with 3 workers + 100ms delay we average ~6 POSTs/s,
+        # well below the cap. Previous 8-worker burst hit 10006 on ~14
+        # of 35 symbols.
+        warmup_lock = threading.Lock()
+        last_call_ts = [0.0]
+
         def warm_symbol(base):
+            with warmup_lock:
+                gap = time.time() - last_call_ts[0]
+                if gap < 0.1:
+                    time.sleep(0.1 - gap)
+                last_call_ts[0] = time.time()
             symbol = f"{base}{QUOTE}"
             try:
-                engine._get_instrument_rules(symbol)  # populates _instrument_cache
-                if engine._set_leverage_safe(symbol):  # populates _leverage_set
+                engine._get_instrument_rules(symbol)
+                if engine._set_leverage_safe(symbol):
                     engine._leverage_set.add(symbol)
                 return (symbol, True, None)
             except Exception as e:
                 return (symbol, False, str(e))
 
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        with ThreadPoolExecutor(max_workers=3) as ex:
             eq_f = ex.submit(bybit.wallet_equity, ACCOUNT_TYPE, True)
             sym_futures = [ex.submit(warm_symbol, b) for b in WARMUP_SYMBOLS]
             try:
