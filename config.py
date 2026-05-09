@@ -66,6 +66,12 @@ if _lev_override_str:
 # e.g. "BTC,ETH,SOL,SIREN,UB,B,FHE,HIGH".
 WARMUP_SYMBOLS = [s.strip().upper() for s in _get("WARMUP_SYMBOLS", "").split(",") if s.strip()]
 
+# Blacklisted symbols — incoming signals on these are SKIPPED entirely.
+# Use for symbols with proven negative EV in backtest (e.g. HIGH had
+# −3.2% EV/trade across 16 historical trades).
+# Format: comma-separated base symbols, e.g. "HIGH,BLESS".
+BLACKLIST_SYMBOLS = set(s.strip().upper() for s in _get("BLACKLIST_SYMBOLS", "").split(",") if s.strip())
+
 # Fixed risk profile — overrides any SL/TPs from the signal with hardcoded
 # percentages. The AO Crusher provider is consistent (TP1=0.8% TP2=1.6%
 # TP3=4% SL=1% on scalp signals). Setting this to true makes the bot

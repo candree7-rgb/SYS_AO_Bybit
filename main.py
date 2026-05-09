@@ -13,7 +13,7 @@ from config import (
     MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
     POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC, SIGNAL_UPDATE_INTERVAL_OPEN_SEC,
     USE_GATEWAY_WS, GATEWAY_FALLBACK_FAILURES, GATEWAY_LOOP_SLEEP_SEC, GATEWAY_INITIAL_BACKFILL,
-    WARMUP_SYMBOLS,
+    WARMUP_SYMBOLS, BLACKLIST_SYMBOLS,
     STATE_FILE, DRY_RUN, LOG_LEVEL
 )
 from bybit_v5 import BybitV5
@@ -494,6 +494,14 @@ def main():
 
             age_ms = age * 1000.0 if ts else -1
             log.info(f"📨 [WS] Signal parsed: {sig['symbol']} {sig['side'].upper()} @ {sig['trigger']} (discord_age={age_ms:.0f}ms)")
+
+            # Symbol blacklist — skip signals on coins with proven negative
+            # EV in the user's backtest (e.g. HIGH had -3.2% EV/trade
+            # across 16 trades). Configured via BLACKLIST_SYMBOLS env.
+            base_sym = (sig.get("base") or "").upper()
+            if base_sym in BLACKLIST_SYMBOLS:
+                log.info(f"⏭️  SKIP {sig['symbol']}: blacklisted base={base_sym}")
+                return
 
             sh = signal_hash(sig)
             mid_str = str(raw_msg.get("id", ""))
