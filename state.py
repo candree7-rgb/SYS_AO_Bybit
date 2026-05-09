@@ -36,9 +36,18 @@ def load_state(path: str) -> Dict[str, Any]:
 def save_state(path: str, st: Dict[str, Any]) -> None:
     # Serialize under the same lock all mutations use, so json.dumps never
     # observes a dict mid-mutation. Atomic write via tmp + rename.
-    with state_lock:
-        payload = json.dumps(st, ensure_ascii=False, separators=(",",":"))
-    p = Path(path)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(p)
+    # Disk failures (Railway transient FS) are caught + logged so the bot
+    # doesn't crash; state.json may be momentarily out-of-date but the
+    # next save attempt recovers.
+    try:
+        with state_lock:
+            payload = json.dumps(st, ensure_ascii=False, separators=(",",":"))
+        p = Path(path)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(p)
+    except Exception as e:
+        # No logger here at module level; print to stderr so Railway
+        # surfaces it. Caller code should not depend on save success.
+        import sys
+        print(f"[state] save_state failed: {e}", file=sys.stderr)

@@ -57,7 +57,7 @@ def _apply_signal_update_to_trade(tr, txt, engine, log):
                 entry_oid = tr.get("entry_order_id")
                 if entry_oid and entry_oid != "DRY_RUN":
                     try:
-                        engine.cancel_entry(tr["symbol"], entry_oid)
+                        engine.cancel_entry(tr["symbol"], entry_oid, tr.get("id"))
                         telegram_alerts.send_order_canceled(
                             symbol=tr["symbol"],
                             side=tr["order_side"],
@@ -75,7 +75,7 @@ def _apply_signal_update_to_trade(tr, txt, engine, log):
             if tr.get("status") == "pending":
                 entry_oid = tr.get("entry_order_id")
                 if entry_oid:
-                    engine.cancel_entry(tr["symbol"], entry_oid)
+                    engine.cancel_entry(tr["symbol"], entry_oid, tr.get("id"))
             if tr.get("status") == "open":
                 engine._cancel_all_trade_orders(tr)
             tr["status"] = "cancelled"
@@ -205,14 +205,20 @@ def main():
         # fast_signal_handler readers.
         try:
             if entry_oid and entry_oid != "DRY_RUN":
-                engine.cancel_entry(symbol, entry_oid)
+                engine.cancel_entry(symbol, entry_oid, trade_id)
         except Exception as e:
             log.warning(f"on_tp1_cross: cancel_entry failed for {symbol}: {e}")
         with state_lock:
             tr = st.get("open_trades", {}).get(trade_id)
-            if tr:
+            # Guard: only flip status if still pending. If the entry
+            # already filled (race between our cancel call and Bybit's
+            # fill-then-WS-push) the trade is "open" with a real
+            # position — don't lie about it.
+            if tr and tr.get("status") == "pending":
                 tr["status"] = "cancelled_tp1_hit"
                 tr["exit_reason"] = "tp1_hit_before_entry"
+            elif tr and tr.get("status") == "open":
+                log.warning(f"[on_tp1_cross] {symbol} entry already FILLED before cancel reached Bybit — leaving status=open")
         try:
             telegram_alerts.send_order_canceled(
                 symbol=symbol,
@@ -244,6 +250,28 @@ def main():
                         break
         except Exception as e:
             log.warning(f"[gateway] backfill failed: {e}")
+
+    # Re-attach entry_watcher for any trades that were pending when the
+    # bot last shut down. Without this, after a restart the conditional
+    # entry sits on Bybit but our TP1-cross safety net is gone until the
+    # entry fills — opening a window where we can enter into a guaranteed
+    # losing trade. With it: watcher resumes the moment the WS connects.
+    pending_at_restart = [
+        tr for tr in st.get("open_trades", {}).values()
+        if tr.get("status") == "pending" and tr.get("entry_order_id")
+    ]
+    if pending_at_restart:
+        log.info(f"♻️  Re-attaching entry_watcher for {len(pending_at_restart)} pending trade(s) from previous session")
+        for tr in pending_at_restart:
+            tps = tr.get("tp_prices") or []
+            tp1 = float(tps[0]) if tps else None
+            if tp1:
+                try:
+                    entry_watcher.watch(
+                        tr["id"], tr["symbol"], tr["order_side"], tp1, tr["entry_order_id"]
+                    )
+                except Exception as e:
+                    log.warning(f"   re-attach failed for {tr.get('symbol')}: {e}")
 
     # gateway.start() is deferred to AFTER fast_signal_handler is defined
     # (further down in main()), so the callback is wired before the WS
@@ -435,7 +463,9 @@ def main():
             mid_str = str(raw_msg.get("id", ""))
 
             # ── Atomic check-and-mark: dedupe + limits + reserve a slot ──
-            trade_id = f"{sig['symbol']}|{sig['side']}|{int(time.time())}"
+            # ms precision avoids orderLinkId collisions on rapid bursts
+            # (Bybit returns 110072 "duplicate orderLinkId" otherwise).
+            trade_id = f"{sig['symbol']}|{sig['side']}|{int(time.time()*1000)}"
 
             # ── Atomic check-and-RESERVE: dedupe + limits + reserve a slot ──
             # Race fix: we add a placeholder trade with status="reserving"
@@ -499,6 +529,12 @@ def main():
                     cur = int(st.get("daily_counts", {}).get(k, 0))
                     if cur > 0:
                         st.setdefault("daily_counts", {})[k] = cur - 1
+                    # Roll back the seen_signal_hashes entry too — otherwise
+                    # if Bybit hiccuped (rate limit / network blip), the
+                    # provider's signal is silently ignored on re-delivery.
+                    seen = set(st.get("seen_signal_hashes", []))
+                    seen.discard(sh)
+                    st["seen_signal_hashes"] = list(seen)[-500:]
                 return
 
             # ── Promote placeholder to real trade ──
@@ -628,15 +664,17 @@ def main():
             engine.check_position_alerts()    # Send Telegram alerts if position P&L crosses thresholds
             engine.log_daily_stats()          # Log stats once per day
 
-            # entry-fill fallback (polling) and post-orders placement
+            # entry-fill fallback (polling) and post-orders placement.
+            # Mutations under state_lock so on_execution / fast_signal_handler
+            # / save_state never observe a half-updated trade dict.
             for tid, tr in list(st.get("open_trades", {}).items()):
                 if tr.get("status") == "pending":
-                    # if position opened but ws missed: detect via positions size > 0
                     sz, avg = engine.position_size_avg(tr["symbol"])
                     if sz > 0 and avg > 0:
-                        tr["status"] = "open"
-                        tr["entry_price"] = avg
-                        tr["filled_ts"] = time.time()
+                        with state_lock:
+                            tr["status"] = "open"
+                            tr["entry_price"] = avg
+                            tr["filled_ts"] = time.time()
                         log.info(f"✅ ENTRY (poll) {tr['symbol']} @ {avg}")
                 if tr.get("status") == "open" and not tr.get("post_orders_placed"):
                     engine.place_post_entry_orders(tr)

@@ -356,18 +356,41 @@ class TradeEngine:
         limit_price = self._round_price(limit_price, tick_size)
 
         qty = self.calc_base_qty(symbol, trigger)  # uses cached equity (sub-ms warm)
-        # triggerDirection: must be CORRECT relative to current market
-        # price or Bybit rejects with 110093 ("expect Falling, but
-        # trigger_price >= current"). We previously hardcoded by side,
-        # but for signals where the market has already passed the
-        # trigger that's wrong. Resolve from the entry_watcher's WS
-        # ticker cache (sub-ms, warm path); fall back to one REST
-        # last_price call if not cached.
+
+        # Lookup current market price ONCE — used for both:
+        #  (1) triggerDirection (must match Bybit's expected direction)
+        #  (2) pre-flight TP1-already-crossed check (closes race window
+        #      between placing the conditional and entry_watcher.watch
+        #      being registered)
         try:
             last = self._last_price(symbol)
-            td = 2 if last >= trigger_adj else 1  # market above → fall; below → rise
         except Exception as e:
             self.log.warning(f"last_price lookup failed for {symbol}: {e} — defaulting triggerDirection by side")
+            last = None
+
+        # Pre-flight: if market already crossed TP1, abort. Otherwise
+        # we'd place an entry that immediately fills into a guaranteed
+        # losing trade (would only stop out via SL).
+        tps_for_check = sig.get("tp_prices") or []
+        if last is not None and tps_for_check:
+            tp1 = float(tps_for_check[0])
+            already_past_tp1 = (
+                (side == "Sell" and last <= tp1)
+                or (side == "Buy" and last >= tp1)
+            )
+            if already_past_tp1:
+                self.log.info(
+                    f"⏭️  SKIP {symbol}: market last={last} already past TP1={tp1} "
+                    f"({'short' if side == 'Sell' else 'long'} would enter into instant loss)"
+                )
+                return None
+
+        # triggerDirection: 2=fall (market drops to trigger), 1=rise.
+        # Bybit rejects with 110093 if direction doesn't match the
+        # market relative to triggerPrice.
+        if last is not None:
+            td = 2 if last >= trigger_adj else 1
+        else:
             td = 2 if side == "Sell" else 1
 
         body = {
@@ -428,7 +451,7 @@ class TradeEngine:
                 self.entry_watcher.ensure_subscribed(symbol)
             except Exception:
                 pass
-        return self._last_price(symbol)
+        return self.bybit.last_price(CATEGORY, symbol)
 
     def _safe_equity_refresh(self):
         """Background equity cache refresh — swallows errors silently
@@ -458,14 +481,17 @@ class TradeEngine:
             self.log.warning(f"set_leverage failed for {symbol}: {e}")
             return False
 
-    def cancel_entry(self, symbol: str, order_id: str) -> None:
+    def cancel_entry(self, symbol: str, order_id: str, trade_id: Optional[str] = None) -> None:
         body = {"category": CATEGORY, "symbol": symbol, "orderId": order_id}
         if DRY_RUN:
             self.log.info(f"DRY_RUN cancel entry: {body}")
         else:
             self.bybit.cancel_order(body)
         if self.entry_watcher:
-            self.entry_watcher.unwatch(symbol)
+            # Pass trade_id so we don't accidentally clear watches for
+            # OTHER pending trades on the same symbol (rare but real
+            # when MAX_CONCURRENT_TRADES allows multiple).
+            self.entry_watcher.unwatch(symbol, trade_id)
 
     def _generate_fallback_tps(self, entry: float, side: str, tick_size: float) -> List[float]:
         """Generate fallback TP prices based on % distance from entry."""
