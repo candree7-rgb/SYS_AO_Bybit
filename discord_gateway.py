@@ -25,10 +25,17 @@ from typing import Any, Dict, Optional
 
 
 class DiscordGateway:
-    def __init__(self, token: str, channel_id: str, log, max_queue_size: int = 200):
+    def __init__(self, token: str, channel_id: str, log, max_queue_size: int = 200,
+                 on_signal_callback=None):
         self.token = token
         self.channel_id = int(channel_id)
         self.log = log
+        # Optional: synchronous callback invoked from a thread-pool worker
+        # (via asyncio.to_thread) for every inbound message. Lets the main
+        # loop's queue path be bypassed entirely for the hot Discord-push →
+        # Bybit-order path. The callback is responsible for its own state
+        # locking; the gateway just dispatches.
+        self.on_signal_callback = on_signal_callback
 
         self.msg_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max_queue_size)
 
@@ -177,6 +184,14 @@ class DiscordGateway:
                 )
                 raw = self._message_to_dict(message)
                 self._enqueue(raw)
+
+                # Direct fast path: dispatch to thread-pool worker so the
+                # Bybit place_order doesn't block the asyncio event loop
+                # (which would stall the WS heartbeat). Fire-and-forget —
+                # the callback owns its own error handling and state lock.
+                cb = self.on_signal_callback
+                if cb is not None:
+                    asyncio.create_task(asyncio.to_thread(cb, raw))
             except Exception as e:
                 self.log.warning(f"[gateway] on_message handler error: {e}")
 
