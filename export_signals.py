@@ -1,28 +1,38 @@
 """
-Export the entire history of an AO Crusher Discord channel to JSON + CSV
-for backtesting.
+Export the entire history of an AO Crusher Discord channel for backtesting.
 
 Walks backwards through the channel via Discord's REST API (`before`
 cursor pagination, 100 msgs/page), parses each message with the same
-signal_parser the live bot uses, and writes:
+signal_parser the live bot uses, and writes to:
 
-  signals.jsonl   — one line per parsed signal (raw text included for
-                    debugging). Latest first.
-  signals.csv     — flattened table with key fields. Open in Excel/sheets.
+  - PostgreSQL `discord_signals` table (when DATABASE_URL is set; idempotent
+    upsert per msg_id, so re-running keeps the table fresh without dupes)
+  - signals.jsonl  (one line per parsed signal, includes raw text)
+  - signals.csv    (flat table with key fields)
 
 Edits are NOT historically retrievable from Discord's API — what you get
 is the FINAL state of each message (i.e. signals that closed will show
-"Closed P&L" in their text; pending/active will show their current
-status). For backtesting that's actually what you want: ground truth of
-how the trade ended up.
+"Closed P&L"; pending/active will show their current status). For
+backtesting that's exactly what you want: ground truth of how each
+trade ended up.
 
-Usage:
+Usage A — locally with file output:
     DISCORD_TOKEN=... CHANNEL_ID=... python export_signals.py
-    # optional:
-    DISCORD_TOKEN=... CHANNEL_ID=... LIMIT=2000 python export_signals.py
-        # stop after N messages instead of full history
-    DISCORD_TOKEN=... CHANNEL_ID=... AFTER_ID=1234... python export_signals.py
-        # only fetch messages newer than this Discord message ID
+
+Usage B — Railway one-shot (writes to Postgres so you can query from
+mobile via pgAdmin / psql, no local files needed):
+    1. In Railway env, set EXPORT_HISTORY=1 (and DATABASE_URL is already
+       set if you have the dashboard add-on)
+    2. Bot redeploys automatically.
+    3. On startup, main.py detects the flag, runs this exporter, writes
+       all signals to discord_signals table, logs progress, and exits.
+    4. Unset EXPORT_HISTORY in Railway → bot resumes normal trading.
+    5. Query the table:  SELECT * FROM discord_signals ORDER BY timestamp_iso DESC;
+
+Optional knobs:
+    LIMIT=2000           stop after N messages instead of full history
+    AFTER_ID=1234...     only fetch messages newer than this Discord msg id
+    SKIP_FILES=1         skip writing signals.jsonl/signals.csv (DB only)
 
 Discord rate limit: ~50 requests/sec per token. Script auto-throttles
 via the existing _request_with_retry on 429.
@@ -44,6 +54,7 @@ from signal_parser import (
     RE_TITLE_SYMBOL,
     RE_SIDE,
 )
+import db_export
 
 OUT_JSONL = "signals.jsonl"
 OUT_CSV   = "signals.csv"
@@ -149,24 +160,33 @@ def export_message(msg: Dict[str, Any], reader: DiscordReader) -> Optional[Dict[
     }
 
 
-def main():
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    channel = os.getenv("CHANNEL_ID", "").strip()
-    if not token or not channel:
-        print("ERROR: set DISCORD_TOKEN and CHANNEL_ID env vars", file=sys.stderr)
-        sys.exit(1)
+def run_export(reader: DiscordReader, channel_id: str, limit_total: int = 0,
+               after_id: Optional[str] = None, skip_files: bool = False,
+               logger=None) -> List[Dict[str, Any]]:
+    """Walk the Discord channel backwards, parse signals, write to
+    Postgres (idempotent upsert) and optionally to JSONL+CSV.
+    Returns the list of parsed records."""
 
-    limit_total = int(os.getenv("LIMIT", "0"))  # 0 = unbounded
-    after_id    = os.getenv("AFTER_ID", "").strip() or None
+    def _log(msg):
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg, file=sys.stderr)
 
-    reader = DiscordReader(token, channel)
+    db_on = db_export.is_enabled()
+    if db_on:
+        # Make sure the discord_signals table exists; init_database is
+        # idempotent so calling it here is safe even if the bot already
+        # ran it at startup.
+        db_export.init_database()
+    _log(f"[export] starting, channel={channel_id}, db={'on' if db_on else 'off'}, skip_files={skip_files}")
 
     records: List[Dict[str, Any]] = []
     raw_count = 0
     parsed_count = 0
-    cursor: Optional[str] = None  # message-id; None = start from latest
+    db_written = 0
+    cursor: Optional[str] = None
 
-    print(f"[export] starting, channel={channel}", file=sys.stderr)
     while True:
         page = reader.fetch_before(cursor, limit=100)
         if not page:
@@ -176,7 +196,6 @@ def main():
             raw_count += 1
             mid = msg.get("id") or ""
 
-            # If user requested a backstop, stop once we go past it
             if after_id and int(mid or "0") <= int(after_id):
                 page = []
                 break
@@ -187,30 +206,43 @@ def main():
             records.append(rec)
             parsed_count += 1
 
+            if db_on:
+                if db_export.upsert_signal(channel_id, rec):
+                    db_written += 1
+
         if not page:
             break
-        # Page is sorted newest→oldest; cursor for next page = oldest id
         oldest = min(int(m.get("id", "0")) for m in page)
         cursor = str(oldest)
 
         if limit_total and raw_count >= limit_total:
-            print(f"[export] reached LIMIT={limit_total}, stopping", file=sys.stderr)
+            _log(f"[export] reached LIMIT={limit_total}, stopping")
             break
 
         if raw_count % 500 == 0:
-            print(f"[export] scanned {raw_count} msgs, {parsed_count} signals so far...", file=sys.stderr)
+            _log(f"[export] scanned {raw_count} msgs, {parsed_count} signals, {db_written} db-written")
 
-        # Polite pacing — Discord rate limit is ~50/s, we use 1 call per
-        # 100 msgs so this is well under, but small sleep helps avoid bursts.
         time.sleep(0.1)
 
-    print(f"[export] done. scanned={raw_count} signals_parsed={parsed_count}", file=sys.stderr)
+    _log(f"[export] done. scanned={raw_count} signals_parsed={parsed_count} db_written={db_written}")
 
-    # --- write outputs ---
+    if not skip_files:
+        _write_files(records, logger)
+
+    return records
+
+
+def _write_files(records, logger=None):
+    def _log(msg):
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg, file=sys.stderr)
+
     with open(OUT_JSONL, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"[export] wrote {len(records)} → {OUT_JSONL}", file=sys.stderr)
+    _log(f"[export] wrote {len(records)} → {OUT_JSONL}")
 
     csv_fields = [
         "msg_id", "timestamp_iso", "timestamp_unix", "edited_timestamp",
@@ -249,7 +281,22 @@ def main():
                 "fresh_parsable":  r["fresh_parsable"],
             }
             w.writerow(row)
-    print(f"[export] wrote {len(records)} rows → {OUT_CSV}", file=sys.stderr)
+    _log(f"[export] wrote {len(records)} rows → {OUT_CSV}")
+
+
+def main():
+    token = os.getenv("DISCORD_TOKEN", "").strip()
+    channel = os.getenv("CHANNEL_ID", "").strip()
+    if not token or not channel:
+        print("ERROR: set DISCORD_TOKEN and CHANNEL_ID env vars", file=sys.stderr)
+        sys.exit(1)
+    limit_total = int(os.getenv("LIMIT", "0"))
+    after_id    = os.getenv("AFTER_ID", "").strip() or None
+    skip_files  = os.getenv("SKIP_FILES", "").strip().lower() in ("1", "true", "yes")
+
+    reader = DiscordReader(token, channel)
+    run_export(reader, channel, limit_total=limit_total,
+               after_id=after_id, skip_files=skip_files)
 
 
 if __name__ == "__main__":

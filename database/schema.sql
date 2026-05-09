@@ -128,3 +128,49 @@ BEGIN
     END IF;
 END
 $$;
+
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- DISCORD_SIGNALS: Historical signal-message dump for backtesting
+-- Populated by export_signals.py / EXPORT_HISTORY=1 startup mode.
+-- One row per Discord message that looked like a signal.
+-- ══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS discord_signals (
+    msg_id              VARCHAR(40) PRIMARY KEY,
+    channel_id          VARCHAR(40),
+    timestamp_iso       TIMESTAMP WITH TIME ZONE,
+    edited_iso          TIMESTAMP WITH TIME ZONE,
+
+    -- Parsed signal fields
+    base_symbol         VARCHAR(30),
+    symbol              VARCHAR(40),                -- base + USDT
+    side                VARCHAR(10),                -- 'SHORT' or 'LONG'
+    trigger_price       DECIMAL(30, 12),
+    sl_price            DECIMAL(30, 12),
+    tp1                 DECIMAL(30, 12),
+    tp2                 DECIMAL(30, 12),
+    tp3                 DECIMAL(30, 12),
+    tp4                 DECIMAL(30, 12),
+
+    -- Final state of the message at export time
+    tp1_hit             BOOLEAN DEFAULT FALSE,
+    tp2_hit             BOOLEAN DEFAULT FALSE,
+    tp3_hit             BOOLEAN DEFAULT FALSE,
+    tp4_hit             BOOLEAN DEFAULT FALSE,
+    status              VARCHAR(20),                -- win/loss/breakeven/active/cancelled/closed/unknown
+    closed_pnl_pct      DECIMAL(10, 4),
+    open_pnl_pct        DECIMAL(10, 4),
+
+    -- Was the strict signal_parser.parse_signal() able to read this as a fresh signal?
+    fresh_parsable      BOOLEAN DEFAULT FALSE,
+
+    -- Raw text for offline re-parsing if format changes
+    raw_text            TEXT,
+
+    imported_at         TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_signals_symbol      ON discord_signals(symbol);
+CREATE INDEX IF NOT EXISTS idx_signals_timestamp   ON discord_signals(timestamp_iso);
+CREATE INDEX IF NOT EXISTS idx_signals_status      ON discord_signals(status);

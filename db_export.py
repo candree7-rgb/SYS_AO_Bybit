@@ -387,3 +387,90 @@ def is_enabled() -> bool:
             log.warning("DATABASE_URL set but psycopg2 not installed. Install with: pip install psycopg2-binary")
             is_enabled._warned = True
     return bool(os.getenv("DATABASE_URL")) and PSYCOPG2_AVAILABLE
+
+
+def upsert_signal(channel_id: str, signal: Dict[str, Any]) -> bool:
+    """Insert or update a Discord-signal row. `signal` is the dict
+    produced by export_signals.export_message(). Idempotent on msg_id."""
+    if not is_enabled():
+        return False
+    conn = _get_connection()
+    if not conn:
+        return False
+    try:
+        tps = signal.get("tp_prices") or []
+        hit = signal.get("tps_hit") or {}
+        ts_unix = signal.get("timestamp_unix") or 0
+        ts_iso = signal.get("timestamp_iso") or None
+        ed_iso = signal.get("edited_timestamp") or None
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO discord_signals (
+                    msg_id, channel_id, timestamp_iso, edited_iso,
+                    base_symbol, symbol, side, trigger_price, sl_price,
+                    tp1, tp2, tp3, tp4,
+                    tp1_hit, tp2_hit, tp3_hit, tp4_hit,
+                    status, closed_pnl_pct, open_pnl_pct,
+                    fresh_parsable, raw_text
+                ) VALUES (%s,%s,%s,%s, %s,%s,%s,%s,%s,
+                          %s,%s,%s,%s, %s,%s,%s,%s,
+                          %s,%s,%s, %s,%s)
+                ON CONFLICT (msg_id) DO UPDATE SET
+                    edited_iso     = EXCLUDED.edited_iso,
+                    tp1_hit        = EXCLUDED.tp1_hit,
+                    tp2_hit        = EXCLUDED.tp2_hit,
+                    tp3_hit        = EXCLUDED.tp3_hit,
+                    tp4_hit        = EXCLUDED.tp4_hit,
+                    status         = EXCLUDED.status,
+                    closed_pnl_pct = EXCLUDED.closed_pnl_pct,
+                    open_pnl_pct   = EXCLUDED.open_pnl_pct,
+                    fresh_parsable = EXCLUDED.fresh_parsable,
+                    raw_text       = EXCLUDED.raw_text
+                """,
+                (
+                    signal["msg_id"], channel_id, ts_iso, ed_iso or None,
+                    signal.get("base_symbol"), signal.get("symbol"), signal.get("side"),
+                    signal.get("trigger"), signal.get("sl_price"),
+                    tps[0] if len(tps) > 0 else None,
+                    tps[1] if len(tps) > 1 else None,
+                    tps[2] if len(tps) > 2 else None,
+                    tps[3] if len(tps) > 3 else None,
+                    bool(hit.get(1, False)), bool(hit.get(2, False)),
+                    bool(hit.get(3, False)), bool(hit.get(4, False)),
+                    signal.get("status"),
+                    signal.get("closed_pnl_pct"),
+                    signal.get("open_pnl_pct"),
+                    bool(signal.get("fresh_parsable")),
+                    signal.get("raw_text"),
+                )
+            )
+            conn.commit()
+            return True
+    except Exception as e:
+        log.error(f"upsert_signal failed for {signal.get('msg_id')}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        _release_connection(conn)
+
+
+def signals_count() -> int:
+    """Returns total rows in discord_signals (for progress logging)."""
+    if not is_enabled():
+        return 0
+    conn = _get_connection()
+    if not conn:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM discord_signals")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    except Exception:
+        return 0
+    finally:
+        _release_connection(conn)
