@@ -357,20 +357,14 @@ class TradeEngine:
 
         qty = self.calc_base_qty(symbol, trigger)  # uses cached equity (sub-ms warm)
 
-        # Lookup current market price ONCE — used for both:
-        #  (1) triggerDirection (must match Bybit's expected direction)
-        #  (2) pre-flight TP1-already-crossed check (closes race window
-        #      between placing the conditional and entry_watcher.watch
-        #      being registered)
+        # Pre-flight: if market is already past TP1, abort BEFORE
+        # submitting. The order would otherwise fill into a guaranteed
+        # losing trade (would only stop out via SL).
         try:
             last = self._last_price(symbol)
         except Exception as e:
-            self.log.warning(f"last_price lookup failed for {symbol}: {e} — defaulting triggerDirection by side")
+            self.log.warning(f"last_price lookup failed for {symbol}: {e} — skipping pre-flight check")
             last = None
-
-        # Pre-flight: if market already crossed TP1, abort. Otherwise
-        # we'd place an entry that immediately fills into a guaranteed
-        # losing trade (would only stop out via SL).
         tps_for_check = sig.get("tp_prices") or []
         if last is not None and tps_for_check:
             tp1 = float(tps_for_check[0])
@@ -385,14 +379,20 @@ class TradeEngine:
                 )
                 return None
 
-        # triggerDirection: 2=fall (market drops to trigger), 1=rise.
-        # Bybit rejects with 110093 if direction doesn't match the
-        # market relative to triggerPrice.
-        if last is not None:
-            td = 2 if last >= trigger_adj else 1
-        else:
-            td = 2 if side == "Sell" else 1
-
+        # Plain LIMIT order — no triggerPrice/triggerDirection.
+        # Why not conditional?
+        #   - Bybit's conditional requires triggerDirection match the market
+        #     at place-time (110093 if mismatch). Volatile alts can drop
+        #     0.4% in the 500ms place_order roundtrip → race.
+        #   - For our use case (entry at trigger price OR better), plain
+        #     LIMIT does the same thing: order sits in the orderbook,
+        #     fills the moment the market matches our limit_price.
+        #   - entry_watcher still cancels on TP1-cross before fill.
+        # SHORT @ trigger 0.079341, market 0.07912:
+        #   plain limit sell @ 0.079341 → waits for market to rise to 0.079341
+        # SHORT @ trigger 0.079341, market 0.080:
+        #   plain limit sell @ 0.079341 → fills IMMEDIATELY at best bid
+        #   (which is >= 0.079341, so we sell at a BETTER price than trigger)
         body = {
             "category": CATEGORY,
             "symbol": symbol,
@@ -401,9 +401,6 @@ class TradeEngine:
             "qty": f"{qty:.10f}",
             "price": f"{limit_price:.10f}",
             "timeInForce": "GTC",
-            "triggerDirection": td,
-            "triggerPrice": f"{trigger_adj:.10f}",
-            "triggerBy": "LastPrice",
             "reduceOnly": False,
             "closeOnTrigger": False,
             "orderLinkId": trade_id,
