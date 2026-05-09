@@ -12,6 +12,12 @@ class BybitV5:
         self.api_secret = api_secret.encode()
         self.recv_window = str(recv_window)
 
+        # wallet_equity cache — equity changes slowly and is needed on every
+        # trade for qty calculation. Caching for 60s removes ~150ms of API
+        # latency from the critical Discord-push → Bybit-order path.
+        self._equity_cache: Dict[str, Tuple[float, float]] = {}  # account_type -> (value, ts)
+        self._equity_ttl = 60.0
+
         # Demo trading uses different endpoints (paper trading on live market data)
         if demo:
             self.base = "https://api-demo.bybit.com"
@@ -73,7 +79,13 @@ class BybitV5:
         return lst[0]
 
     # ---------- Account ----------
-    def wallet_equity(self, account_type: str = "UNIFIED") -> float:
+    def wallet_equity(self, account_type: str = "UNIFIED", force_refresh: bool = False) -> float:
+        # Return cached value if fresh — saves ~150ms per trade.
+        if not force_refresh:
+            cached = self._equity_cache.get(account_type)
+            if cached is not None and (time.time() - cached[1]) < self._equity_ttl:
+                return cached[0]
+
         params = {"accountType": account_type}
         query_string = self._build_query_string(params)
         # Use query string in URL (not params=) to ensure order matches signature
@@ -90,7 +102,9 @@ class BybitV5:
         item = lst[0]
         # prefer totalEquity if present
         val = item.get("totalEquity") or item.get("totalWalletBalance") or item.get("totalAvailableBalance")
-        return float(val)
+        value = float(val)
+        self._equity_cache[account_type] = (value, time.time())
+        return value
 
     def set_leverage(self, category: str, symbol: str, leverage: int) -> Dict[str, Any]:
         body = {

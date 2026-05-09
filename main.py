@@ -503,7 +503,7 @@ def main():
                         "entry_order_id": oid,
                         "status": "pending",
                         "placed_ts": time.time(),
-                        "base_qty": engine.calc_base_qty(sig["symbol"], float(sig["trigger"])),
+                        "base_qty": sig.get("_base_qty") or engine.calc_base_qty(sig["symbol"], float(sig["trigger"])),
                         "raw": sig.get("raw", ""),
                         "discord_msg_id": mid,  # Store Discord message ID for signal updates
                         # Risk & Leverage tracking (captured at trade creation)

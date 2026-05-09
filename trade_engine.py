@@ -219,6 +219,16 @@ class TradeEngine:
 
     # ---------- core actions ----------
     def place_conditional_entry(self, sig: Dict[str, Any], trade_id: str) -> Optional[str]:
+        """Place-first model: minimum work in critical path.
+
+        Skips: last_price call, too_far check, beyond_expiry check.
+        The entry_watcher (Bybit public-WS ticker) cancels the order if TP1
+        is crossed before the conditional fills — that's the safety net.
+
+        Bybit calls in critical path (warm path, leverage cached, equity cached):
+            place_order — that's it (~200ms total).
+        Cold path (first trade on new symbol) adds set_leverage (~150ms).
+        """
         symbol = sig["symbol"]
         side   = "Sell" if sig["side"] == "sell" else "Buy"
         trigger = float(sig["trigger"])
@@ -252,25 +262,12 @@ class TradeEngine:
             if sl_price:
                 sl_price = self._round_price(sl_price, tick_size)
 
-        # ── Parallel: set_leverage (if needed) + last_price ─────────────────
-        # set_leverage is skipped on symbols we've already configured this
-        # session (Bybit persists leverage per account+symbol).
-        need_lev = (symbol not in self._leverage_set) and not DRY_RUN
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_lev = ex.submit(self._set_leverage_safe, symbol) if need_lev else None
-            f_last = ex.submit(self.bybit.last_price, CATEGORY, symbol)
-            last = f_last.result()
-            if f_lev:
-                lev_ok = f_lev.result()
-                if lev_ok:
-                    self._leverage_set.add(symbol)
-
-        if self._too_far(side, last, trigger):
-            self.log.info(f"SKIP {symbol} – too far past trigger (last={last}, trigger={trigger})")
-            return None
-        if self._beyond_expiry_price(side, last, trigger):
-            self.log.info(f"SKIP {symbol} – beyond expiry-price rule (last={last}, trigger={trigger})")
-            return None
+        # ── Cold-path leverage set ──────────────────────────────────────────
+        # Only call Bybit for unfamiliar symbols. After the first trade we
+        # remember that the leverage is configured and skip the call.
+        if symbol not in self._leverage_set and not DRY_RUN:
+            if self._set_leverage_safe(symbol):
+                self._leverage_set.add(symbol)
 
         # buffer: slightly earlier trigger if desired
         trigger_adj = trigger * (1 - ENTRY_TRIGGER_BUFFER_PCT / 100.0) if side == "Buy" else trigger * (1 + ENTRY_TRIGGER_BUFFER_PCT / 100.0)
@@ -286,8 +283,12 @@ class TradeEngine:
                 limit_price = trigger * (1 - off)
         limit_price = self._round_price(limit_price, tick_size)
 
-        qty = self.calc_base_qty(symbol, trigger)
-        td = self._trigger_direction(last, trigger_adj)
+        qty = self.calc_base_qty(symbol, trigger)  # uses cached equity (sub-ms warm)
+        # Hardcoded triggerDirection by side — fresh signals always have
+        # trigger in the natural direction (SHORT trigger below current,
+        # LONG above). Saves a last_price API call. If wrong (rare edge),
+        # Bybit returns an error and we log it.
+        td = 2 if side == "Sell" else 1  # 2 = fall, 1 = rise
 
         body = {
             "category": CATEGORY,
@@ -315,6 +316,7 @@ class TradeEngine:
             body["tpslMode"] = "Full"
             sl_inline = True
         sig["_sl_inline"] = sl_inline  # consumed by main.py to flag the trade
+        sig["_base_qty"] = qty          # consumed by main.py — avoid recompute
 
         if DRY_RUN:
             self.log.info(f"DRY_RUN ENTRY {symbol}: {body}")
