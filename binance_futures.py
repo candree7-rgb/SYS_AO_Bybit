@@ -229,12 +229,21 @@ class BinanceFutures:
         data = self._signed_request(
             "GET", "/fapi/v1/leverageBracket", {"symbol": symbol}
         )
-        # Returns a list with a single entry for the symbol
+        # Defensive: scan ALL brackets for the highest initialLeverage. The
+        # response is typically sorted with bracket 1 = highest leverage,
+        # but some symbols have caps that don't match bracket-1 default.
         if isinstance(data, list) and data:
             brackets = data[0].get("brackets", [])
             if brackets:
-                return int(brackets[0].get("initialLeverage", 100))
-        return 100
+                cands = []
+                for b in brackets:
+                    try:
+                        cands.append(int(b.get("initialLeverage", 0)))
+                    except (TypeError, ValueError):
+                        pass
+                if cands:
+                    return max(cands)
+        return 20  # conservative fallback (was 100 — caused -4028 surprises)
 
     # ====================================================================== #
     # Account                                                                 #

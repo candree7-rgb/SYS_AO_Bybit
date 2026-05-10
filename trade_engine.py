@@ -463,7 +463,10 @@ class TradeEngine:
     def _set_leverage_safe(self, symbol: str) -> bool:
         """Set margin-mode (idempotent) + leverage. Treats Bybit's 110043
         (not modified) and Binance's -4045/-4046 (already set) as cached
-        success. Margin-mode call may fail if a position exists — non-fatal."""
+        success. On Binance -4028 (invalid leverage) re-attempts with the
+        requested value halved, since some symbols have leverage caps
+        below LEVERAGE_OVERRIDES default and our exchangeInfo cache may
+        be stale."""
         eff_lev = self._effective_leverage(symbol)
         if eff_lev != LEVERAGE:
             self.log.info(
@@ -472,24 +475,40 @@ class TradeEngine:
                 f"(default {RISK_PCT}%) — same notional"
             )
         # Margin-mode first (Binance rejects mode change once a position
-        # exists, so do this before opening any). Bybit client doesn't
-        # have set_margin_mode → guarded with hasattr for forward-compat.
+        # exists). Bybit client doesn't have set_margin_mode — guarded.
         try:
             from config import MARGIN_MODE as _mm
             if hasattr(self.bybit, "set_margin_mode"):
                 self.bybit.set_margin_mode(symbol, _mm)
         except Exception as e:
             self.log.debug(f"set_margin_mode {symbol}: {e}")
-        try:
-            self.bybit.set_leverage(CATEGORY, symbol, eff_lev)
-            return True
-        except Exception as e:
-            msg = str(e)
-            # Bybit "leverage not modified" or Binance equivalents → success
-            if "110043" in msg or "-4045" in msg or "-4046" in msg:
+
+        # Retry-with-halving loop for Binance -4028. After 4 halvings
+        # (20 → 10 → 5 → 2 → 1) we give up.
+        attempt_lev = eff_lev
+        for _ in range(5):
+            try:
+                self.bybit.set_leverage(CATEGORY, symbol, attempt_lev)
+                if attempt_lev != eff_lev:
+                    self.log.info(
+                        f"[engine] {symbol}: clamped leverage to {attempt_lev}x "
+                        f"(symbol cap below requested {eff_lev}x)"
+                    )
                 return True
-            self.log.warning(f"set_leverage failed for {symbol}: {e}")
-            return False
+            except Exception as e:
+                msg = str(e)
+                if "110043" in msg or "-4045" in msg or "-4046" in msg:
+                    return True
+                if "-4028" in msg and attempt_lev > 1:
+                    new_lev = max(1, int(attempt_lev) // 2)
+                    if new_lev == int(attempt_lev):
+                        new_lev = max(1, int(attempt_lev) - 1)
+                    attempt_lev = new_lev
+                    continue
+                self.log.warning(f"set_leverage failed for {symbol}: {e}")
+                return False
+        self.log.warning(f"set_leverage gave up for {symbol} after halving retries")
+        return False
 
     def cancel_entry(self, symbol: str, order_id: str, trade_id: Optional[str] = None) -> None:
         body = {"category": CATEGORY, "symbol": symbol, "orderId": order_id}
