@@ -88,8 +88,13 @@ BLACKLIST_SYMBOLS = set(s.strip().upper() for s in _get("BLACKLIST_SYMBOLS", "")
 #   - makes the bot robust against signal format changes
 #   - minimal speed gain (parsing is sub-ms either way)
 FIXED_RISK_PROFILE = _get_bool("FIXED_RISK_PROFILE","true")
-# Backtest-optimised defaults for AO Crusher signals on Binance:
-#   SL=2.0%, TPs at 0.8/1.6/4.0%. EV/sig +6.49% with 0/100/0 splits + BE+1%.
+# Tick-precise backtest (1013 signals, all Binance aggTrades) shows
+# splits=[10,30,60] is the OPTIMAL config. The 22% of signals that
+# reach TP3 monotonically (no upward retrace to BE level) give +58%
+# margin per trade with the 60% TP3 piece — that's where the EV comes
+# from. With splits=[0,100,0] those big wins get capped at TP2.
+# Top config: SL=2.0%, splits=[10,30,60], BE+0.7% → +9.56% EV/sig,
+# 28% MaxDD, 59% WR. See event_sweep.py for the full sweep result.
 FIXED_SL_PCT       = _get_float("FIXED_SL_PCT","2.0")
 FIXED_TP_PCTS      = [float(x) for x in _get("FIXED_TP_PCTS","0.8,1.6,4.0").split(",") if x.strip()]
 
@@ -109,17 +114,20 @@ ENTRY_EXPIRATION_PRICE_PCT   = _get_float("ENTRY_EXPIRATION_PRICE_PCT","0.6")
 
 # TP/SL
 MOVE_SL_TO_BE_ON_TP1 = _get_bool("MOVE_SL_TO_BE_ON_TP1","true")
-# BE+buffer: SL is moved to entry × (1 ± buffer%) once TP1 is reached.
-# Backtest shows 1.0% buffer captures most of the move while still
-# protecting against retracements. Lower buffer = closer to BE = faster
-# stop-out on noise.
-BREAKEVEN_PROFIT_BUFFER_PCT = _get_float("BREAKEVEN_PROFIT_BUFFER_PCT","1.0")
+# BE+buffer: after TP1 SL is moved to entry × (1 ± buffer%). Constraint:
+# buffer MUST be < TP1 distance (0.8%) — otherwise the BE level lands
+# on the wrong side of current price and Binance rejects with -2021.
+# Sweep winner: 0.7% (just below TP1) → locks +0.7% on retracements,
+# leaves enough room for the TP3 runner trades to develop.
+BREAKEVEN_PROFIT_BUFFER_PCT = _get_float("BREAKEVEN_PROFIT_BUFFER_PCT","0.7")
 INITIAL_SL_PCT = _get_float("INITIAL_SL_PCT","19.0")  # SL distance from entry in %
 
 # TP_SPLITS: percentage of position to close at each TP level.
-# Backtest-optimised default 0,100,0 = full position out at TP2 (1.6%).
+# Tick-precise sweep winner: 10,30,60. The 60% TP3 piece captures the
+# big monotonic moves (~22% of signals) at +4% × 60% × 20x = +48%
+# margin per such trade — that's where the +9.56% EV comes from.
 # DO NOT normalize - allow sum < 100% for runner positions
-TP_SPLITS = [float(x) for x in _get("TP_SPLITS","0,100,0").split(",") if x.strip()]
+TP_SPLITS = [float(x) for x in _get("TP_SPLITS","10,30,60").split(",") if x.strip()]
 if sum(TP_SPLITS) > 100.0:
     # Only normalize if over 100% (user error)
     s = sum(TP_SPLITS)
