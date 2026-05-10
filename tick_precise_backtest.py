@@ -47,12 +47,11 @@ def cache_path_kline(symbol, date):
 
 
 def fetch_aggtrades(symbol, date):
-    """Stream 1 day of aggTrades from Binance Vision archive into a
-    compact binary cache. Format: 16 bytes per record (uint64 time_ms +
-    double price). Streams the CSV line-by-line to avoid loading the
-    entire (potentially 50-100MB) decompressed CSV into memory.
-
-    Returns the cache path on success, None on 404 / network error."""
+    """Bulk-parse 1 day of aggTrades. Reads ZIP + decompresses CSV in
+    one go (~50-100MB peak per worker), parses with split() once, packs
+    binary records into one bytearray, writes a single gzip block.
+    Roughly 5-10x faster than line-by-line streaming for large files.
+    Returns cache path or None."""
     cp = cache_path_tick(symbol, date)
     if os.path.exists(cp):
         return cp
@@ -61,30 +60,36 @@ def fetch_aggtrades(symbol, date):
     tmp = cp + '.tmp'
     try:
         req = Request(url, headers={"User-Agent": "tick-bt/1.0"})
-        # We have to load the ZIP itself fully (random access), but we
-        # stream the CSV inside it to keep peak memory bounded.
         with urlopen(req, timeout=120) as resp:
             zip_bytes = resp.read()
         with ZipFile(BytesIO(zip_bytes)) as zf:
-            inner = zf.namelist()[0]
-            with zf.open(inner) as csv_stream:
-                with gzip.open(tmp, 'wb', compresslevel=4) as out:
-                    for raw in csv_stream:
-                        line = raw.decode('utf-8', errors='ignore').strip()
-                        if not line or line.startswith(('agg_trade', 'a,')):
-                            continue
-                        parts = line.split(',')
-                        # cols: agg_trade_id, price, quantity, first_trade_id,
-                        # last_trade_id, transact_time, is_buyer_maker
-                        try:
-                            price = float(parts[1])
-                            t = int(float(parts[5]))
-                        except (IndexError, ValueError):
-                            continue
-                        out.write(_REC.pack(t, price))
+            csv_bytes = zf.read(zf.namelist()[0])
+        del zip_bytes  # free immediately
+
+        # Bulk parse: build packed binary in one buffer
+        out_buf = bytearray()
+        pack = _REC.pack
+        # Skip header line if present, then parse
+        first_nl = csv_bytes.find(b'\n')
+        if csv_bytes[:11] == b'agg_trade_i' or csv_bytes[:2] == b'a,':
+            csv_bytes = csv_bytes[first_nl + 1:]
+        for line in csv_bytes.split(b'\n'):
+            if not line:
+                continue
+            parts = line.split(b',')
+            if len(parts) < 6:
+                continue
+            try:
+                price = float(parts[1])
+                t = int(parts[5])  # int parse on bytes is fast
+            except ValueError:
+                continue
+            out_buf.extend(pack(t, price))
+        del csv_bytes
+
+        with gzip.open(tmp, 'wb', compresslevel=3) as f:
+            f.write(out_buf)
         os.rename(tmp, cp)
-        # Free the ZIP bytes ASAP — workers run concurrently.
-        del zip_bytes
         return cp
     except HTTPError as e:
         try: os.unlink(tmp)
@@ -314,10 +319,11 @@ def main():
 
     if todo:
         done = 0; last_log = time.time()
-        # 12 workers — streaming CSV parser keeps per-worker memory low
-        # (only ZIP bytes + small streaming buffer), so 12 × ~5MB avg
-        # ZIP = ~60MB peak, well within sandbox limits. 4 was too slow.
-        with ThreadPoolExecutor(max_workers=12) as ex:
+        # 6 workers — bulk parse holds full CSV in memory per worker
+        # (~50MB worst case), so 6 × 50MB = 300MB peak. Streaming was
+        # safer but ~5x slower. 6 + bulk should be the speed/memory
+        # sweet spot.
+        with ThreadPoolExecutor(max_workers=6) as ex:
             futs = {ex.submit(fetch_aggtrades, s, d): (s, d) for (s, d) in todo}
             for fut in as_completed(futs):
                 done += 1
