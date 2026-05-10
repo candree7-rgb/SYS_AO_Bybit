@@ -89,13 +89,14 @@ BLACKLIST_SYMBOLS = set(s.strip().upper() for s in _get("BLACKLIST_SYMBOLS", "")
 #   - minimal speed gain (parsing is sub-ms either way)
 FIXED_RISK_PROFILE = _get_bool("FIXED_RISK_PROFILE","true")
 # Tick-precise backtest (1013 signals, all Binance aggTrades) shows
-# splits=[10,30,60] is the OPTIMAL config. The 22% of signals that
+# splits=[10,30,60] is the OPTIMAL split. The 22% of signals that
 # reach TP3 monotonically (no upward retrace to BE level) give +58%
 # margin per trade with the 60% TP3 piece — that's where the EV comes
 # from. With splits=[0,100,0] those big wins get capped at TP2.
-# Top config: SL=2.0%, splits=[10,30,60], BE+0.7% → +9.56% EV/sig,
-# 28% MaxDD, 59% WR. See event_sweep.py for the full sweep result.
-FIXED_SL_PCT       = _get_float("FIXED_SL_PCT","2.0")
+# Best risk-adjusted: SL=1.0%, splits=[10,30,60], BE+0.7% → +8.63%
+# EV/sig, 18% MaxDD. SL=2.0% gets slightly more EV (+9.56%) but DD
+# climbs to 28% — same loss-rate, double loss size. See event_sweep.py.
+FIXED_SL_PCT       = _get_float("FIXED_SL_PCT","1.0")
 FIXED_TP_PCTS      = [float(x) for x in _get("FIXED_TP_PCTS","0.8,1.6,4.0").split(",") if x.strip()]
 
 # Limits / Safety
