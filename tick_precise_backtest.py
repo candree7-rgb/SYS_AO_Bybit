@@ -258,12 +258,20 @@ def main():
         signals = [s for s in json.load(f) if s['outcomes_by_sl']['2.0'] != 'no_data']
     print(f"  → {len(signals)} signals", file=sys.stderr)
 
-    # Required (sym, date) pairs: day of post + day after (for 4h walk crossing midnight)
+    # Required (sym, date) pairs: only for signals that COULD have hit TP1
+    # (based on precomputed state). Loss-only or never-filled signals don't
+    # need ms-precise tick data — we already know the outcome from klines.
     pairs_set = set()
+    skipped_loss_only = 0
     for s in signals:
+        state_2pct = s['outcomes_by_sl'].get('2.0', '')
+        if state_2pct in ('loss', 'never_filled', 'no_data', 'no_event'):
+            skipped_loss_only += 1
+            continue  # outcome is unambiguous from klines, skip tick fetch
         for off in (0, 86400):
             pairs_set.add((s['sym'], date_str(s['post'] + off)))
     pairs = sorted(pairs_set)
+    print(f"  → {skipped_loss_only} signals are loss/never-filled (outcomes already known from klines)", file=sys.stderr)
     print(f"  → {len(pairs)} unique (symbol, date) tick-pairs needed", file=sys.stderr)
 
     # Skip already-cached
@@ -272,7 +280,9 @@ def main():
 
     if todo:
         done = 0; last_log = time.time()
-        with ThreadPoolExecutor(max_workers=24) as ex:
+        # 8 workers (down from 24) — ARIA/BLESS/BR have 10+MB compressed
+        # aggTrades files; with 24 parallel decodes the sandbox OOMs.
+        with ThreadPoolExecutor(max_workers=8) as ex:
             futs = {ex.submit(fetch_aggtrades, s, d): (s, d) for (s, d) in todo}
             for fut in as_completed(futs):
                 done += 1
@@ -286,15 +296,30 @@ def main():
     for s, d in pairs:
         klines_by_pair[(s, d)] = load_klines(s, d)
 
-    # Run simulation
+    # Run simulation. For signals we already know are losses/never_filled
+    # from klines (no aggTrades fetched), short-circuit with the known state.
     print("Running tick-precise simulation (BE+0.7%)...", file=sys.stderr)
     results = []
     last_log = time.time()
+    incremental_path = 'data/tick_precise_outcomes.json.gz'
     for i, sig in enumerate(signals):
-        results.append(simulate_tick(sig, klines_by_pair, sl_pct=2.0, be_buf=0.7))
+        state_2pct = sig['outcomes_by_sl'].get('2.0', '')
+        if state_2pct in ('loss', 'never_filled', 'no_data', 'no_event'):
+            # Short-circuit using kline outcome (no tick data available)
+            if state_2pct == 'loss':
+                results.append({'state': 'loss', 'pnl': pnl_loss(2.0)})
+            else:
+                results.append({'state': state_2pct, 'pnl': 0.0})
+        else:
+            results.append(simulate_tick(sig, klines_by_pair, sl_pct=2.0, be_buf=0.7))
         if time.time() - last_log > 10:
             print(f"    processed {i+1}/{len(signals)}", file=sys.stderr)
             last_log = time.time()
+        # Incremental checkpoint every 100 signals
+        if (i + 1) % 100 == 0:
+            with gzip.open(incremental_path, 'wt') as f:
+                json.dump([{'msg_id': s['msg_id'], 'state': r['state'], 'pnl': r['pnl']}
+                           for s, r in zip(signals[:i+1], results)], f, separators=(',', ':'))
 
     pnls = [r['pnl'] for r in results]
     ev = sum(pnls) / len(pnls)
