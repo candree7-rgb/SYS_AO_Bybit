@@ -8,7 +8,8 @@ import queue as _queue
 
 from config import (
     DISCORD_TOKEN, CHANNEL_ID,
-    BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_DEMO, RECV_WINDOW, ACCOUNT_TYPE,
+    BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_TESTNET, RECV_WINDOW, ACCOUNT_TYPE,
+    MARGIN_MODE,
     CATEGORY, QUOTE, LEVERAGE, RISK_PCT,
     MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
     POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC, SIGNAL_UPDATE_INTERVAL_OPEN_SEC,
@@ -16,7 +17,7 @@ from config import (
     WARMUP_SYMBOLS, BLACKLIST_SYMBOLS,
     STATE_FILE, DRY_RUN, LOG_LEVEL
 )
-from bybit_v5 import BybitV5
+from binance_futures import BinanceFutures
 from discord_reader import DiscordReader
 from discord_gateway import DiscordGateway
 from signal_parser import parse_signal, signal_hash, parse_signal_update, is_trade_closed
@@ -177,8 +178,8 @@ def main():
     missing = [k for k,v in {
         "DISCORD_TOKEN": DISCORD_TOKEN,
         "CHANNEL_ID": CHANNEL_ID,
-        "BYBIT_API_KEY": BYBIT_API_KEY,
-        "BYBIT_API_SECRET": BYBIT_API_SECRET,
+        "BINANCE_API_KEY": BINANCE_API_KEY,
+        "BINANCE_API_SECRET": BINANCE_API_SECRET,
     }.items() if not v]
     if missing:
         raise SystemExit(f"Missing ENV(s): {', '.join(missing)}")
@@ -220,7 +221,17 @@ def main():
 
     st = load_state(STATE_FILE)
 
-    bybit = BybitV5(BYBIT_API_KEY, BYBIT_API_SECRET, testnet=BYBIT_TESTNET, demo=BYBIT_DEMO, recv_window=RECV_WINDOW)
+    bybit = BinanceFutures(
+        BINANCE_API_KEY, BINANCE_API_SECRET,
+        testnet=BINANCE_TESTNET, recv_window=RECV_WINDOW,
+    )
+    # Force One-Way mode account-wide before any orders go out — set_leverage
+    # and STOP_MARKET closePosition=true rely on this. Idempotent.
+    if not DRY_RUN:
+        try:
+            bybit.set_position_mode_one_way()
+        except Exception as e:
+            log.warning(f"could not enforce One-Way position mode: {e} (continuing)")
     discord = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
 
     # Discord Gateway WebSocket: push-based new-message receiver. Replaces
@@ -315,11 +326,10 @@ def main():
 
     log.info("="*58)
     mode_str = " | DRY_RUN" if DRY_RUN else ""
-    mode_str += " | DEMO" if BYBIT_DEMO else ""
-    mode_str += " | TESTNET" if BYBIT_TESTNET else ""
-    log.info("Discord → Bybit Bot (One-way)" + mode_str)
+    mode_str += " | TESTNET" if BINANCE_TESTNET else ""
+    log.info("Discord → Binance Futures Bot (One-way)" + mode_str)
     log.info("="*58)
-    log.info(f"Config: CATEGORY={CATEGORY}, QUOTE={QUOTE}, LEVERAGE={LEVERAGE}x")
+    log.info(f"Config: QUOTE={QUOTE}, LEVERAGE={LEVERAGE}x, MARGIN={MARGIN_MODE}")
     log.info(f"Config: RISK_PCT={RISK_PCT}%, MAX_CONCURRENT={MAX_CONCURRENT_TRADES}, MAX_DAILY={MAX_TRADES_PER_DAY}")
     log.info(f"Config: POLL_SECONDS={POLL_SECONDS}, TC_MAX_LAG_SEC={TC_MAX_LAG_SEC}")
     log.info(f"Config: USE_GATEWAY_WS={USE_GATEWAY_WS} (fallback after {GATEWAY_FALLBACK_FAILURES} failures)")
@@ -354,15 +364,12 @@ def main():
             log.info("🔥 Warmup skipped (DRY_RUN)")
             return
 
-        log.info(f"🔥 Warming up Bybit caches: equity + {len(WARMUP_SYMBOLS)} symbols...")
+        log.info(f"🔥 Warming up Binance caches: equity + {len(WARMUP_SYMBOLS)} symbols (margin={MARGIN_MODE})...")
         t0 = time.time()
 
-        # Per-call light delay to stay under Bybit's per-second POST limit.
-        # Each warm_symbol does 2 REST calls (instruments_info GET + set_
-        # leverage POST). Bybit's POST limit is ~10/s shared across the
-        # account; with 3 workers + 100ms delay we average ~6 POSTs/s,
-        # well below the cap. Previous 8-worker burst hit 10006 on ~14
-        # of 35 symbols.
+        # Light per-call delay to stay under Binance's order-rate limit
+        # (300 orders / 10s, but warmup only does GET + 2 POSTs per
+        # symbol; conservative anyway).
         warmup_lock = threading.Lock()
         last_call_ts = [0.0]
 
@@ -375,6 +382,14 @@ def main():
             symbol = f"{base}{QUOTE}"
             try:
                 engine._get_instrument_rules(symbol)
+                # Margin mode must be set BEFORE first leverage call —
+                # Binance rejects margin-mode change once a position
+                # exists; setting it here on every cold symbol keeps the
+                # account state explicit. Idempotent (-4046 ignored).
+                try:
+                    bybit.set_margin_mode(symbol, MARGIN_MODE)
+                except Exception as e:
+                    log.debug(f"set_margin_mode {symbol}: {e}")
                 if engine._set_leverage_safe(symbol):
                     engine._leverage_set.add(symbol)
                 return (symbol, True, None)
@@ -405,6 +420,14 @@ def main():
     # Signal update tracking (dynamic intervals: 60s for pending, 10s for open)
     last_signal_update_check_pending = time.time() - (SIGNAL_UPDATE_INTERVAL_SEC - 5)  # First check after 5 seconds
     last_signal_update_check_open = time.time() - (SIGNAL_UPDATE_INTERVAL_OPEN_SEC - 3)  # First check after 3 seconds
+
+    # Discord REST safety-net: even when Gateway WS is healthy, the WS can
+    # silently drop messages (we hit this on XION). Every 60s, fetch the
+    # last few messages via REST and re-dispatch through fast_signal_handler.
+    # The signal_hash dedupe inside fast_signal_handler ensures already-
+    # processed messages are skipped. Cost: ~1 REST call/min, negligible.
+    DISCORD_SAFETYNET_INTERVAL_SEC = 60
+    last_discord_safetynet = time.time()
 
     # State-write throttle: writing state.json on every loop iteration adds
     # 50-200ms on slow filesystems and is wasteful when nothing changed.
@@ -742,6 +765,28 @@ def main():
                     msgs.append(m)
                 if msgs:
                     log.debug(f"[gateway] drained {len(msgs)} backfill/queued message(s)")
+
+                # Safety-net: every DISCORD_SAFETYNET_INTERVAL_SEC, also
+                # pull a small REST batch to catch messages the WS dropped
+                # silently. Dedupe is enforced by signal_hash inside the
+                # handler — re-delivering an already-seen message is a no-op.
+                if (time.time() - last_discord_safetynet) >= DISCORD_SAFETYNET_INTERVAL_SEC:
+                    last_discord_safetynet = time.time()
+                    try:
+                        sn = discord.fetch_after(st.get("last_discord_id"), limit=10)
+                        if sn:
+                            new_count = sum(
+                                1 for m in sn
+                                if int(m.get("id", "0")) > int(st.get("last_discord_id") or "0")
+                            )
+                            if new_count:
+                                log.warning(
+                                    f"⚠️  [safety-net] REST fetched {new_count} message(s) "
+                                    f"newer than gateway last-seen — WS may be dropping events"
+                                )
+                            msgs.extend(sn)
+                    except Exception as e:
+                        log.debug(f"[safety-net] REST poll failed: {e}")
             else:
                 after = st.get("last_discord_id")
                 log.debug(f"Polling Discord REST (after={after})...")
@@ -752,7 +797,17 @@ def main():
                     msgs = []
                 log.debug(f"Fetched {len(msgs)} message(s) from Discord")
 
+            # De-dupe messages by id to avoid double-dispatch when the
+            # safety-net fetch overlaps with the WS queue.
+            seen_ids: set = set()
+            unique_msgs = []
             for m in sorted(msgs, key=lambda x: int(x.get("id", "0"))):
+                mid = m.get("id")
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                unique_msgs.append(m)
+            for m in unique_msgs:
                 fast_signal_handler(m)
 
             _save_state_throttled()

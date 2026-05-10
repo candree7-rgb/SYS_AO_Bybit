@@ -1,15 +1,15 @@
 """
-EntryWatcher: live-cancels pending conditional entry orders when TP1 is hit
-before the entry triggers.
+EntryWatcher: live-cancels pending entry limit orders when TP1 is hit
+before the entry fills.
 
-Subscribes to Bybit's public ticker stream (`tickers.{symbol}`) for every
-symbol with a pending entry. On every price tick, checks whether the price
-has crossed TP1; if so, cancels the entry via the supplied callback and
-removes the watch.
+Subscribes to Binance's public `<symbol>@aggTrade` stream for every
+symbol with a pending entry. On every trade tick, checks whether the
+price has crossed TP1; if so, cancels the entry via the supplied callback
+and removes the watch.
 
-One WebSocket connection serves all symbols (Bybit allows multi-subscribe
-on a single public connection). Reconnects automatically and re-subscribes
-to the currently-watched symbols.
+One WebSocket connection serves all symbols. Subscriptions are managed
+via JSON-RPC SUBSCRIBE/UNSUBSCRIBE messages. Reconnects automatically
+and re-subscribes to the currently-watched symbols.
 """
 
 import json
@@ -80,10 +80,10 @@ class EntryWatcher:
             }
             need_subscribe = symbol not in self._subscribed and self._ws is not None
         if need_subscribe:
-            self._send({"op": "subscribe", "args": [f"tickers.{symbol}"]})
+            self._send_subscribe([symbol])
             with self._lock:
                 self._subscribed.add(symbol)
-            self.log.info(f"[watcher] subscribed tickers.{symbol} (tp1={tp1_price}, side={side})")
+            self.log.info(f"[watcher] subscribed {symbol}@aggTrade (tp1={tp1_price}, side={side})")
 
     def unwatch(self, symbol: str, trade_id: Optional[str] = None):
         """Remove one trade (if trade_id given) or all trades for a symbol.
@@ -108,8 +108,8 @@ class EntryWatcher:
             else:
                 already_subscribed = False
         if symbol_empty and already_subscribed and self._ws:
-            self._send({"op": "unsubscribe", "args": [f"tickers.{symbol}"]})
-            self.log.debug(f"[watcher] unsubscribed tickers.{symbol}")
+            self._send_unsubscribe([symbol])
+            self.log.debug(f"[watcher] unsubscribed {symbol}@aggTrade")
 
     # ---------- internals ----------
 
@@ -122,6 +122,26 @@ class EntryWatcher:
         except Exception as e:
             self.log.warning(f"[watcher] send failed: {e}")
 
+    def _send_subscribe(self, symbols: list):
+        if not symbols:
+            return
+        params = [f"{s.lower()}@aggTrade" for s in symbols]
+        self._send({
+            "method": "SUBSCRIBE",
+            "params": params,
+            "id": int(time.time() * 1000) & 0xFFFFFFFF,
+        })
+
+    def _send_unsubscribe(self, symbols: list):
+        if not symbols:
+            return
+        params = [f"{s.lower()}@aggTrade" for s in symbols]
+        self._send({
+            "method": "UNSUBSCRIBE",
+            "params": params,
+            "id": int(time.time() * 1000) & 0xFFFFFFFF,
+        })
+
     def _on_open(self, ws):
         self._ws = ws
         with self._lock:
@@ -129,30 +149,28 @@ class EntryWatcher:
             # so the cache survives WS reconnect.
             symbols = list(set(self._watches.keys()) | self._kept_symbols)
             self._subscribed.clear()
-        # Bybit allows up to 10 args per subscribe message — chunk to be safe.
-        for i in range(0, len(symbols), 10):
-            chunk = symbols[i : i + 10]
-            args = [f"tickers.{s}" for s in chunk]
-            try:
-                ws.send(json.dumps({"op": "subscribe", "args": args}))
-                with self._lock:
-                    self._subscribed.update(chunk)
-            except Exception as e:
-                self.log.warning(f"[watcher] resubscribe failed: {e}")
+        # Binance's combined-stream WS allows many subscribes per message.
+        # Chunk to 50 to stay well under the per-frame size limit.
+        for i in range(0, len(symbols), 50):
+            chunk = symbols[i : i + 50]
+            self._send_subscribe(chunk)
+            with self._lock:
+                self._subscribed.update(chunk)
         if symbols:
             self.log.info(f"[watcher] connected, resubscribed to {len(symbols)} symbol(s)")
 
     def _on_message(self, ws, msg):
-        topic = msg.get("topic", "")
-        if not topic.startswith("tickers."):
+        # Binance @aggTrade payload (no envelope):
+        #   {"e":"aggTrade","s":"BTCUSDT","p":"65000.10",...}
+        # Subscribe-ack messages have {"result":null,"id":...} — skip.
+        if msg.get("e") != "aggTrade":
             return
-        data = msg.get("data") or {}
-        symbol = data.get("symbol")
-        last_str = data.get("lastPrice")
-        if not symbol or last_str is None:
-            return  # delta without lastPrice change
+        symbol = msg.get("s")
+        price_str = msg.get("p")
+        if not symbol or price_str is None:
+            return
         try:
-            last = float(last_str)
+            last = float(price_str)
         except (TypeError, ValueError):
             return
         # Cache last-price for any other consumer (trade_engine) to read.
@@ -178,7 +196,7 @@ class EntryWatcher:
             if not already:
                 self._subscribed.add(symbol)
         if not already and self._ws:
-            self._send({"op": "subscribe", "args": [f"tickers.{symbol}"]})
+            self._send_subscribe([symbol])
 
     def _check_cross(self, symbol: str, last: float):
         with self._lock:
@@ -214,7 +232,7 @@ class EntryWatcher:
                 else:
                     unsub = False
             if unsub and self._ws:
-                self._send({"op": "unsubscribe", "args": [f"tickers.{symbol}"]})
+                self._send_unsubscribe([symbol])
 
     def _on_error(self, err):
         self.log.debug(f"[watcher] WS error (will reconnect): {err}")

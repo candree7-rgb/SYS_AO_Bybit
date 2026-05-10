@@ -25,8 +25,12 @@ def _pos_side(side: str) -> str:
     return "Long" if side == "Buy" else "Short"
 
 class TradeEngine:
-    def __init__(self, bybit, state: dict, logger, entry_watcher=None):
-        self.bybit = bybit
+    def __init__(self, client, state: dict, logger, entry_watcher=None):
+        # `client` is a BinanceFutures instance exposing the Bybit-shaped
+        # API (place_order/cancel_order/positions/wallet_equity/etc.).
+        # Attribute kept as `self.bybit` to minimise diffs in the methods
+        # below; callers never need to know the underlying exchange.
+        self.bybit = client
         self.state = state
         self.log = logger
         self.entry_watcher = entry_watcher
@@ -34,9 +38,7 @@ class TradeEngine:
         self._cache_ttl = 300  # 5 min cache
         self._cache_times: Dict[str, float] = {}
         self._last_stats_day: str = ""
-        # Symbols whose leverage we have already set this session — avoids
-        # a redundant set_leverage Bybit call on every trade. Bybit error
-        # 110043 ("leverage not modified") is also treated as cached-success.
+        # Symbols whose leverage we have already set this session
         self._leverage_set: set = set()
 
     # ---------- startup sync ----------
@@ -423,17 +425,17 @@ class TradeEngine:
             return "DRY_RUN"
 
         try:
-            self.log.debug(f"Bybit place_order request: {body}")
+            self.log.debug(f"place_order request: {body}")
             resp = self.bybit.place_order(body)
-            self.log.debug(f"Bybit place_order response: {resp}")
+            self.log.debug(f"place_order response: {resp}")
             oid = (resp.get("result") or {}).get("orderId")
             if oid:
-                self.log.info(f"✅ Bybit order created: {symbol} orderId={oid} (SL inline @ {sl_price})")
+                self.log.info(f"✅ Order created: {symbol} orderId={oid} (SL inline @ {sl_price})")
             else:
-                self.log.warning(f"⚠️ Bybit response has no orderId: {resp}")
+                self.log.warning(f"⚠️ Order response has no orderId: {resp}")
             return oid
         except Exception as e:
-            self.log.error(f"❌ Bybit place_order FAILED for {symbol}: {e}")
+            self.log.error(f"❌ place_order FAILED for {symbol}: {e}")
             return None
 
     def _last_price(self, symbol: str) -> float:
@@ -459,8 +461,9 @@ class TradeEngine:
             pass
 
     def _set_leverage_safe(self, symbol: str) -> bool:
-        """Set leverage; treat 110043 (not modified) as success.
-        Uses per-symbol override from LEVERAGE_OVERRIDES if configured."""
+        """Set margin-mode (idempotent) + leverage. Treats Bybit's 110043
+        (not modified) and Binance's -4045/-4046 (already set) as cached
+        success. Margin-mode call may fail if a position exists — non-fatal."""
         eff_lev = self._effective_leverage(symbol)
         if eff_lev != LEVERAGE:
             self.log.info(
@@ -468,13 +471,23 @@ class TradeEngine:
                 f"(default {LEVERAGE}x), risk {self._effective_risk_pct(symbol):.1f}% "
                 f"(default {RISK_PCT}%) — same notional"
             )
+        # Margin-mode first (Binance rejects mode change once a position
+        # exists, so do this before opening any). Bybit client doesn't
+        # have set_margin_mode → guarded with hasattr for forward-compat.
+        try:
+            from config import MARGIN_MODE as _mm
+            if hasattr(self.bybit, "set_margin_mode"):
+                self.bybit.set_margin_mode(symbol, _mm)
+        except Exception as e:
+            self.log.debug(f"set_margin_mode {symbol}: {e}")
         try:
             self.bybit.set_leverage(CATEGORY, symbol, eff_lev)
             return True
         except Exception as e:
             msg = str(e)
-            if "110043" in msg:
-                return True  # already set to the target leverage
+            # Bybit "leverage not modified" or Binance equivalents → success
+            if "110043" in msg or "-4045" in msg or "-4046" in msg:
+                return True
             self.log.warning(f"set_leverage failed for {symbol}: {e}")
             return False
 

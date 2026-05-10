@@ -19,12 +19,20 @@ def _get_float(name: str, default: str) -> float:
 DISCORD_TOKEN = _get("DISCORD_TOKEN")
 CHANNEL_ID    = _get("CHANNEL_ID")
 
-# Bybit
-BYBIT_API_KEY    = _get("BYBIT_API_KEY")
-BYBIT_API_SECRET = _get("BYBIT_API_SECRET")
-BYBIT_TESTNET    = _get_bool("BYBIT_TESTNET","false")
-BYBIT_DEMO       = _get_bool("BYBIT_DEMO","false")  # Demo trading (paper trading)
-ACCOUNT_TYPE     = _get("ACCOUNT_TYPE","UNIFIED")  # UNIFIED / CONTRACT etc (depends on your Bybit account)
+# Exchange — Binance USDT-M Futures.
+# Legacy BYBIT_* env vars are accepted as fallbacks so an existing
+# Railway deploy keeps booting without a config edit.
+BINANCE_API_KEY    = _get("BINANCE_API_KEY") or _get("BYBIT_API_KEY")
+BINANCE_API_SECRET = _get("BINANCE_API_SECRET") or _get("BYBIT_API_SECRET")
+BINANCE_TESTNET    = _get_bool("BINANCE_TESTNET", "false") or _get_bool("BYBIT_TESTNET", "false")
+
+# Margin mode applied per traded symbol on first leverage-set call.
+# ISOLATED caps loss to that position's margin (recommended).
+MARGIN_MODE = _get("MARGIN_MODE", "ISOLATED").upper()  # ISOLATED | CROSSED
+
+# Account-type kept for back-compat with trade_engine.py — passed through
+# to wallet_equity() which translates UNIFIED → USDT for Binance.
+ACCOUNT_TYPE = _get("ACCOUNT_TYPE", "USDT")
 
 # Bot identification (for multi-bot dashboard support)
 BOT_ID = _get("BOT_ID", "ao")  # Unique identifier for this bot instance
@@ -80,7 +88,9 @@ BLACKLIST_SYMBOLS = set(s.strip().upper() for s in _get("BLACKLIST_SYMBOLS", "")
 #   - makes the bot robust against signal format changes
 #   - minimal speed gain (parsing is sub-ms either way)
 FIXED_RISK_PROFILE = _get_bool("FIXED_RISK_PROFILE","true")
-FIXED_SL_PCT       = _get_float("FIXED_SL_PCT","1.0")
+# Backtest-optimised defaults for AO Crusher signals on Binance:
+#   SL=2.0%, TPs at 0.8/1.6/4.0%. EV/sig +6.49% with 0/100/0 splits + BE+1%.
+FIXED_SL_PCT       = _get_float("FIXED_SL_PCT","2.0")
 FIXED_TP_PCTS      = [float(x) for x in _get("FIXED_TP_PCTS","0.8,1.6,4.0").split(",") if x.strip()]
 
 # Limits / Safety
@@ -99,13 +109,17 @@ ENTRY_EXPIRATION_PRICE_PCT   = _get_float("ENTRY_EXPIRATION_PRICE_PCT","0.6")
 
 # TP/SL
 MOVE_SL_TO_BE_ON_TP1 = _get_bool("MOVE_SL_TO_BE_ON_TP1","true")
-BREAKEVEN_PROFIT_BUFFER_PCT = _get_float("BREAKEVEN_PROFIT_BUFFER_PCT","0.1")  # Profit buffer when moving SL to BE (to cover fees)
+# BE+buffer: SL is moved to entry × (1 ± buffer%) once TP1 is reached.
+# Backtest shows 1.0% buffer captures most of the move while still
+# protecting against retracements. Lower buffer = closer to BE = faster
+# stop-out on noise.
+BREAKEVEN_PROFIT_BUFFER_PCT = _get_float("BREAKEVEN_PROFIT_BUFFER_PCT","1.0")
 INITIAL_SL_PCT = _get_float("INITIAL_SL_PCT","19.0")  # SL distance from entry in %
 
-# TP_SPLITS: percentage of position to close at each TP level
-# Example: 30,30,30 means 90% total, leaving 10% as runner for trailing stop
+# TP_SPLITS: percentage of position to close at each TP level.
+# Backtest-optimised default 0,100,0 = full position out at TP2 (1.6%).
 # DO NOT normalize - allow sum < 100% for runner positions
-TP_SPLITS = [float(x) for x in _get("TP_SPLITS","30,30,30").split(",") if x.strip()]
+TP_SPLITS = [float(x) for x in _get("TP_SPLITS","0,100,0").split(",") if x.strip()]
 if sum(TP_SPLITS) > 100.0:
     # Only normalize if over 100% (user error)
     s = sum(TP_SPLITS)
