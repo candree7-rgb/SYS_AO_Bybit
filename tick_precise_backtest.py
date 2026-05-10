@@ -314,11 +314,10 @@ def main():
 
     if todo:
         done = 0; last_log = time.time()
-        # 4 workers — even with streaming CSV parse, the raw ZIP bytes
-        # (10-15MB for ARIA/BLESS days) still need to load fully for
-        # random access. 4 × 15MB = ~60MB peak per pool, plus per-worker
-        # decompression buffers. Sandbox has been OOM-killing at 8.
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        # 12 workers — streaming CSV parser keeps per-worker memory low
+        # (only ZIP bytes + small streaming buffer), so 12 × ~5MB avg
+        # ZIP = ~60MB peak, well within sandbox limits. 4 was too slow.
+        with ThreadPoolExecutor(max_workers=12) as ex:
             futs = {ex.submit(fetch_aggtrades, s, d): (s, d) for (s, d) in todo}
             for fut in as_completed(futs):
                 done += 1
