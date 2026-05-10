@@ -15,6 +15,7 @@ from config import (
     POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC, SIGNAL_UPDATE_INTERVAL_OPEN_SEC,
     USE_GATEWAY_WS, GATEWAY_FALLBACK_FAILURES, GATEWAY_LOOP_SLEEP_SEC, GATEWAY_INITIAL_BACKFILL,
     WARMUP_SYMBOLS, BLACKLIST_SYMBOLS,
+    DISABLE_ENTRY_WATCHER,
     STATE_FILE, DRY_RUN, LOG_LEVEL
 )
 from binance_futures import BinanceFutures
@@ -278,7 +279,14 @@ def main():
 
     entry_watcher = EntryWatcher(bybit, on_tp1_cross, log)
     engine = TradeEngine(bybit, st, log, entry_watcher=entry_watcher)
-    entry_watcher.start()
+    # Skip starting the WS-ticker thread if the cancel feature is disabled.
+    # The watcher object is still constructed (other code reads
+    # entry_watcher.get_last_price for price-cache hits) but the connect
+    # loop and TP1-cross logic stay dormant.
+    if DISABLE_ENTRY_WATCHER:
+        log.info("⚙️  ENTRY_WATCHER disabled — TP1-cross-cancel will not fire (relying on ENTRY_EXPIRATION_MIN timeout only)")
+    else:
+        entry_watcher.start()
 
     # Backfill via REST once before connecting Gateway so messages posted
     # during downtime aren't lost. Pre-load them straight into the gateway
@@ -307,7 +315,7 @@ def main():
         tr for tr in st.get("open_trades", {}).values()
         if tr.get("status") == "pending" and tr.get("entry_order_id")
     ]
-    if pending_at_restart:
+    if pending_at_restart and not DISABLE_ENTRY_WATCHER:
         log.info(f"♻️  Re-attaching entry_watcher for {len(pending_at_restart)} pending trade(s) from previous session")
         for tr in pending_at_restart:
             tps = tr.get("tp_prices") or []
@@ -641,7 +649,7 @@ def main():
             # ── Watch TP1 cross + Telegram (parallel ok, off critical path) ──
             tps = sig.get("tp_prices") or []
             tp1 = float(tps[0]) if tps else None
-            if tp1:
+            if tp1 and not DISABLE_ENTRY_WATCHER:
                 order_side = "Sell" if sig["side"] == "sell" else "Buy"
                 try:
                     entry_watcher.watch(trade_id, sig["symbol"], order_side, tp1, oid)

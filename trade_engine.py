@@ -384,26 +384,30 @@ class TradeEngine:
         qty = self.calc_base_qty(symbol, trigger)  # uses cached equity (sub-ms warm)
 
         # Pre-flight: if market is already past TP1, abort BEFORE
-        # submitting. The order would otherwise fill into a guaranteed
-        # losing trade (would only stop out via SL).
-        try:
-            last = self._last_price(symbol)
-        except Exception as e:
-            self.log.warning(f"last_price lookup failed for {symbol}: {e} — skipping pre-flight check")
-            last = None
-        tps_for_check = sig.get("tp_prices") or []
-        if last is not None and tps_for_check:
-            tp1 = float(tps_for_check[0])
-            already_past_tp1 = (
-                (side == "Sell" and last <= tp1)
-                or (side == "Buy" and last >= tp1)
-            )
-            if already_past_tp1:
-                self.log.info(
-                    f"⏭️  SKIP {symbol}: market last={last} already past TP1={tp1} "
-                    f"({'short' if side == 'Sell' else 'long'} would enter into instant loss)"
+        # submitting. Realistic-filter sweep showed this rejects ~40 % of
+        # signals — most of which would still be profitable (price often
+        # rallies back to trigger and the move continues to TP2/TP3).
+        # Gate behind DISABLE_PREFLIGHT_TP1 so it can be toggled live.
+        from config import DISABLE_PREFLIGHT_TP1
+        if not DISABLE_PREFLIGHT_TP1:
+            try:
+                last = self._last_price(symbol)
+            except Exception as e:
+                self.log.warning(f"last_price lookup failed for {symbol}: {e} — skipping pre-flight check")
+                last = None
+            tps_for_check = sig.get("tp_prices") or []
+            if last is not None and tps_for_check:
+                tp1 = float(tps_for_check[0])
+                already_past_tp1 = (
+                    (side == "Sell" and last <= tp1)
+                    or (side == "Buy" and last >= tp1)
                 )
-                return None
+                if already_past_tp1:
+                    self.log.info(
+                        f"⏭️  SKIP {symbol}: market last={last} already past TP1={tp1} "
+                        f"({'short' if side == 'Sell' else 'long'} would enter into instant loss)"
+                    )
+                    return None
 
         # Plain LIMIT order — no triggerPrice/triggerDirection.
         # Why not conditional?

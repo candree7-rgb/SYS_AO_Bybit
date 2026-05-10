@@ -113,6 +113,17 @@ ENTRY_TRIGGER_BUFFER_PCT     = _get_float("ENTRY_TRIGGER_BUFFER_PCT","0.0")
 ENTRY_LIMIT_PRICE_OFFSET_PCT = _get_float("ENTRY_LIMIT_PRICE_OFFSET_PCT","0.0")
 ENTRY_EXPIRATION_PRICE_PCT   = _get_float("ENTRY_EXPIRATION_PRICE_PCT","0.6")
 
+# Toggles for the two cancellation-mechanisms that the realistic-filter
+# backtest showed are leaving 99 % of EV on the table:
+#   1. DISABLE_PREFLIGHT_TP1: skip the "last price ≤ TP1 → SKIP" check
+#      that fires before the entry order is even placed.
+#   2. DISABLE_ENTRY_WATCHER: don't subscribe a public-WS ticker watcher
+#      that cancels pending limits when price crosses TP1 before fill.
+# With both enabled the bot relies solely on ENTRY_EXPIRATION_MIN
+# (default 180 min) to time-out unfilled limits.
+DISABLE_PREFLIGHT_TP1 = _get_bool("DISABLE_PREFLIGHT_TP1","false")
+DISABLE_ENTRY_WATCHER = _get_bool("DISABLE_ENTRY_WATCHER","false")
+
 # TP/SL
 MOVE_SL_TO_BE_ON_TP1 = _get_bool("MOVE_SL_TO_BE_ON_TP1","true")
 # BE+buffer: after TP1 SL is moved to entry × (1 ± buffer%). Constraint:
