@@ -64,6 +64,32 @@ def _fmt_num(x: float | str) -> str:
     return _strip_trailing_zeros(s)
 
 
+def _decimals_for_step(step: str) -> int:
+    """Number of fractional digits implied by a step/tick string like '0.001'."""
+    if "." not in step:
+        return 0
+    frac = step.split(".", 1)[1].rstrip("0")
+    return len(frac)
+
+
+def _quantize_to_step(value: float, step: str) -> str:
+    """Round `value` DOWN to a multiple of `step` and format with the
+    exact decimal-precision Binance expects. Prevents -1111 / -1013
+    rejections from mis-aligned quantities or prices."""
+    try:
+        s = float(step)
+    except (TypeError, ValueError):
+        return _fmt_num(value)
+    if s <= 0:
+        return _fmt_num(value)
+    import math as _math
+    n = _math.floor(float(value) / s) * s
+    decimals = _decimals_for_step(step)
+    if decimals == 0:
+        return str(int(round(n)))
+    return f"{n:.{decimals}f}"
+
+
 # --------------------------------------------------------------------------- #
 class BinanceFutures:
     """Binance USDT-M Futures wrapper exposing the Bybit V5 method shape."""
@@ -105,7 +131,9 @@ class BinanceFutures:
         self._ws_equity_lock = threading.Lock()
         self._ws_equity_max_age = 30.0
 
-        self._ws_positions: Dict[str, Tuple[float, float, float]] = {}
+        # symbol -> (size, avg_price, side, ts). Side stored as "Buy"/"Sell"
+        # so set_trading_stop can derive the closing-side without a REST call.
+        self._ws_positions: Dict[str, Tuple[float, float, str, float]] = {}
         self._ws_pos_lock = threading.Lock()
         self._ws_pos_max_age = 10.0
 
@@ -249,10 +277,20 @@ class BinanceFutures:
     # Account                                                                 #
     # ====================================================================== #
     def get_cached_position(self, symbol: str):
+        """Returns (size, avg_price) or None if cache is empty/stale.
+        The full 4-tuple (size, avg, side, ts) is internal."""
         with self._ws_pos_lock:
             t = self._ws_positions.get(symbol)
-        if t and (time.time() - t[2]) < self._ws_pos_max_age:
+        if t and (time.time() - t[3]) < self._ws_pos_max_age:
             return t[0], t[1]
+        return None
+
+    def get_cached_position_full(self, symbol: str):
+        """Returns (size, avg_price, side) or None. Side is 'Buy'/'Sell'/''."""
+        with self._ws_pos_lock:
+            t = self._ws_positions.get(symbol)
+        if t and (time.time() - t[3]) < self._ws_pos_max_age:
+            return t[0], t[1], t[2]
         return None
 
     def wallet_equity(self, account_type: str = "USDT", force_refresh: bool = False) -> float:
@@ -322,6 +360,38 @@ class BinanceFutures:
             raise
 
     # ====================================================================== #
+    # Filter helpers (used to defensively re-quantize qty/price)             #
+    # ====================================================================== #
+    def _filter_steps(self, symbol: str) -> Tuple[Optional[str], Optional[str]]:
+        """Return (tick_size, step_size) string-formatted for the symbol,
+        or (None, None) if exchangeInfo is unreachable. Does not throw."""
+        try:
+            s = self._symbol_filters(symbol)
+        except Exception:
+            return (None, None)
+        tick = None
+        step = None
+        for f in s.get("filters", []):
+            ft = f.get("filterType")
+            if ft == "PRICE_FILTER":
+                tick = f.get("tickSize")
+            elif ft == "LOT_SIZE":
+                step = f.get("stepSize")
+        return (tick, step)
+
+    def _qty_str(self, symbol: str, qty: Any) -> str:
+        _tick, step = self._filter_steps(symbol)
+        if step is None:
+            return _fmt_num(qty)
+        return _quantize_to_step(float(qty), step)
+
+    def _price_str(self, symbol: str, price: Any) -> str:
+        tick, _step = self._filter_steps(symbol)
+        if tick is None:
+            return _fmt_num(price)
+        return _quantize_to_step(float(price), tick)
+
+    # ====================================================================== #
     # Order placement (Bybit-shaped body → Binance translation)              #
     # ====================================================================== #
     def place_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -380,12 +450,12 @@ class BinanceFutures:
             "symbol": symbol,
             "side": side,
             "type": order_type_raw,
-            "quantity": _fmt_num(qty),
+            "quantity": self._qty_str(symbol, qty),
             "newClientOrderId": _encode_link_id(link_id),
             "newOrderRespType": "RESULT",
         }
         if order_type_raw == "LIMIT":
-            params["price"] = _fmt_num(price)
+            params["price"] = self._price_str(symbol, price)
             params["timeInForce"] = tif
         if reduce_only:
             params["reduceOnly"] = "true"
@@ -408,9 +478,9 @@ class BinanceFutures:
             "symbol": symbol,
             "side": side,
             "type": "STOP",
-            "quantity": _fmt_num(qty),
-            "price": _fmt_num(price),
-            "stopPrice": _fmt_num(stop_price),
+            "quantity": self._qty_str(symbol, qty),
+            "price": self._price_str(symbol, price),
+            "stopPrice": self._price_str(symbol, stop_price),
             "timeInForce": tif,
             "workingType": "MARK_PRICE",
             "priceProtect": "true",
@@ -445,23 +515,23 @@ class BinanceFutures:
             "symbol": symbol,
             "side": side,
             "type": order_type,  # LIMIT / MARKET
-            "quantity": _fmt_num(qty),
+            "quantity": self._qty_str(symbol, qty),
             "newClientOrderId": client_order_id,
-            "newOrderRespType": "RESULT",
+            "newOrderRespType": "ACK",  # ACK is ~50ms faster; orderId is included
         }
         if order_type == "LIMIT":
-            entry_order["price"] = _fmt_num(price)
+            entry_order["price"] = self._price_str(symbol, price)
             entry_order["timeInForce"] = tif
         sl_order = {
             "symbol": symbol,
             "side": sl_side,
             "type": "STOP_MARKET",
-            "stopPrice": _fmt_num(sl_price),
+            "stopPrice": self._price_str(symbol, sl_price),
             "closePosition": "true",
             "workingType": "MARK_PRICE",
             "priceProtect": "true",
             "newClientOrderId": sl_cid,
-            "newOrderRespType": "RESULT",
+            "newOrderRespType": "ACK",
         }
         params = {
             "batchOrders": json.dumps([entry_order, sl_order], separators=(",", ":")),
@@ -481,15 +551,18 @@ class BinanceFutures:
             raise BinanceAPIError(
                 int(entry_resp["code"]), entry_resp.get("msg", ""), entry_resp
             )
+        sl_ok = True
         if isinstance(sl_resp, dict) and sl_resp.get("code", 0) and int(sl_resp.get("code", 0)) < 0:
-            # Entry placed, SL failed → keep entry but log; caller's
-            # set_trading_stop fallback in trade_engine will retry SL.
-            # Don't cancel entry: the bot's safety net will set SL after fill.
-            pass
+            # Entry placed, SL leg failed. We MUST signal this back so
+            # trade_engine's place_post_entry_orders re-issues an SL after
+            # fill — otherwise the position would run unprotected.
+            sl_ok = False
         else:
             with self._sl_lock:
                 self._sl_orders[symbol] = str(sl_resp.get("orderId"))
-        return _wrap_order_response(entry_resp)
+        wrapped = _wrap_order_response(entry_resp)
+        wrapped["result"]["slInlineOk"] = sl_ok
+        return wrapped
 
     def cancel_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
         symbol = body["symbol"]
@@ -601,6 +674,10 @@ class BinanceFutures:
         cid = f"sl-{symbol}-{int(time.time()*1000)}"[:36]
 
         if trailing and not new_sl:
+            # Binance TRAILING_STOP_MARKET takes callbackRate in PERCENT
+            # (0.1–5). The Bybit-shape body sends `trailingStop` as an
+            # absolute price distance — we cannot translate without the
+            # current price. Caller must supply trailing as percent.
             params = {
                 "symbol": symbol,
                 "side": side_close,
@@ -609,21 +686,21 @@ class BinanceFutures:
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
                 "newClientOrderId": cid,
-                "newOrderRespType": "RESULT",
+                "newOrderRespType": "ACK",
             }
             if body.get("activePrice"):
-                params["activationPrice"] = _fmt_num(body["activePrice"])
+                params["activationPrice"] = self._price_str(symbol, body["activePrice"])
         else:
             params = {
                 "symbol": symbol,
                 "side": side_close,
                 "type": "STOP_MARKET",
-                "stopPrice": _fmt_num(new_sl),
+                "stopPrice": self._price_str(symbol, new_sl),
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
                 "priceProtect": "true",
                 "newClientOrderId": cid,
-                "newOrderRespType": "RESULT",
+                "newOrderRespType": "ACK",
             }
         resp = self._signed_request("POST", "/fapi/v1/order", params)
         with self._sl_lock:
@@ -633,15 +710,13 @@ class BinanceFutures:
     def _closing_side(self, symbol: str) -> Optional[str]:
         """Return the order side that would CLOSE the open position on this
         symbol (BUY for SHORT, SELL for LONG). None if no position open."""
-        # Prefer cached
-        cached = self.get_cached_position(symbol)
+        cached = self.get_cached_position_full(symbol)
         if cached is not None:
-            size, _ = cached
-            if size == 0:
-                # WS-cached zero may be stale; fall through to REST
-                pass
-            else:
-                return None  # cache stores size+avg, not side; fall through
+            size, _avg, side = cached
+            if size > 0 and side:
+                return "BUY" if side == "Sell" else "SELL"
+            # size 0 or empty side → fall through to REST (cache may be
+            # stale right after a fill / reconnect)
         try:
             poss = self.positions("linear", symbol)
         except Exception:
@@ -778,17 +853,37 @@ class BinanceFutures:
         }
         if x == "TRADE":
             on_execution(ev)
-            # When a TP/SL/entry fully fills and was tracked as the SL order,
-            # forget the SL pointer (so the next set_trading_stop doesn't try
-            # to cancel a non-existent order).
+            # When the SL fires, drop the pointer (a future set_trading_stop
+            # call would otherwise try to cancel a non-existent order) AND
+            # eagerly cancel the residual reduceOnly TP/DCA orders for the
+            # symbol. Binance does NOT auto-cancel siblings of a closePosition
+            # SL — without this the orphaned TPs sit until the next cleanup
+            # poll and could interfere with a new trade on the same symbol.
             if cid.endswith("-SL") or cid.endswith(":SL"):
+                sym = o.get("s")
                 with self._sl_lock:
-                    self._sl_orders.pop(o.get("s"), None)
+                    self._sl_orders.pop(sym, None)
+                if sym:
+                    self._cancel_reduce_only_for_symbol(sym)
         if on_order:
             try:
                 on_order(ev)
             except Exception:
                 pass
+
+    def _cancel_reduce_only_for_symbol(self, symbol: str) -> None:
+        """Cancel every open reduceOnly order on this symbol (TP/DCA siblings
+        of a just-fired SL). Best-effort; failures are logged at debug."""
+        try:
+            opens = self.open_orders("linear", symbol)
+        except Exception:
+            return
+        for o in opens:
+            if not o.get("reduceOnly"):
+                continue
+            oid = str(o.get("orderId", ""))
+            if oid:
+                self._cancel_by_order_id(symbol, oid)
 
     def _handle_account_update(self, a: Dict[str, Any], on_wallet, on_position):
         """ACCOUNT_UPDATE.a contains B (balances) and P (positions)."""
@@ -821,15 +916,16 @@ class BinanceFutures:
             except (TypeError, ValueError):
                 continue
             size = abs(pa)
+            side = "Sell" if pa < 0 else ("Buy" if pa > 0 else "")
             with self._ws_pos_lock:
-                self._ws_positions[sym] = (size, ep, time.time())
+                self._ws_positions[sym] = (size, ep, side, time.time())
             if on_position:
                 try:
                     on_position({
                         "symbol": sym,
                         "size": size,
                         "avgPrice": ep,
-                        "side": "Sell" if pa < 0 else ("Buy" if pa > 0 else ""),
+                        "side": side,
                     })
                 except Exception:
                     pass

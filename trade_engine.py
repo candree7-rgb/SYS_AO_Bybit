@@ -82,6 +82,30 @@ class TradeEngine:
             else:
                 self.log.info(f"✅ Startup sync: {len(open_positions)} position(s), all tracked")
 
+            # Hydrate the Binance client's SL pointer from open SL orders so
+            # set_trading_stop (BE-move on TP1) works after a process
+            # restart instead of falling through to the open-orders scan
+            # path on every call. Identifies SL orders by either the
+            # ":SL"/"|SL" suffix we use or the Binance stopOrderType field.
+            if hasattr(self.bybit, "_sl_orders"):
+                for pos in open_positions:
+                    sym = pos.get("symbol")
+                    if not sym:
+                        continue
+                    try:
+                        for o in self.bybit.open_orders(CATEGORY, sym):
+                            link = (o.get("orderLinkId") or "")
+                            stop_type = (o.get("stopOrderType") or "")
+                            if link.endswith(":SL") or link.endswith("|SL") or stop_type == "Stop":
+                                oid = str(o.get("orderId", ""))
+                                if oid:
+                                    with self.bybit._sl_lock:
+                                        self.bybit._sl_orders[sym] = oid
+                                    self.log.info(f"♻️  Hydrated SL pointer: {sym} → {oid}")
+                                break
+                    except Exception as e:
+                        self.log.debug(f"SL hydration failed for {sym}: {e}")
+
             # Log performance report at startup
             if self.state.get("trade_history"):
                 self.log_performance_report()
@@ -409,28 +433,47 @@ class TradeEngine:
         }
 
         # ── Inline stopLoss in the entry order ──────────────────────────────
-        # Bybit attaches the SL to the position once the conditional fills,
-        # which means we save a separate set_trading_stop call (~150ms).
-        sl_inline = False
+        # Inline SL: Bybit attaches it to the position when the entry fills;
+        # Binance translates this to a batchOrders [LIMIT, STOP_MARKET]
+        # submitted in 1 RTT. The exchange may report SL leg failure even
+        # though the entry succeeded — see slInlineOk handling below.
+        sl_inline_requested = False
         if sl_price:
             body["stopLoss"] = f"{sl_price:.10f}"
             body["slTriggerBy"] = "LastPrice"
             body["tpslMode"] = "Full"
-            sl_inline = True
-        sig["_sl_inline"] = sl_inline  # consumed by main.py to flag the trade
+            sl_inline_requested = True
         sig["_base_qty"] = qty          # consumed by main.py — avoid recompute
 
         if DRY_RUN:
             self.log.info(f"DRY_RUN ENTRY {symbol}: {body}")
+            sig["_sl_inline"] = sl_inline_requested
             return "DRY_RUN"
 
         try:
             self.log.debug(f"place_order request: {body}")
             resp = self.bybit.place_order(body)
             self.log.debug(f"place_order response: {resp}")
-            oid = (resp.get("result") or {}).get("orderId")
+            result = resp.get("result") or {}
+            oid = result.get("orderId")
+            # The Binance client reports whether the inline SL leg actually
+            # was accepted. Only mark the trade as "SL set" if it really is —
+            # otherwise place_post_entry_orders will re-issue an SL after fill.
+            if sl_inline_requested:
+                sl_actually_inline = bool(result.get("slInlineOk", True))
+                if not sl_actually_inline:
+                    self.log.warning(
+                        f"⚠️ {symbol}: inline SL leg of batchOrders failed — "
+                        f"will re-set SL after entry fill"
+                    )
+                sig["_sl_inline"] = sl_actually_inline
+            else:
+                sig["_sl_inline"] = False
             if oid:
-                self.log.info(f"✅ Order created: {symbol} orderId={oid} (SL inline @ {sl_price})")
+                if sig.get("_sl_inline"):
+                    self.log.info(f"✅ Order created: {symbol} orderId={oid} (SL inline @ {sl_price})")
+                else:
+                    self.log.info(f"✅ Order created: {symbol} orderId={oid} (SL will be set post-fill)")
             else:
                 self.log.warning(f"⚠️ Order response has no orderId: {resp}")
             return oid
@@ -833,8 +876,31 @@ class TradeEngine:
         if link in self.state.get("open_trades", {}):
             tr = self.state["open_trades"][link]
             if tr.get("status") == "pending":
-                # some execution payloads contain execPrice/lastPrice
-                exec_price = ev.get("execPrice") or ev.get("price") or ev.get("lastPrice") or tr.get("trigger")
+                # Only act on a FULLY filled entry. Partial fills generate
+                # multiple TRADE events; if we placed TPs after the first
+                # partial, the TP qty would be sized to half the position
+                # and the rest would drift unprotected. Bybit and Binance
+                # both publish status="Filled" / "FILLED" only on full
+                # completion. Anything else (PartiallyFilled / PARTIALLY_FILLED)
+                # is ignored — we wait for the full-fill event.
+                exec_status = (ev.get("orderStatus") or ev.get("execStatus") or "").upper()
+                if exec_status not in ("FILLED", ""):
+                    # Empty status = legacy Bybit shape; trust it.
+                    self.log.debug(
+                        f"[entry] partial fill {tr['symbol']} status={exec_status} — waiting for FILLED"
+                    )
+                    return
+                # Prefer the avg fill price (avgPrice) over the last-trade
+                # price (lastPrice/execPrice) so partial sequences resolve to
+                # the VWAP not the last tick. trigger is the last-resort
+                # fallback when the venue did not echo any price.
+                exec_price = (
+                    ev.get("avgPrice")
+                    or ev.get("execPrice")
+                    or ev.get("lastPrice")
+                    or ev.get("price")
+                    or tr.get("trigger")
+                )
                 try:
                     tr["entry_price"] = float(exec_price)
                 except Exception:
