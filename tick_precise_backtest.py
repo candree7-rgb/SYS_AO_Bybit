@@ -14,13 +14,17 @@ For each signal:
 
 This eliminates the same-candle ordering ambiguity entirely.
 """
-import os, sys, gzip, json, time
+import os, sys, gzip, json, time, struct
 from io import BytesIO
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 from zipfile import ZipFile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
+
+# Per-row binary format: <Qd> = uint64 time_ms + double price = 16 bytes.
+# 1M trades = 16MB raw, ~5-8MB gzipped. JSON would be 30 MB+.
+_REC = struct.Struct('<Qd')
 
 BINANCE_VISION_BASE = "https://data.binance.vision/data/futures/um/daily/aggTrades"
 KLINE_BASE = "https://data.binance.vision/data/futures/um/daily/klines"
@@ -43,52 +47,82 @@ def cache_path_kline(symbol, date):
 
 
 def fetch_aggtrades(symbol, date):
-    """Download 1 day of aggTrades. Cache as compressed binary
-    list-of-tuples [(time_ms, price), ...]. Drops qty/maker fields to
-    save memory — we only need (time, price)."""
+    """Stream 1 day of aggTrades from Binance Vision archive into a
+    compact binary cache. Format: 16 bytes per record (uint64 time_ms +
+    double price). Streams the CSV line-by-line to avoid loading the
+    entire (potentially 50-100MB) decompressed CSV into memory.
+
+    Returns the cache path on success, None on 404 / network error."""
     cp = cache_path_tick(symbol, date)
     if os.path.exists(cp):
         return cp
 
     url = f"{BINANCE_VISION_BASE}/{symbol}/{symbol}-aggTrades-{date}.zip"
+    tmp = cp + '.tmp'
     try:
         req = Request(url, headers={"User-Agent": "tick-bt/1.0"})
-        with urlopen(req, timeout=60) as resp:
-            data = resp.read()
-        with ZipFile(BytesIO(data)) as zf:
-            csv_bytes = zf.read(zf.namelist()[0]).decode('utf-8')
-        rows = []
-        for line in csv_bytes.strip().split('\n'):
-            if line.startswith('agg_trade') or line.startswith('a,'):
-                continue
-            parts = line.split(',')
-            # cols: agg_trade_id, price, quantity, first_trade_id,
-            # last_trade_id, transact_time, is_buyer_maker
-            try:
-                price = float(parts[1])
-                t = int(float(parts[5]))
-            except (IndexError, ValueError):
-                continue
-            rows.append((t, price))
-        rows.sort(key=lambda x: x[0])
-        with gzip.open(cp, 'wt') as f:
-            json.dump(rows, f, separators=(',', ':'))
+        # We have to load the ZIP itself fully (random access), but we
+        # stream the CSV inside it to keep peak memory bounded.
+        with urlopen(req, timeout=120) as resp:
+            zip_bytes = resp.read()
+        with ZipFile(BytesIO(zip_bytes)) as zf:
+            inner = zf.namelist()[0]
+            with zf.open(inner) as csv_stream:
+                with gzip.open(tmp, 'wb', compresslevel=4) as out:
+                    for raw in csv_stream:
+                        line = raw.decode('utf-8', errors='ignore').strip()
+                        if not line or line.startswith(('agg_trade', 'a,')):
+                            continue
+                        parts = line.split(',')
+                        # cols: agg_trade_id, price, quantity, first_trade_id,
+                        # last_trade_id, transact_time, is_buyer_maker
+                        try:
+                            price = float(parts[1])
+                            t = int(float(parts[5]))
+                        except (IndexError, ValueError):
+                            continue
+                        out.write(_REC.pack(t, price))
+        os.rename(tmp, cp)
+        # Free the ZIP bytes ASAP — workers run concurrently.
+        del zip_bytes
         return cp
     except HTTPError as e:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
         if e.code == 404:
             return None
         raise
-    except (URLError, Exception) as e:
+    except (URLError, Exception):
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
         return None
 
 
 def load_ticks(symbol, date):
+    """Read the cached aggTrades. Auto-detects format: legacy JSON
+    (early pre-OOM-fix runs) or new binary (16-byte records).
+    Returns list of (time_ms, price) tuples, sorted by time."""
     cp = cache_path_tick(symbol, date)
     if not os.path.exists(cp):
         return None
     try:
-        with gzip.open(cp, 'rt') as f:
-            return json.load(f)
+        with gzip.open(cp, 'rb') as f:
+            head = f.read(2)
+            f.seek(0)
+            if head[:1] == b'[':
+                # Legacy JSON
+                return json.load(gzip.open(cp, 'rt'))
+            # Binary
+            rows = []
+            chunk_size = _REC.size * 4096
+            while True:
+                buf = f.read(chunk_size)
+                if not buf:
+                    break
+                for off in range(0, len(buf) - _REC.size + 1, _REC.size):
+                    rows.append(_REC.unpack_from(buf, off))
+            rows.sort(key=lambda x: x[0])
+            return rows
     except Exception:
         return None
 
@@ -280,9 +314,11 @@ def main():
 
     if todo:
         done = 0; last_log = time.time()
-        # 8 workers (down from 24) — ARIA/BLESS/BR have 10+MB compressed
-        # aggTrades files; with 24 parallel decodes the sandbox OOMs.
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        # 4 workers — even with streaming CSV parse, the raw ZIP bytes
+        # (10-15MB for ARIA/BLESS days) still need to load fully for
+        # random access. 4 × 15MB = ~60MB peak per pool, plus per-worker
+        # decompression buffers. Sandbox has been OOM-killing at 8.
+        with ThreadPoolExecutor(max_workers=4) as ex:
             futs = {ex.submit(fetch_aggtrades, s, d): (s, d) for (s, d) in todo}
             for fut in as_completed(futs):
                 done += 1
