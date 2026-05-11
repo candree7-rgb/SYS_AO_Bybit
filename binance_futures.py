@@ -166,6 +166,14 @@ class BinanceFutures:
         self._sl_orders: Dict[str, str] = {}
         self._sl_lock = threading.Lock()
 
+        # Tracks order ids that live on /fapi/v1/algoOrder (algoId values
+        # are LONG ints just like orderIds, but cancel/query needs a different
+        # endpoint). Used by _cancel_by_order_id to route correctly.
+        # Per Binance 2025-12-09 migration: TRAILING_STOP_MARKET and
+        # STOP_MARKET conditional types are now placed via the algo endpoint.
+        self._algo_orders: set = set()
+        self._algo_lock = threading.Lock()
+
         # listenKey state for User-Data-Stream
         self._listen_key: Optional[str] = None
         self._listen_key_ts: float = 0.0
@@ -539,90 +547,128 @@ class BinanceFutures:
         resp = self._signed_request("POST", "/fapi/v1/order", params)
         return _wrap_order_response(resp)
 
+    # ====================================================================== #
+    # Algo Order endpoint (/fapi/v1/algoOrder)                                #
+    # ----------------------------------------------------------------------- #
+    # Binance migrated conditional order types (STOP, STOP_MARKET, TAKE_PROFIT,
+    # TAKE_PROFIT_MARKET, TRAILING_STOP_MARKET) to a separate "algo" endpoint
+    # starting 2025-12-09. The legacy /fapi/v1/order endpoint still accepts
+    # these types on some symbols/accounts but is documented to return
+    # -4120 STOP_ORDER_SWITCH_ALGO going forward. The algo endpoint:
+    #   - is signed identically to /fapi/v1/order (HMAC, timestamp, recvWindow)
+    #   - returns `algoId` instead of `orderId`
+    #   - takes `triggerPrice` for STOP_MARKET (not `stopPrice`)
+    #   - takes `activatePrice` for TRAILING_STOP_MARKET (not `activationPrice`)
+    #   - does NOT support closePosition=true on TRAILING_STOP_MARKET → quantity
+    #     + reduceOnly required for one-way mode
+    #   - is NOT returned by GET /fapi/v1/openOrders — use openAlgoOrders
+    # ====================================================================== #
+    def _place_algo_order(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /fapi/v1/algoOrder. Returns raw algo response with `algoId`.
+        Caller is responsible for setting algoType, type, side, symbol etc.
+        """
+        resp = self._signed_request("POST", "/fapi/v1/algoOrder", params)
+        algo_id = resp.get("algoId")
+        if algo_id is not None:
+            with self._algo_lock:
+                self._algo_orders.add(str(algo_id))
+        return resp
+
+    def _cancel_algo_order_by_id(self, algo_id: Any) -> Dict[str, Any]:
+        """DELETE /fapi/v1/algoOrder by algoId. Idempotent on -2011-like
+        'unknown algo order' errors. Note: this endpoint does NOT take symbol.
+        """
+        try:
+            resp = self._signed_request(
+                "DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id}
+            )
+            with self._algo_lock:
+                self._algo_orders.discard(str(algo_id))
+            return resp
+        except BinanceAPIError as e:
+            # -2011 "Unknown order" and -4046 / -4150 "algo order not found"
+            # both mean it's already gone (filled or cancelled). Idempotent.
+            if e.code in (-2011, -4046):
+                with self._algo_lock:
+                    self._algo_orders.discard(str(algo_id))
+                return {"alreadyClosed": True}
+            raise
+
+    def open_algo_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """GET /fapi/v1/openAlgoOrders. Algos do NOT appear in regular
+        openOrders, so any orphan-cleanup pass must also iterate this list.
+        """
+        params: Dict[str, Any] = {}
+        if symbol:
+            params["symbol"] = symbol
+        data = self._signed_request("GET", "/fapi/v1/openAlgoOrders", params)
+        return data if isinstance(data, list) else []
+
+    def _is_algo_order_id(self, order_id: str) -> bool:
+        with self._algo_lock:
+            return str(order_id) in self._algo_orders
+
     def _place_trailing_stop_market(
         self,
         symbol: str,
         side: str,
         callback_rate: Any,
         activation_price: Optional[Any],
-        close_position: bool,
+        close_position: bool,  # kept for API compat; ignored — algo never accepts it
         quantity: Optional[Any],
         client_order_id: str,
     ) -> Dict[str, Any]:
-        """Place a Binance TRAILING_STOP_MARKET order.
+        """Place a TRAILING_STOP_MARKET via /fapi/v1/algoOrder.
 
-        Per Binance USDT-M Futures API docs (POST /fapi/v1/order):
-          - callbackRate: 0.1 .. 10.0 (one decimal, % retrace from extreme)
-          - activationPrice: optional; defaults to mark/last at place-time.
-            For SHORT (side=BUY) the trail arms when MARK price drops to
-            activationPrice; the extreme then tracks the lowest mark seen
-            and fires a MARKET BUY once mark retraces callbackRate %.
-          - closePosition=true is mutually exclusive with quantity and
-            reduceOnly. Must use one OR the other.
-          - priceProtect is NOT a valid param for TRAILING_STOP_MARKET
-            (only STOP/STOP_MARKET/TAKE_PROFIT/TAKE_PROFIT_MARKET) — would
-            be rejected with -1106. Omitted here.
+        Per Binance docs (algo endpoint, 2025-12-09 migration):
+          - algoType=CONDITIONAL, type=TRAILING_STOP_MARKET
+          - callbackRate: 0.1 .. 10.0 (1 dp, 1 = 1%)
+          - activatePrice (NOT activationPrice): optional; defaults to mark
+            at place-time. For BUY (closing SHORT) activatePrice must be
+            < latest price; for SELL it must be > latest price. Violations
+            return -4135 INVALID_ACTIVATION_PRICE.
+          - closePosition is NOT supported on algo trailing — must use
+            quantity + reduceOnly. reduceOnly=true is mandatory in our flow
+            as a safety belt against an orphan trigger opening a reverse
+            position if the underlying position has already been closed.
+          - workingType: MARK_PRICE or CONTRACT_PRICE (default).
 
-        Built-in fallbacks for live-trade robustness:
-          - If Binance rejects closePosition for this type (-1106 or -4136
-            "Target strategy invalid for orderType TRAILING_STOP_MARKET,
-            closePosition true"), retry with quantity + reduceOnly. Seen
-            live on some symbols (e.g. AKEUSDT) in 2026-05 — Binance now
-            disallows closePosition=true with TRAILING_STOP_MARKET on
-            certain perp listings even though docs still describe it.
-          - If activationPrice would immediately trigger (-2021 — mark
-            already crossed it), retry without activationPrice so Binance
-            defaults to the current mark.
+        Fallback: if activatePrice would immediately trigger (-4135), retry
+        without activatePrice so Binance defaults to the current mark.
         """
-        def _build(use_close: bool, use_activation: bool) -> Dict[str, Any]:
+        if quantity is None:
+            raise RuntimeError(
+                "TRAILING_STOP_MARKET via algoOrder requires quantity "
+                "(closePosition is not supported on the algo endpoint)"
+            )
+
+        def _build(use_activation: bool) -> Dict[str, Any]:
             p: Dict[str, Any] = {
+                "algoType": "CONDITIONAL",
                 "symbol": symbol,
                 "side": side,
                 "type": "TRAILING_STOP_MARKET",
+                "quantity": self._qty_str(symbol, quantity),
+                "reduceOnly": "true",
                 "callbackRate": _fmt_num(callback_rate),
                 "workingType": "MARK_PRICE",
-                "newClientOrderId": client_order_id,
+                "clientAlgoId": client_order_id,
                 "newOrderRespType": "ACK",
             }
-            if use_close:
-                p["closePosition"] = "true"
-            elif quantity is not None:
-                p["quantity"] = self._qty_str(symbol, quantity)
-                p["reduceOnly"] = "true"
-            else:
-                raise RuntimeError("TRAILING_STOP_MARKET needs closePosition=true OR quantity")
             if use_activation and activation_price is not None:
-                p["activationPrice"] = self._price_str(symbol, activation_price)
+                p["activatePrice"] = self._price_str(symbol, activation_price)
             return p
 
-        # First attempt: closePosition + activationPrice (intended config)
         try:
-            resp = self._signed_request("POST", "/fapi/v1/order",
-                                         _build(close_position, True))
-            return _wrap_order_response(resp)
+            resp = self._place_algo_order(_build(True))
+            return _wrap_algo_response(resp)
         except BinanceAPIError as e:
-            # -1106 / -4136: closePosition rejected for TRAILING_STOP_MARKET.
-            # Seen live: AKEUSDT 2026-05 with -4136 "Target strategy invalid".
-            # Retry with quantity + reduceOnly using the open position size.
-            if e.code in (-1106, -4136) and close_position and quantity is not None:
-                resp = self._signed_request("POST", "/fapi/v1/order",
-                                             _build(False, True))
-                return _wrap_order_response(resp)
-            # -2021: order would immediately trigger (mark already past
-            # activationPrice) — retry without activationPrice so the
-            # exchange defaults it to the current mark. Also re-try the
-            # qty fallback path if closePosition was rejected upstream.
-            if e.code == -2021 and activation_price is not None:
-                try:
-                    resp = self._signed_request("POST", "/fapi/v1/order",
-                                                 _build(close_position, False))
-                    return _wrap_order_response(resp)
-                except BinanceAPIError as e2:
-                    if e2.code in (-1106, -4136) and close_position and quantity is not None:
-                        resp = self._signed_request("POST", "/fapi/v1/order",
-                                                     _build(False, False))
-                        return _wrap_order_response(resp)
-                    raise
+            # -4135 INVALID_ACTIVATION_PRICE — mark already crossed it (e.g.
+            # for SHORT, mark already below activatePrice). Retry without
+            # activatePrice so Binance picks the current mark as the start.
+            if e.code == -4135 and activation_price is not None:
+                resp = self._place_algo_order(_build(False))
+                return _wrap_algo_response(resp)
             raise
 
     def _place_conditional_limit(
@@ -748,12 +794,30 @@ class BinanceFutures:
             raise
 
     def _cancel_by_order_id(self, symbol: str, order_id: str) -> None:
+        """Cancel an order by id. Routes to /fapi/v1/algoOrder when the id
+        is tracked in _algo_orders (STOP_MARKET / TRAILING_STOP_MARKET on
+        the algo endpoint), otherwise to /fapi/v1/order. Errors are
+        swallowed — used by cleanup paths that should never raise.
+        """
+        if self._is_algo_order_id(order_id):
+            try:
+                self._cancel_algo_order_by_id(order_id)
+            except Exception:
+                pass
+            return
         try:
             self._signed_request(
                 "DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}
             )
-        except BinanceAPIError:
-            pass
+        except BinanceAPIError as e:
+            # If the regular endpoint says -2011 / -1102 unknown id, the
+            # order may actually be an algo we forgot to track (e.g. across
+            # a restart with no persistent _algo_orders set). Try algo too.
+            if e.code in (-2011, -1102, -2013):
+                try:
+                    self._cancel_algo_order_by_id(order_id)
+                except Exception:
+                    pass
 
     def open_orders(self, category: str, symbol: str) -> List[Dict[str, Any]]:  # noqa: ARG002
         """Return list of open orders in Bybit shape (orderId, orderLinkId, ...)."""
@@ -794,19 +858,28 @@ class BinanceFutures:
     # SL/TP at position level (Bybit set_trading_stop equivalent)            #
     # ====================================================================== #
     def set_trading_stop(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Replace the active SL order for a symbol (Binance has no
-        position-level SL — emulate by cancel-and-replace STOP_MARKET).
+        """Replace the active SL order for a symbol via the algo endpoint.
+
+        Binance migrated STOP_MARKET / TRAILING_STOP_MARKET to
+        /fapi/v1/algoOrder on 2025-12-09 (closePosition is forbidden there
+        on TRAILING_STOP_MARKET; STOP_MARKET also moved). This function
+        cancels any previously tracked SL and places a fresh STOP_MARKET
+        (or TRAILING_STOP_MARKET) as an algo order with
+        reduceOnly=true and quantity matching the current position size.
 
         Recognised fields: symbol, stopLoss, takeProfit (optional),
         trailingStop (optional), activePrice (optional).
+
+        Returns {"retCode":0, "result":{"orderId": "<algoId>", ...}}.
+        `noPosition: True` in result is returned only when no position
+        exists — caller must treat that as 'SL NOT armed'.
         """
         symbol = body["symbol"]
         new_sl = body.get("stopLoss")
         trailing = body.get("trailingStop")
-        # Active TP at position-level is rare in our flow; ignore for now.
 
-        # 1. Cancel existing SL order (tracked by us, falls back to scanning
-        #    open orders for an SL-tagged clientOrderId).
+        # 1. Cancel existing SL order. Routed by _cancel_by_order_id which
+        # checks _algo_orders set to pick the right endpoint.
         with self._sl_lock:
             old_sl = self._sl_orders.get(symbol)
         if old_sl:
@@ -814,13 +887,20 @@ class BinanceFutures:
             with self._sl_lock:
                 self._sl_orders.pop(symbol, None)
         else:
-            # Scan open orders for any *-SL clientOrderId we may have lost
+            # Scan algo + regular open orders for an SL-tagged clientId we lost.
             try:
                 for o in self.open_orders("linear", symbol):
                     cid = (o.get("orderLinkId") or "").split(":")
-                    # match Bybit-style "trade_id:SL" suffix only — leave others
                     if len(cid) == 2 and cid[1] == "SL":
                         self._cancel_by_order_id(symbol, str(o.get("orderId", "")))
+                        break
+            except Exception:
+                pass
+            try:
+                for ao in self.open_algo_orders(symbol):
+                    cid = (_decode_client_id(ao.get("clientAlgoId") or "")).split(":")
+                    if len(cid) == 2 and cid[1] == "SL":
+                        self._cancel_algo_order_by_id(ao.get("algoId"))
                         break
             except Exception:
                 pass
@@ -828,47 +908,59 @@ class BinanceFutures:
         if not new_sl and not trailing:
             return {"retCode": 0, "result": {}}
 
-        # 2. Determine SL side from current position
+        # 2. Determine SL side + qty from current position.
         side_close = self._closing_side(symbol)
-        if side_close is None:
-            # No position → nothing to protect; return ok.
+        pos_size = self._position_size(symbol)
+        if side_close is None or pos_size <= 0:
             return {"retCode": 0, "result": {"noPosition": True}}
 
         cid = f"sl-{symbol}-{int(time.time()*1000)}"[:36]
 
+        params: Dict[str, Any] = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": side_close,
+            "quantity": self._qty_str(symbol, pos_size),
+            "reduceOnly": "true",
+            "workingType": "MARK_PRICE",
+            "clientAlgoId": cid,
+            "newOrderRespType": "ACK",
+        }
         if trailing and not new_sl:
-            # Binance TRAILING_STOP_MARKET takes callbackRate in PERCENT
-            # (0.1–5). The Bybit-shape body sends `trailingStop` as an
-            # absolute price distance — we cannot translate without the
-            # current price. Caller must supply trailing as percent.
-            params = {
-                "symbol": symbol,
-                "side": side_close,
-                "type": "TRAILING_STOP_MARKET",
-                "callbackRate": _fmt_num(trailing),
-                "closePosition": "true",
-                "workingType": "MARK_PRICE",
-                "newClientOrderId": cid,
-                "newOrderRespType": "ACK",
-            }
+            params["type"] = "TRAILING_STOP_MARKET"
+            params["callbackRate"] = _fmt_num(trailing)
             if body.get("activePrice"):
-                params["activationPrice"] = self._price_str(symbol, body["activePrice"])
+                params["activatePrice"] = self._price_str(symbol, body["activePrice"])
         else:
-            params = {
-                "symbol": symbol,
-                "side": side_close,
-                "type": "STOP_MARKET",
-                "stopPrice": self._price_str(symbol, new_sl),
-                "closePosition": "true",
-                "workingType": "MARK_PRICE",
-                "priceProtect": "true",
-                "newClientOrderId": cid,
-                "newOrderRespType": "ACK",
-            }
-        resp = self._signed_request("POST", "/fapi/v1/order", params)
-        with self._sl_lock:
-            self._sl_orders[symbol] = str(resp.get("orderId"))
-        return {"retCode": 0, "result": resp}
+            params["type"] = "STOP_MARKET"
+            params["triggerPrice"] = self._price_str(symbol, new_sl)
+            params["priceProtect"] = "true"
+
+        resp = self._place_algo_order(params)
+        algo_id = str(resp.get("algoId", ""))
+        if algo_id:
+            with self._sl_lock:
+                self._sl_orders[symbol] = algo_id
+        return {"retCode": 0, "result": {"orderId": algo_id, "isAlgo": True, **resp}}
+
+    def _position_size(self, symbol: str) -> float:
+        """Returns the open position size for `symbol`, or 0 if none.
+        Prefers WS cache, falls back to REST. Swallows network errors so
+        callers can treat 0 as 'no position'."""
+        cached = self.get_cached_position_full(symbol)
+        if cached is not None:
+            size, _avg, _side = cached
+            if size > 0:
+                return float(size)
+        try:
+            for p in self.positions("linear", symbol):
+                if p.get("symbol") == symbol:
+                    sz = abs(float(p.get("size", 0) or 0))
+                    if sz > 0:
+                        return sz
+        except Exception:
+            pass
+        return 0.0
 
     def _closing_side(self, symbol: str) -> Optional[str]:
         """Return the order side that would CLOSE the open position on this
@@ -1041,16 +1133,20 @@ class BinanceFutures:
     def _cancel_reduce_only_for_symbol(self, symbol: str) -> None:
         """Cancel every open protective order on this symbol after one of
         them fires (TP/DCA siblings of a just-fired SL, OR an orphan
-        TRAILING_STOP_MARKET that didn't fire). Includes reduceOnly orders
-        AND closePosition orders — the latter because trailing-stops with
-        closePosition=true won't auto-cancel when the SL closes the
-        position to 0, and Binance lets them linger as orphans that could
-        misfire on a subsequent trade for the same symbol.
+        TRAILING_STOP_MARKET / STOP_MARKET that didn't fire).
+
+        Sweeps BOTH endpoints:
+          - /fapi/v1/openOrders   — regular orders (TPs, DCAs, legacy SL/TRAIL)
+          - /fapi/v1/openAlgoOrders — algo orders (SL/TRAIL post 2025-12-09)
+
+        Algos do NOT show up in the regular openOrders list, so without
+        this dual-sweep an algo-SL would linger as an orphan after the
+        position closes and could misfire on the next trade.
         """
         try:
             opens = self.open_orders("linear", symbol)
         except Exception:
-            return
+            opens = []
         for o in opens:
             # Cancel anything that's a position-closer: reduce-only OR
             # close-position (returned as closeOnTrigger in our Bybit-
@@ -1061,19 +1157,54 @@ class BinanceFutures:
             if oid:
                 self._cancel_by_order_id(symbol, oid)
 
-    def cancel_all_open_for_symbol(self, symbol: str) -> Dict[str, Any]:
-        """One-call cancel of every open order on a symbol via
-        DELETE /fapi/v1/allOpenOrders. Cleaner than enumerating + DELETE
-        per order when we want everything gone (e.g. after position close).
-        """
+        # Algo orders are reduce-only by construction in our flow (SL +
+        # TRAIL only). Cancel all of them.
         try:
-            return self._signed_request(
+            algos = self.open_algo_orders(symbol)
+        except Exception:
+            algos = []
+        for a in algos:
+            aid = a.get("algoId")
+            if aid is None:
+                continue
+            try:
+                self._cancel_algo_order_by_id(aid)
+            except Exception:
+                pass
+
+    def cancel_all_open_for_symbol(self, symbol: str) -> Dict[str, Any]:
+        """One-call cancel of every open order on a symbol. Hits BOTH
+        /fapi/v1/allOpenOrders (regular) AND every entry in
+        /fapi/v1/openAlgoOrders (algo). After 2025-12-09 algo-SL/TRAIL
+        orders are NOT cancelled by /fapi/v1/allOpenOrders, so this dual
+        path is required for true 'everything gone' semantics.
+        """
+        regular_ok = True
+        try:
+            self._signed_request(
                 "DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}
             )
         except BinanceAPIError as e:
-            if e.code in (-2011, -2013):
-                return {"code": 0, "msg": "nothing-to-cancel"}
-            raise
+            if e.code not in (-2011, -2013):
+                regular_ok = False
+                # don't raise — still try to clear algos
+
+        # Sweep algos one-by-one (no documented bulk endpoint that takes
+        # symbol-only filter that we trust to be present on all accounts).
+        try:
+            for a in self.open_algo_orders(symbol):
+                aid = a.get("algoId")
+                if aid is not None:
+                    try:
+                        self._cancel_algo_order_by_id(aid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        with self._sl_lock:
+            self._sl_orders.pop(symbol, None)
+        return {"code": 0, "msg": "ok" if regular_ok else "regular-partial"}
 
     def _handle_account_update(self, a: Dict[str, Any], on_wallet, on_position):
         """ACCOUNT_UPDATE.a contains B (balances) and P (positions)."""
@@ -1177,6 +1308,26 @@ def _wrap_order_response(resp: Any) -> Dict[str, Any]:
         "result": {
             "orderId": str(resp.get("orderId", "")),
             "orderLinkId": _decode_client_id(resp.get("clientOrderId", "")),
+        },
+    }
+
+
+def _wrap_algo_response(resp: Any) -> Dict[str, Any]:
+    """Convert an algo-order response → Bybit-style envelope.
+    The unique id field is `algoId` (LONG), not `orderId`. We surface it
+    in the `orderId` slot so downstream code that stores `trade["sl_order_id"]`
+    / `trade["trail_order_id"]` works unchanged. The cancel path uses
+    _is_algo_order_id() to route to the correct DELETE endpoint.
+    """
+    if not isinstance(resp, dict):
+        return {"retCode": 0, "result": {}}
+    return {
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {
+            "orderId": str(resp.get("algoId", "")),
+            "orderLinkId": _decode_client_id(resp.get("clientAlgoId", "")),
+            "isAlgo": True,
         },
     }
 
