@@ -666,28 +666,39 @@ def main():
                     "equity_at_entry": round(equity_now, 2) if equity_now > 0 else None,
                     "leverage": engine._effective_leverage(sig["symbol"]),
                 }
-                save_state(STATE_FILE, st)
             log.info(f"🟡 [WS] ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")
 
-            # ── Watch TP1 cross + Telegram (parallel ok, off critical path) ──
-            tps = sig.get("tp_prices") or []
-            tp1 = float(tps[0]) if tps else None
-            if tp1 and not DISABLE_ENTRY_WATCHER:
-                order_side = "Sell" if sig["side"] == "sell" else "Buy"
+            # ── SPEED-CRITICAL PATH ENDS HERE ──
+            # Order is placed and acked. Everything below is post-flight
+            # bookkeeping (state to disk, Telegram alert, optional entry-
+            # watcher) — moved to a daemon thread so this handler can
+            # return immediately and start processing the next signal.
+            # save_state takes 50-200ms (sync disk I/O on Railway).
+            # Telegram .send_entry_pending takes 100-300ms (sync HTTP).
+            # Together that's 150-500ms of latency we don't need to block on.
+            def _post_flight():
                 try:
-                    entry_watcher.watch(trade_id, sig["symbol"], order_side, tp1, oid)
+                    save_state(STATE_FILE, st)
                 except Exception as e:
-                    log.warning(f"entry_watcher.watch failed: {e}")
-
-            try:
-                telegram_alerts.send_entry_pending(
-                    symbol=sig["symbol"],
-                    side="Sell" if sig["side"] == "sell" else "Buy",
-                    entry=float(sig["trigger"]),
-                    qty=st["open_trades"][trade_id]["base_qty"]
-                )
-            except Exception as e:
-                log.warning(f"telegram alert failed: {e}")
+                    log.warning(f"save_state failed in post-flight: {e}")
+                tps = sig.get("tp_prices") or []
+                tp1 = float(tps[0]) if tps else None
+                if tp1 and not DISABLE_ENTRY_WATCHER:
+                    order_side = "Sell" if sig["side"] == "sell" else "Buy"
+                    try:
+                        entry_watcher.watch(trade_id, sig["symbol"], order_side, tp1, oid)
+                    except Exception as e:
+                        log.warning(f"entry_watcher.watch failed: {e}")
+                try:
+                    telegram_alerts.send_entry_pending(
+                        symbol=sig["symbol"],
+                        side="Sell" if sig["side"] == "sell" else "Buy",
+                        entry=float(sig["trigger"]),
+                        qty=st["open_trades"][trade_id]["base_qty"],
+                    )
+                except Exception as e:
+                    log.warning(f"telegram alert failed: {e}")
+            threading.Thread(target=_post_flight, daemon=True).start()
         except Exception:
             log.exception("[WS] fast_signal_handler crashed")
 
