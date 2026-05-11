@@ -39,8 +39,24 @@ from websocket import WebSocketApp
 # orderLinkId ↔ clientOrderId codec                                          #
 # --------------------------------------------------------------------------- #
 def _encode_link_id(link_id: str) -> str:
-    """Bybit `|`/`:` → Binance `_`/`-`. Truncate to 36 chars (Binance limit)."""
+    """Bybit `|`/`:` → Binance `_`/`-`. Truncate to 36 chars (Binance limit).
+
+    When the input exceeds 36 chars (typical for long-symbol trade-ids
+    like ``1000PEPEUSDT|sell|1762847234567:TRAIL`` = 37 chars), naive
+    right-truncation would chop the suffix character that _handle_order_
+    update relies on to detect SL/TRAIL fires. So if there's a short
+    trailing ``-SUFFIX`` we keep it intact and truncate the trade-id
+    portion from the front of the suffix instead.
+    """
     cid = link_id.replace("|", "_").replace(":", "-")
+    if len(cid) <= 36:
+        return cid
+    idx = cid.rfind("-")
+    if idx > 0 and len(cid) - idx <= 10:
+        suffix = cid[idx:]
+        prefix = cid[:idx]
+        prefix = prefix[: 36 - len(suffix)]
+        return prefix + suffix
     return cid[:36]
 
 
@@ -492,35 +508,65 @@ class BinanceFutures:
         """Place a Binance TRAILING_STOP_MARKET order.
 
         Per Binance USDT-M Futures API docs (POST /fapi/v1/order):
-          - callbackRate: 0.1 .. 5.0 (one decimal, % retrace from extreme)
+          - callbackRate: 0.1 .. 10.0 (one decimal, % retrace from extreme)
           - activationPrice: optional; defaults to mark/last at place-time.
             For SHORT (side=BUY) the trail arms when MARK price drops to
             activationPrice; the extreme then tracks the lowest mark seen
             and fires a MARKET BUY once mark retraces callbackRate %.
           - closePosition=true is mutually exclusive with quantity and
             reduceOnly. Must use one OR the other.
+          - priceProtect is NOT a valid param for TRAILING_STOP_MARKET
+            (only STOP/STOP_MARKET/TAKE_PROFIT/TAKE_PROFIT_MARKET) — would
+            be rejected with -1106. Omitted here.
+
+        Built-in fallbacks for live-trade robustness:
+          - If Binance rejects closePosition for this type (-1106), retry
+            with quantity + reduceOnly using the open position size.
+          - If activationPrice would immediately trigger (-2021 — mark
+            already crossed it), retry without activationPrice so Binance
+            defaults to the current mark.
         """
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-            "side": side,
-            "type": "TRAILING_STOP_MARKET",
-            "callbackRate": _fmt_num(callback_rate),
-            "workingType": "MARK_PRICE",
-            "priceProtect": "true",
-            "newClientOrderId": client_order_id,
-            "newOrderRespType": "ACK",
-        }
-        if close_position:
-            params["closePosition"] = "true"
-        elif quantity is not None:
-            params["quantity"] = self._qty_str(symbol, quantity)
-            params["reduceOnly"] = "true"
-        else:
-            raise RuntimeError("TRAILING_STOP_MARKET needs either closePosition=true OR quantity")
-        if activation_price is not None:
-            params["activationPrice"] = self._price_str(symbol, activation_price)
-        resp = self._signed_request("POST", "/fapi/v1/order", params)
-        return _wrap_order_response(resp)
+        def _build(use_close: bool, use_activation: bool) -> Dict[str, Any]:
+            p: Dict[str, Any] = {
+                "symbol": symbol,
+                "side": side,
+                "type": "TRAILING_STOP_MARKET",
+                "callbackRate": _fmt_num(callback_rate),
+                "workingType": "MARK_PRICE",
+                "newClientOrderId": client_order_id,
+                "newOrderRespType": "ACK",
+            }
+            if use_close:
+                p["closePosition"] = "true"
+            elif quantity is not None:
+                p["quantity"] = self._qty_str(symbol, quantity)
+                p["reduceOnly"] = "true"
+            else:
+                raise RuntimeError("TRAILING_STOP_MARKET needs closePosition=true OR quantity")
+            if use_activation and activation_price is not None:
+                p["activationPrice"] = self._price_str(symbol, activation_price)
+            return p
+
+        # First attempt: closePosition + activationPrice (intended config)
+        try:
+            resp = self._signed_request("POST", "/fapi/v1/order",
+                                         _build(close_position, True))
+            return _wrap_order_response(resp)
+        except BinanceAPIError as e:
+            # -1106: parameter sent when not required (e.g. closePosition on
+            # TRAILING_STOP_MARKET if the docs change)
+            if e.code == -1106 and close_position and quantity is not None:
+                resp = self._signed_request("POST", "/fapi/v1/order",
+                                             _build(False, True))
+                return _wrap_order_response(resp)
+            # -2021: order would immediately trigger (mark already past
+            # activationPrice) — retry without activationPrice so the
+            # exchange defaults it to the current mark.
+            if e.code == -2021 and activation_price is not None:
+                resp = self._signed_request("POST", "/fapi/v1/order",
+                                             _build(close_position, False))
+                return _wrap_order_response(resp)
+            raise
 
     def _place_conditional_limit(
         self,

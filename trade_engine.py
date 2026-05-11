@@ -562,7 +562,23 @@ class TradeEngine:
         if DRY_RUN:
             self.log.info(f"DRY_RUN cancel entry: {body}")
         else:
-            self.bybit.cancel_order(body)
+            try:
+                self.bybit.cancel_order(body)
+            except Exception as e:
+                self.log.debug(f"cancel_entry {symbol} {order_id}: {e}")
+            # Also kill the inline SL that was placed alongside this entry
+            # in the same batchOrders call. Without this it lingers as an
+            # orphaned STOP_MARKET closePosition=true and would fire on a
+            # subsequent trade for the same symbol (same-symbol race).
+            if trade_id:
+                try:
+                    self.bybit.cancel_order({
+                        "category": CATEGORY,
+                        "symbol": symbol,
+                        "orderLinkId": f"{trade_id}:SL",
+                    })
+                except Exception as e:
+                    self.log.debug(f"orphan-SL cancel for {symbol}: {e}")
         if self.entry_watcher:
             # Pass trade_id so we don't accidentally clear watches for
             # OTHER pending trades on the same symbol (rare but real
