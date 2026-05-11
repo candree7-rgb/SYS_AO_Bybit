@@ -1571,6 +1571,19 @@ class TradeEngine:
                             except Exception as e:
                                 self.log.error(f"❌ FAILED to force close {tr['symbol']}: {e}")
                                 self.log.error(f"   ⚠️ MANUAL INTERVENTION REQUIRED!")
+                                # Page operator via Telegram — this is the
+                                # last-ditch close attempt for an orphan
+                                # position; if it fails the position is
+                                # running unprotected until manually closed.
+                                try:
+                                    import telegram_alerts
+                                    telegram_alerts.send_message(
+                                        f"🚨 {tr['symbol']}: EMERGENCY CLOSE FAILED ({e}). "
+                                        f"Position may be open and unprotected — "
+                                        f"close manually in Binance NOW."
+                                    )
+                                except Exception:
+                                    pass
                                 # Don't mark trade as closed if we couldn't close the position
                                 continue
 

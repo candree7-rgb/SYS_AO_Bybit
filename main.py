@@ -272,9 +272,27 @@ def main():
             # If no tracked symbols, still prime account-wide so the
             # _algo_orders set covers any straggler from a previous crash
             # that startup_sync will want to clean up.
-            primed = bybit.prime_algo_orders(tracked_syms or None)
+            prime_result = bybit.prime_algo_orders(tracked_syms or None)
+            primed = prime_result.get("count", 0)
+            sl_count = prime_result.get("sl_count", 0)
+            trails_by_tid = prime_result.get("trails_by_trade_id", {}) or {}
             if primed:
-                log.info(f"♻️  Primed {primed} algo order(s) from Binance into in-memory cache")
+                log.info(
+                    f"♻️  Primed {primed} algo order(s) ({sl_count} SLs, "
+                    f"{len(trails_by_tid)} TRAILs) from Binance into in-memory cache"
+                )
+            # Hydrate trail_order_id on open trades so the idempotency check
+            # in _place_trailing_stop_orders does NOT place a second TRAIL
+            # for a trade whose trail was already armed pre-restart.
+            if trails_by_tid:
+                with state_lock:
+                    hydrated = 0
+                    for trade_id, trade in st.get("open_trades", {}).items():
+                        if trade_id in trails_by_tid and not trade.get("trail_order_id"):
+                            trade["trail_order_id"] = trails_by_tid[trade_id]
+                            hydrated += 1
+                    if hydrated:
+                        log.info(f"♻️  Hydrated trail_order_id on {hydrated} open trade(s)")
         except Exception as e:
             log.warning(f"prime_algo_orders failed: {e} (continuing — first-cancel will be slower)")
 

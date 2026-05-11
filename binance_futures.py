@@ -670,6 +670,19 @@ class BinanceFutures:
                     "_place_algo_order: loop exited with no response and no recorded error"
                 )
             raise last_err
+        # Check algoStatus — Binance can return 200 OK with algoStatus=REJECTED
+        # or EXPIRED at place time (e.g. reduceOnly fails because position is
+        # already closed). Without this check the caller would believe the SL
+        # was armed and write the algoId into _sl_orders / sl_set_inline=True,
+        # leaving the next trade unprotected. Treat terminal-non-active states
+        # as a placement failure.
+        algo_status = (resp.get("algoStatus") or "").upper()
+        if algo_status in ("REJECTED", "EXPIRED", "CANCELED"):
+            raise BinanceAPIError(
+                -1,
+                f"algo place returned algoStatus={algo_status}: {resp.get('msg', '')}",
+                resp,
+            )
         algo_id = resp.get("algoId")
         if algo_id is not None:
             with self._algo_lock:
@@ -712,7 +725,7 @@ class BinanceFutures:
         with self._algo_lock:
             return str(order_id) in self._algo_orders
 
-    def prime_algo_orders(self, symbols: Optional[List[str]] = None) -> int:
+    def prime_algo_orders(self, symbols: Optional[List[str]] = None) -> Dict[str, Any]:
         """Populate the in-memory _algo_orders set and _sl_orders dict from
         whatever algo orders are currently live on Binance. Call this once
         on boot (between state-load and gateway-start) so the post-restart
@@ -727,20 +740,29 @@ class BinanceFutures:
              the legacy `:SL` / `-SL` suffix scan, so without priming the
              scan misses it → bot might place a second algo SL.)
 
+          3. Skip placing a duplicate TRAIL by hydrating
+             trade["trail_order_id"] in the caller (main.py). The trail
+             cid is `{trade_id}:TRAIL` which decodes from `-TRAIL` after
+             _encode_link_id. Caller looks up algoId via the returned
+             `trails_by_trade_id` mapping and writes it into the trade
+             state BEFORE place_post_entry_orders runs.
+
         Args:
             symbols: list to limit the query to (one /fapi/v1/openAlgoOrders
                 call per symbol). If None, makes a single call without a
-                symbol param which returns ALL open algos account-wide
-                (cheaper, preferred). Pass an explicit symbol list only
-                when you want to scope to known-tradable symbols (e.g.
-                to ignore stale algos on delisted pairs).
+                symbol param which returns ALL open algos account-wide.
         Returns:
-            number of algos primed into _algo_orders.
+            dict with:
+              - "count": total algos primed
+              - "sl_count": algo-SLs added to _sl_orders
+              - "trails_by_trade_id": {trade_id: algoId} for TRAIL algos —
+                caller must apply these to the corresponding state entries.
         Errors are swallowed; this is best-effort.
         Reference: /fapi/v1/openAlgoOrders (no `symbol` param → all open).
         """
         primed = 0
         sl_primed = 0
+        trails_by_trade_id: Dict[str, str] = {}
         try:
             if symbols:
                 algos: List[Dict[str, Any]] = []
@@ -752,7 +774,7 @@ class BinanceFutures:
             else:
                 algos = self.open_algo_orders()
         except Exception:
-            return 0
+            return {"count": 0, "sl_count": 0, "trails_by_trade_id": {}}
 
         for ao in algos:
             aid = str(ao.get("algoId") or "")
@@ -761,9 +783,6 @@ class BinanceFutures:
             with self._algo_lock:
                 self._algo_orders.add(aid)
                 primed += 1
-            # If this algo is an SL we placed (cid starts with "sl-" or
-            # ends with -SL/:SL), populate _sl_orders so set_trading_stop
-            # finds it and replaces in place instead of placing a duplicate.
             sym = ao.get("symbol")
             cid_raw = _decode_client_id(ao.get("clientAlgoId") or "")
             cid_parts = cid_raw.split(":")
@@ -772,14 +791,30 @@ class BinanceFutures:
                 or cid_raw.endswith("-SL")
                 or (len(cid_parts) == 2 and cid_parts[1] == "SL")
             )
+            is_trail = (
+                cid_raw.endswith("-TRAIL")
+                or (len(cid_parts) == 2 and cid_parts[1] == "TRAIL")
+            )
             if is_sl and sym:
                 with self._sl_lock:
-                    # Don't overwrite if we somehow already have one for
-                    # this symbol (shouldn't happen at boot — _sl_orders is
-                    # empty — but guards against re-priming during runtime).
                     self._sl_orders.setdefault(sym, aid)
                     sl_primed += 1
-        return primed
+            elif is_trail:
+                # Recover the trade_id from the cid. Both forms produce a
+                # `{trade_id}:TRAIL` or `{trade_id}-TRAIL` shape. Strip suffix.
+                if cid_raw.endswith("-TRAIL"):
+                    trade_id = cid_raw[: -len("-TRAIL")]
+                elif cid_raw.endswith(":TRAIL"):
+                    trade_id = cid_raw[: -len(":TRAIL")]
+                else:
+                    trade_id = ""
+                if trade_id:
+                    trails_by_trade_id[trade_id] = aid
+        return {
+            "count": primed,
+            "sl_count": sl_primed,
+            "trails_by_trade_id": trails_by_trade_id,
+        }
 
     def _place_trailing_stop_market(
         self,
