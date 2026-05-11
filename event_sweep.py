@@ -8,7 +8,7 @@ from tick_precise_backtest import (
     cache_path_tick, date_str, compound, LEV, TP_PCTS, FEE_M, FEE_T, SLIP
 )
 
-EVENTS_PATH = 'data/tick_events.json.gz'
+EVENTS_PATH = 'data/tick_events_v2.json.gz'
 
 def first_cross_above(ticks, level, t_start):
     for tm, p in ticks:
@@ -94,7 +94,12 @@ def build_events():
 
         ev['entry_t'] = entry_t
 
-        # SINGLE pass: track all interesting first-cross times
+        # CORRECTED LOGIC (v2): be_hit_t records FIRST cross of be-level
+        # AFTER tp1_t, not after entry_t. Reason: the BE-stop is only
+        # ARMED once tp1 fills — checking earlier crosses is wrong (those
+        # would have been the entry itself or pre-tp1 noise that the bot
+        # ignores). Old v1 events undercounted BE-fires by including the
+        # immediate post-entry tick where price was naturally > be-level.
         sl_levels = {sl: trigger * (1 + sl/100) for sl in SLS}
         be_levels = {be: trigger * (1 - be/100) for be in BES}
 
@@ -102,7 +107,9 @@ def build_events():
         be_hit_t = {be: None for be in BES}
         tp1_t = tp2_t = tp3_t = None
 
-        for tm, p in all_ticks:
+        # Phase A: pre-tp1 — only track tp* and sl
+        idx = 0
+        for idx, (tm, p) in enumerate(all_ticks):
             if tp1_t is None and p <= tp1:
                 tp1_t = tm
             if tp2_t is None and p <= tp2:
@@ -112,14 +119,28 @@ def build_events():
             for sl in SLS:
                 if sl_hit_t[sl] is None and p >= sl_levels[sl]:
                     sl_hit_t[sl] = tm
-            for be in BES:
-                if be_hit_t[be] is None and p >= be_levels[be]:
-                    be_hit_t[be] = tm
-            # Early exit: if everything tracked, stop
-            if (tp1_t and tp2_t and tp3_t and
-                all(v is not None for v in sl_hit_t.values()) and
-                all(v is not None for v in be_hit_t.values())):
-                break
+            if tp1_t is not None:
+                break  # exit phase A once tp1 hit
+
+        # Phase B: post-tp1 — also track be_hit_t (which is now properly
+        # the first cross AFTER tp1, matching the bot's BE-stop arm time).
+        if tp1_t is not None:
+            for tm, p in all_ticks[idx:]:
+                if tp2_t is None and p <= tp2:
+                    tp2_t = tm
+                if tp3_t is None and p <= tp3:
+                    tp3_t = tm
+                for sl in SLS:
+                    if sl_hit_t[sl] is None and p >= sl_levels[sl]:
+                        sl_hit_t[sl] = tm
+                for be in BES:
+                    if be_hit_t[be] is None and p >= be_levels[be]:
+                        be_hit_t[be] = tm
+                # Early exit
+                if (tp2_t and tp3_t and
+                    all(v is not None for v in sl_hit_t.values()) and
+                    all(v is not None for v in be_hit_t.values())):
+                    break
 
         ev['tp1_t'] = tp1_t; ev['tp2_t'] = tp2_t; ev['tp3_t'] = tp3_t
         ev['sl_hit_t'] = sl_hit_t
