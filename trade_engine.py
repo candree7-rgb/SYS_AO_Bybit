@@ -642,13 +642,32 @@ class TradeEngine:
                 "stopLoss": f"{sl_price:.10f}",
                 "tpslMode": "Full",
             }
+            sl_armed = False
             try:
                 if DRY_RUN:
                     self.log.info(f"DRY_RUN set SL (trail-mode fallback): {ts_body}")
+                    sl_armed = True
                 else:
-                    self.bybit.set_trading_stop(ts_body)
-                self.log.info(f"✅ Hard SL set @ {sl_price} (trail-mode fallback)")
-                trade["sl_set_inline"] = True  # mark as armed
+                    resp = self.bybit.set_trading_stop(ts_body)
+                    # set_trading_stop may silently no-op when the position
+                    # cache lag / REST fail makes _closing_side return None:
+                    # it then returns {"noPosition": True} with retCode 0.
+                    # Treat that — and any response without orderId — as
+                    # a failure so we don't falsely mark sl_set_inline.
+                    result = (resp or {}).get("result") or {}
+                    if result.get("noPosition"):
+                        raise RuntimeError(
+                            f"set_trading_stop returned noPosition for {symbol} — "
+                            f"SL was NOT armed"
+                        )
+                    if not result.get("orderId"):
+                        raise RuntimeError(
+                            f"set_trading_stop returned no orderId for {symbol}: {result}"
+                        )
+                    sl_armed = True
+                if sl_armed:
+                    self.log.info(f"✅ Hard SL set @ {sl_price} (trail-mode fallback)")
+                    trade["sl_set_inline"] = True
             except Exception as e:
                 self.log.error(
                     f"🚨 CRITICAL: SL fallback FAILED for {symbol} @ {sl_price}: {e} — "
@@ -657,10 +676,17 @@ class TradeEngine:
                 try:
                     import telegram_alerts
                     telegram_alerts.send_message(
-                        f"🚨 {symbol}: SL set FAILED — check manually!"
+                        f"🚨 {symbol}: SL set FAILED ({type(e).__name__}: {e}) — "
+                        f"check manually!"
                     )
                 except Exception:
                     pass
+
+        # ── Idempotency: don't place a second TRAIL on retry/restart ──
+        if trade.get("trail_order_id"):
+            self.log.info(f"Trail already armed for {symbol} (oid={trade['trail_order_id']}); skipping")
+            trade["post_orders_placed"] = True
+            return
 
         # ── Braces: trailing stop ──
         body = {
