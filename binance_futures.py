@@ -622,8 +622,12 @@ class BinanceFutures:
         return resp
 
     def _cancel_algo_order_by_id(self, algo_id: Any) -> Dict[str, Any]:
-        """DELETE /fapi/v1/algoOrder by algoId. Idempotent on -2011-like
+        """DELETE /fapi/v1/algoOrder by algoId. Idempotent on
         'unknown algo order' errors. Note: this endpoint does NOT take symbol.
+        Error codes (Binance USDS-M Futures error-code page):
+          -2011 UNKNOWN_ORDER (algo already filled or cancelled)
+          -2013 ORDER_DOES_NOT_EXIST
+        Both mean the algo is already gone — treat as idempotent success.
         """
         try:
             resp = self._signed_request(
@@ -633,9 +637,7 @@ class BinanceFutures:
                 self._algo_orders.discard(str(algo_id))
             return resp
         except BinanceAPIError as e:
-            # -2011 "Unknown order" and -4046 / -4150 "algo order not found"
-            # both mean it's already gone (filled or cancelled). Idempotent.
-            if e.code in (-2011, -4046):
+            if e.code in (-2011, -2013):
                 with self._algo_lock:
                     self._algo_orders.discard(str(algo_id))
                 return {"alreadyClosed": True}
@@ -860,10 +862,13 @@ class BinanceFutures:
                 "DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}
             )
         except BinanceAPIError as e:
-            # If the regular endpoint says -2011 / -1102 unknown id, the
-            # order may actually be an algo we forgot to track (e.g. across
-            # a restart with no persistent _algo_orders set). Try algo too.
-            if e.code in (-2011, -1102, -2013):
+            # If the regular endpoint says -2011 UNKNOWN_ORDER or -2013
+            # ORDER_DOES_NOT_EXIST, the id may actually be an algo we
+            # forgot to track (e.g. across a restart with an empty
+            # in-memory _algo_orders set). Try the algo endpoint as
+            # fallback. -1102 is "malformed query" — that's a real bug,
+            # not a routing miss, so we let it propagate to logs.
+            if e.code in (-2011, -2013):
                 try:
                     self._cancel_algo_order_by_id(order_id)
                 except Exception:
@@ -1136,6 +1141,8 @@ class BinanceFutures:
                 self._handle_order_update(msg.get("o") or {}, on_execution, on_order)
             elif ev_type == "ACCOUNT_UPDATE":
                 self._handle_account_update(msg.get("a") or {}, on_wallet, on_position)
+            elif ev_type == "ALGO_UPDATE":
+                self._handle_algo_update(msg.get("o") or {}, on_order)
             elif ev_type == "listenKeyExpired":
                 # Force reconnect via on_error
                 if on_error:
@@ -1179,21 +1186,35 @@ class BinanceFutures:
         }
         if x == "TRADE":
             on_execution(ev)
-            # Position-closing order just fired (SL or TRAIL or one of the
-            # TPs). Binance does NOT auto-cancel sibling closePosition or
-            # reduceOnly orders when one closes the position to 0 — without
-            # explicit cleanup the orphans sit and could misfire on the
-            # next trade for the same symbol. Cancel ALL open closers.
+            # Position-closing order just fired (SL or TRAIL). Binance does
+            # NOT auto-cancel sibling reduceOnly/closePosition orders when
+            # one closes the position to 0 — without explicit cleanup the
+            # orphans sit and could misfire on the next trade for the same
+            # symbol. Cancel ALL open closers in that case.
             #
-            # IMPORTANT post-algoOrder migration: when an algo SL or TRAIL
-            # fires, Binance spawns a regular MARKET order whose:
-            #   - `o` (type) is `MARKET`, NOT STOP_MARKET/TRAILING_STOP_MARKET
-            #   - `c` (clientOrderId) is auto-generated, NOT our clientAlgoId
-            # So suffix and type checks alone miss algo triggers. We also
-            # match `reduceOnly==true AND fill completed the order`, which
-            # catches the spawned market regardless of how it was named.
+            # IMPORTANT: distinguish a true position-closing event from a
+            # partial TP LIMIT fill. A LIMIT reduceOnly TP that fills its
+            # own qty completely is `closed_fully=True` but the underlying
+            # position likely still has volume (DCA-grown size, or another
+            # TP slice). Sweeping reduceOnly siblings on a TP fill would
+            # cancel the still-needed SL/TRAIL → naked position.
+            #
+            # The narrow set of events that DO justify a sweep:
+            #   - cid suffix marks our SL/TRAIL (legacy inline-SL had :SL,
+            #     trail body has :TRAIL, set_trading_stop algo SL has
+            #     prefix "sl-")
+            #   - order_type is STOP_MARKET / TRAILING_STOP_MARKET (the
+            #     legacy /fapi/v1/order path before the algo migration)
+            #   - order_type is MARKET AND reduceOnly AND closed_fully —
+            #     this is the spawned market order created when a
+            #     /fapi/v1/algoOrder STOP_MARKET or TRAILING_STOP_MARKET
+            #     triggers. (Binance docs don't enumerate the spawned
+            #     order's fields; the cid is auto-generated, so neither
+            #     suffix nor type matches without this branch.)
             cid_str = str(cid)
-            is_sl = cid_str.endswith("-SL") or cid_str.endswith(":SL")
+            is_sl = (cid_str.endswith("-SL")
+                     or cid_str.endswith(":SL")
+                     or cid_str.startswith("sl-"))
             is_trail = cid_str.endswith("-TRAIL") or cid_str.endswith(":TRAIL")
             order_type = (o.get("o") or "").upper()
             reduce_only = bool(o.get("R"))
@@ -1203,9 +1224,10 @@ class BinanceFutures:
             except (TypeError, ValueError):
                 cum_qty = orig_qty = 0.0
             closed_fully = orig_qty > 0 and cum_qty >= orig_qty
+            is_algo_spawn = (order_type == "MARKET" and reduce_only and closed_fully)
             if (is_sl or is_trail
                     or order_type in ("STOP_MARKET", "TRAILING_STOP_MARKET")
-                    or (reduce_only and closed_fully)):
+                    or is_algo_spawn):
                 sym = o.get("s")
                 if is_sl:
                     with self._sl_lock:
@@ -1318,6 +1340,55 @@ class BinanceFutures:
         if not algo_ok:
             msg_parts.append("algo-partial")
         return {"code": -1, "msg": ",".join(msg_parts), "algoCancelled": algo_count}
+
+    def _handle_algo_update(self, o: Dict[str, Any], on_order):
+        """ALGO_UPDATE event payload — algo-order lifecycle transitions
+        (NEW → TRIGGERING → TRIGGERED / CANCELED / REJECTED / EXPIRED /
+        FINISHED). Replaces the deprecated CONDITIONAL_ORDER_TRIGGER_REJECT
+        event since 2025-12-09.
+
+        We use this purely for state-tracking and visibility:
+          - Drop the algoId from _algo_orders / _sl_orders on terminal
+            states so a stale id can't survive into the next trade.
+          - Log REJECTED loudly — a rejection here (e.g. reduceOnly fails
+            because position already closed) is a safety event that the
+            old code would have silently missed.
+
+        Actual position close is still driven by the ORDER_TRADE_UPDATE
+        for the spawned market order — that's where _cancel_reduce_only_
+        for_symbol() fires from. This handler is supplementary, not
+        load-bearing on the protective path.
+        """
+        aid = str(o.get("aid", ""))
+        sym = o.get("s")
+        status = (o.get("X") or "").upper()
+        cid = o.get("caid") or ""
+        ot = (o.get("o") or "").upper()
+        if status in ("CANCELED", "FINISHED", "EXPIRED", "REJECTED"):
+            with self._algo_lock:
+                self._algo_orders.discard(aid)
+            if sym:
+                with self._sl_lock:
+                    tracked = self._sl_orders.get(sym)
+                    if tracked == aid:
+                        self._sl_orders.pop(sym, None)
+        if status == "REJECTED":
+            # Surface this — a silent reject would have hidden e.g. a
+            # reduceOnly-on-zero-position rejection that means our SL
+            # never armed. Forwarded via on_order so trade_engine can
+            # alert if it cares.
+            try:
+                if on_order:
+                    on_order({
+                        "algoUpdate": True,
+                        "algoId": aid,
+                        "clientAlgoId": _decode_client_id(cid),
+                        "symbol": sym,
+                        "orderType": ot,
+                        "status": status,
+                    })
+            except Exception:
+                pass
 
     def _handle_account_update(self, a: Dict[str, Any], on_wallet, on_position):
         """ACCOUNT_UPDATE.a contains B (balances) and P (positions)."""

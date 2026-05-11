@@ -1201,7 +1201,26 @@ class TradeEngine:
 
         for attempt in range(max_retries):
             try:
-                self.bybit.set_trading_stop(body)
+                resp = self.bybit.set_trading_stop(body)
+                # set_trading_stop returns {"result": {"noPosition": True}}
+                # when the position cache reports size=0 — that means the
+                # SL was NOT armed (or the position was already closed).
+                # Treat as failure and retry; the last-attempt path will
+                # log + return False just like an exception would.
+                result = (resp or {}).get("result") or {}
+                if result.get("noPosition"):
+                    if attempt < max_retries - 1:
+                        self.log.warning(
+                            f"SL move attempt {attempt+1}: noPosition for {symbol} "
+                            f"— retrying in 100ms..."
+                        )
+                        time.sleep(0.1)
+                        continue
+                    self.log.warning(
+                        f"⚠️ SL move {symbol}: position size = 0, no SL armed "
+                        f"(position already closed?)"
+                    )
+                    return False
                 return True
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -1574,22 +1593,28 @@ class TradeEngine:
                     del self.state["open_trades"][tid]
 
     def _cancel_all_trade_orders(self, trade: Dict[str, Any]) -> None:
-        """Cancel all pending DCA and TP orders for a closed trade."""
+        """Cancel all pending orders for a closed trade — DCA, TP, SL, TRAIL.
+
+        Must sweep BOTH endpoints since the algo-order migration: algo SL
+        and algo TRAIL do NOT appear in /fapi/v1/openOrders. Without the
+        algo sweep, an algo SL/TRAIL would linger and could misfire on the
+        next trade for the same symbol (reduceOnly=true makes the misfire
+        a no-op on zero position, but a NEW position would be wrongly
+        closed).
+        """
         if DRY_RUN:
             self.log.info(f"DRY_RUN: Would cancel orders for {trade['symbol']}")
             return
 
         symbol = trade["symbol"]
         trade_id = trade["id"]
+        cancelled = 0
 
+        # ── Regular orders (LIMIT TPs, conditional DCAs) ──
         try:
-            # Get all open orders for this symbol
             open_orders = self.bybit.open_orders(CATEGORY, symbol)
-
-            cancelled = 0
             for order in open_orders:
                 link_id = order.get("orderLinkId") or ""
-                # Check if this order belongs to our trade (DCA or TP)
                 if link_id.startswith(trade_id + ":"):
                     order_id = order.get("orderId")
                     if order_id:
@@ -1602,15 +1627,32 @@ class TradeEngine:
                             cancelled += 1
                             self.log.info(f"🗑️ Cancelled orphan order: {link_id}")
                         except Exception as e:
-                            # Ignore "order not found" errors
                             if "not found" not in str(e).lower():
                                 self.log.warning(f"Failed to cancel {link_id}: {e}")
-
-            if cancelled > 0:
-                self.log.info(f"🧹 Cleaned up {cancelled} pending order(s) for {symbol}")
-
         except Exception as e:
-            self.log.warning(f"Failed to cleanup orders for {symbol}: {e}")
+            self.log.warning(f"Failed to cleanup regular orders for {symbol}: {e}")
+
+        # ── Algo orders (algo SL via set_trading_stop, algo TRAIL) ──
+        try:
+            algos = self.bybit.open_algo_orders(symbol)
+            for ao in algos:
+                cid_raw = ao.get("clientAlgoId") or ""
+                # Match either trade-id prefix (TRAIL: "<trade_id>:TRAIL")
+                # or the sl- prefix used by set_trading_stop for algo SL.
+                if cid_raw.startswith(trade_id + ":") or cid_raw.startswith("sl-"):
+                    aid = ao.get("algoId")
+                    if aid is not None:
+                        try:
+                            self.bybit._cancel_algo_order_by_id(aid)
+                            cancelled += 1
+                            self.log.info(f"🗑️ Cancelled orphan algo: {cid_raw} (algoId={aid})")
+                        except Exception as e:
+                            self.log.warning(f"Failed to cancel algo {cid_raw}: {e}")
+        except Exception as e:
+            self.log.warning(f"Failed to cleanup algo orders for {symbol}: {e}")
+
+        if cancelled > 0:
+            self.log.info(f"🧹 Cleaned up {cancelled} pending order(s) for {symbol}")
 
     def _export_trade_to_db(self, trade: Dict[str, Any]) -> None:
         """Export trade to PostgreSQL database immediately after close."""
