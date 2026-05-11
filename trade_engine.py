@@ -731,7 +731,34 @@ class TradeEngine:
                 except Exception:
                     pass
 
-        trade["post_orders_placed"] = True
+        # Only mark post-orders placed if AT LEAST ONE protection leg armed.
+        # If both the hard-SL belt AND the trail failed (e.g. the algo place
+        # exhausted its 3 retries on transient 5xx and surfaced as an
+        # exception that we caught + telegram-alerted above), leaving this
+        # flag False makes the main loop retry on the next tick
+        # (main.py:821: `if status==open and not post_orders_placed:
+        # place_post_entry_orders(tr)`). Without this gate a failed-retry
+        # trade would be permanently stuck unprotected.
+        # NB: sl_set_inline is set EITHER by the inline-SL on the entry
+        # batchOrders (place_entry path) OR by the trail-mode fallback above
+        # at line ~675; both mean a hard STOP_MARKET is live on the
+        # position. trail_order_id is set only on successful trail place.
+        sl_armed = bool(trade.get("sl_set_inline"))
+        trail_armed = bool(trade.get("trail_order_id"))
+        if sl_armed or trail_armed:
+            trade["post_orders_placed"] = True
+        else:
+            self.log.error(
+                f"🚨 {symbol}: NEITHER hard SL nor trail armed — leaving "
+                f"post_orders_placed=False so main loop retries next tick"
+            )
+            try:
+                import telegram_alerts
+                telegram_alerts.send_message(
+                    f"🚨 {symbol}: BOTH protection legs failed — will retry next tick"
+                )
+            except Exception:
+                pass
 
     def place_post_entry_orders(self, trade: Dict[str, Any]) -> None:
         """Places SL + TP ladder + DCA conditionals after entry is filled.

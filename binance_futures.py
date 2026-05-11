@@ -22,6 +22,7 @@ Key translations
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 import hmac
@@ -34,6 +35,11 @@ from urllib.parse import urlencode
 import requests
 from requests.adapters import HTTPAdapter
 from websocket import WebSocketApp
+
+# Module-level logger. Used for telemetry that doesn't have a caller-supplied
+# logger (e.g. WS-event handlers that fire on the WS thread). Falls back to
+# root logger config from main.py setup_logging().
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -576,10 +582,20 @@ class BinanceFutures:
           - -4015 / -1102 duplicate-clientAlgoId is handled by looking
             up the existing algo via openAlgoOrders. Makes retries safe
             against a network timeout that was actually delivered.
+          - -4061 ORDER_HEDGE_MODE_NOT_MATCH (user toggled Hedge Mode in
+            the Binance app mid-run): every reduceOnly algo place would
+            fail forever. On first occurrence we force One-Way via
+            /fapi/v1/positionSide/dual (idempotent) and retry the place
+            ONCE. A second -4061 in the same call means the recovery
+            didn't stick (e.g. account has open Hedge-Mode positions
+            blocking the switch — Binance rejects the toggle with -4068
+            then) → raise so the caller can surface it. Reference:
+            https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code
         """
         last_err: Optional[Exception] = None
         backoffs = [0.0, 0.08, 0.20]  # 3 attempts incl. first
         resp: Optional[Dict[str, Any]] = None
+        hedge_recovery_tried = False
         for delay in backoffs:
             if delay:
                 time.sleep(delay)
@@ -599,6 +615,36 @@ class BinanceFutures:
                             break
                     except Exception:
                         pass
+                if e.code == -4061 and not hedge_recovery_tried:
+                    # Hedge-Mode-vs-One-Way mismatch. Try to force One-Way
+                    # mode account-wide and retry the place exactly once.
+                    hedge_recovery_tried = True
+                    sym = params.get("symbol", "?")
+                    try:
+                        self.set_position_mode_one_way()
+                        try:
+                            import telegram_alerts
+                            telegram_alerts.send_message(
+                                f"⚠️ {sym}: -4061 Hedge-Mode mismatch detected — "
+                                f"forced One-Way mode and retrying algo place. "
+                                f"Check that Binance app didn't toggle Hedge Mode mid-run."
+                            )
+                        except Exception:
+                            pass
+                        last_err = e
+                        continue
+                    except Exception as recovery_err:
+                        # Recovery itself failed (e.g. -4068 open positions
+                        # blocking the toggle). Surface the original -4061.
+                        try:
+                            import telegram_alerts
+                            telegram_alerts.send_message(
+                                f"🚨 {sym}: -4061 recovery FAILED ({recovery_err}). "
+                                f"Algo place will fail — fix Hedge Mode manually."
+                            )
+                        except Exception:
+                            pass
+                        raise e
                 if e.code == -1003:  # TOO_MANY_REQUESTS — retry
                     last_err = e
                     continue
@@ -613,7 +659,16 @@ class BinanceFutures:
                     continue
                 raise
         if resp is None:
-            assert last_err is not None
+            # All retries exhausted. last_err must be set because the only
+            # path that breaks out of the loop without resp is the one that
+            # raises directly (handled above) — so if we got here without a
+            # resp it's because every attempt recorded a retryable error.
+            # Use a real raise instead of assert (which is stripped under
+            # `python -O`).
+            if last_err is None:
+                raise RuntimeError(
+                    "_place_algo_order: loop exited with no response and no recorded error"
+                )
             raise last_err
         algo_id = resp.get("algoId")
         if algo_id is not None:
@@ -656,6 +711,75 @@ class BinanceFutures:
     def _is_algo_order_id(self, order_id: str) -> bool:
         with self._algo_lock:
             return str(order_id) in self._algo_orders
+
+    def prime_algo_orders(self, symbols: Optional[List[str]] = None) -> int:
+        """Populate the in-memory _algo_orders set and _sl_orders dict from
+        whatever algo orders are currently live on Binance. Call this once
+        on boot (between state-load and gateway-start) so the post-restart
+        bot can:
+
+          1. Route _cancel_by_order_id straight to /fapi/v1/algoOrder
+             without paying the regular-endpoint -2013 RTT fallback first.
+
+          2. Skip placing a duplicate SL when set_trading_stop is invoked
+             on a position whose SL was already armed before the restart
+             (the new algo-SL cid `sl-{symbol}-{ts}-{rnd}` doesn't match
+             the legacy `:SL` / `-SL` suffix scan, so without priming the
+             scan misses it → bot might place a second algo SL.)
+
+        Args:
+            symbols: list to limit the query to (one /fapi/v1/openAlgoOrders
+                call per symbol). If None, makes a single call without a
+                symbol param which returns ALL open algos account-wide
+                (cheaper, preferred). Pass an explicit symbol list only
+                when you want to scope to known-tradable symbols (e.g.
+                to ignore stale algos on delisted pairs).
+        Returns:
+            number of algos primed into _algo_orders.
+        Errors are swallowed; this is best-effort.
+        Reference: /fapi/v1/openAlgoOrders (no `symbol` param → all open).
+        """
+        primed = 0
+        sl_primed = 0
+        try:
+            if symbols:
+                algos: List[Dict[str, Any]] = []
+                for sym in symbols:
+                    try:
+                        algos.extend(self.open_algo_orders(sym))
+                    except Exception:
+                        continue
+            else:
+                algos = self.open_algo_orders()
+        except Exception:
+            return 0
+
+        for ao in algos:
+            aid = str(ao.get("algoId") or "")
+            if not aid:
+                continue
+            with self._algo_lock:
+                self._algo_orders.add(aid)
+                primed += 1
+            # If this algo is an SL we placed (cid starts with "sl-" or
+            # ends with -SL/:SL), populate _sl_orders so set_trading_stop
+            # finds it and replaces in place instead of placing a duplicate.
+            sym = ao.get("symbol")
+            cid_raw = _decode_client_id(ao.get("clientAlgoId") or "")
+            cid_parts = cid_raw.split(":")
+            is_sl = (
+                cid_raw.startswith("sl-")
+                or cid_raw.endswith("-SL")
+                or (len(cid_parts) == 2 and cid_parts[1] == "SL")
+            )
+            if is_sl and sym:
+                with self._sl_lock:
+                    # Don't overwrite if we somehow already have one for
+                    # this symbol (shouldn't happen at boot — _sl_orders is
+                    # empty — but guards against re-priming during runtime).
+                    self._sl_orders.setdefault(sym, aid)
+                    sl_primed += 1
+        return primed
 
     def _place_trailing_stop_market(
         self,
@@ -918,9 +1042,9 @@ class BinanceFutures:
         Binance migrated STOP_MARKET / TRAILING_STOP_MARKET to
         /fapi/v1/algoOrder on 2025-12-09 (closePosition is forbidden there
         on TRAILING_STOP_MARKET; STOP_MARKET also moved). This function
-        cancels any previously tracked SL and places a fresh STOP_MARKET
-        (or TRAILING_STOP_MARKET) as an algo order with
-        reduceOnly=true and quantity matching the current position size.
+        places a fresh STOP_MARKET (or TRAILING_STOP_MARKET) algo order
+        with reduceOnly=true matching the current position size, and only
+        THEN cancels any previously tracked SL.
 
         Recognised fields: symbol, stopLoss, takeProfit (optional),
         trailingStop (optional), activePrice (optional), qty (optional —
@@ -931,15 +1055,29 @@ class BinanceFutures:
         `noPosition: True` is returned when there is no position to
         protect — caller must treat that as 'SL NOT armed'. The existing
         SL is preserved in that case (we do NOT cancel-and-not-replace).
+
+        Ordering: PLACE-NEW-FIRST, then CANCEL-OLD.
+        Rationale: the previous order (cancel-then-place) opened a
+        ~50–100 ms window with no SL armed. If the place leg's retry
+        budget was exhausted (transient 5xx) the position would have
+        been naked until the next caller invocation. By placing the new
+        SL first, the worst case is a brief window where the position
+        has TWO reduceOnly STOP_MARKET algo orders on it — Binance
+        accepts multiple STOP_MARKET orders per position (no closePosition
+        flag is set; reduceOnly enforces no over-close) so the duplicate
+        is harmless: whichever triggers first closes the position, and
+        the second naturally becomes a no-op (reduceOnly fires against
+        zero size).
+        Refs:
+          - /fapi/v1/algoOrder (algo orders coexist; reduceOnly enforces)
+          - error code -2022 ReduceOnly Order Failed (harmless on already-closed)
         """
         symbol = body["symbol"]
         new_sl = body.get("stopLoss")
         trailing = body.get("trailingStop")
 
-        # 1. POSITION CHECK FIRST — before touching the existing SL.
-        # The previous version cancelled the old SL unconditionally, then
-        # bailed if position cache was stale → position left naked. Now we
-        # verify position exists; only then proceed with cancel-and-replace.
+        # 1. POSITION CHECK FIRST — bail early if no live position to protect.
+        # Otherwise resolve closing side + qty for the new order.
         if new_sl or trailing:
             side_close = self._closing_side(symbol)
             qty_override = body.get("qty")
@@ -953,37 +1091,26 @@ class BinanceFutures:
             side_close = None
             pos_size = 0.0
 
-        # 2. Cancel existing SL order. Routed by _cancel_by_order_id which
-        # checks _algo_orders set to pick the right endpoint.
+        # Snapshot the currently tracked SL id (we'll cancel it AFTER the
+        # new SL is confirmed live). Captured under the lock to stay
+        # consistent with concurrent ALGO_UPDATE handler mutations.
         with self._sl_lock:
             old_sl = self._sl_orders.get(symbol)
-        if old_sl:
-            self._cancel_by_order_id(symbol, old_sl)
-            with self._sl_lock:
-                self._sl_orders.pop(symbol, None)
-        else:
-            # Scan algo + regular open orders for an SL-tagged clientId we lost.
-            try:
-                for o in self.open_orders("linear", symbol):
-                    cid = (o.get("orderLinkId") or "").split(":")
-                    if len(cid) == 2 and cid[1] == "SL":
-                        self._cancel_by_order_id(symbol, str(o.get("orderId", "")))
-                        break
-            except Exception:
-                pass
-            try:
-                for ao in self.open_algo_orders(symbol):
-                    cid = (_decode_client_id(ao.get("clientAlgoId") or "")).split(":")
-                    if len(cid) == 2 and cid[1] == "SL":
-                        self._cancel_algo_order_by_id(ao.get("algoId"))
-                        break
-            except Exception:
-                pass
 
+        # If caller only wanted to clear SL (no new SL/trail) → cancel any
+        # tracked SL and exit; no new order to place.
         if not new_sl and not trailing:
+            if old_sl:
+                self._cancel_by_order_id(symbol, old_sl)
+                with self._sl_lock:
+                    if self._sl_orders.get(symbol) == old_sl:
+                        self._sl_orders.pop(symbol, None)
+            else:
+                # No tracked SL — scan for an SL-tagged orphan to clean up.
+                self._cleanup_orphan_sl(symbol)
             return {"retCode": 0, "result": {}}
 
-        # 3. Build the algo order — side & size were resolved in step 1.
+        # 2. PLACE the new algo order FIRST (before cancelling old).
         # Random 4-char suffix on cid prevents collisions when two
         # SLs are placed in the same millisecond on the same symbol.
         # Truncate symbol (not the timestamp) so the suffix is preserved
@@ -1012,12 +1139,67 @@ class BinanceFutures:
             params["triggerPrice"] = self._price_str(symbol, new_sl)
             params["priceProtect"] = "true"
 
+        # If the place leg raises, the OLD SL is still live — position
+        # remains protected. Caller (set_trading_stop callers in
+        # trade_engine) will see the exception and decide whether to
+        # retry. This is the whole point of place-before-cancel.
         resp = self._place_algo_order(params)
         algo_id = str(resp.get("algoId", ""))
         if algo_id:
             with self._sl_lock:
                 self._sl_orders[symbol] = algo_id
+
+        # 3. NEW SL is now confirmed live. Cancel the old one.
+        # Errors are swallowed by _cancel_by_order_id; worst case is a
+        # stale algo that triggers later against a closed position
+        # (-2022 ReduceOnly Order Failed — handled idempotently in
+        # ALGO_UPDATE / _cancel_algo_order_by_id).
+        if old_sl and old_sl != algo_id:
+            self._cancel_by_order_id(symbol, old_sl)
+        else:
+            # No tracked SL — scan for an SL-tagged orphan (legacy
+            # inline-SL cid suffix :SL OR new algo SL cid prefix "sl-").
+            self._cleanup_orphan_sl(symbol, exclude_algo_id=algo_id)
+
         return {"retCode": 0, "result": {"orderId": algo_id, "isAlgo": True, **resp}}
+
+    def _cleanup_orphan_sl(self, symbol: str, exclude_algo_id: Optional[str] = None) -> None:
+        """Scan algo + regular open orders for an SL-tagged clientId we
+        lost track of, and cancel it. Used by set_trading_stop when the
+        in-memory _sl_orders has no entry (e.g. across restart).
+
+        `exclude_algo_id` lets the caller skip the algo just placed —
+        critical for place-before-cancel so we don't immediately
+        cancel the SL we just armed.
+
+        Recognises:
+          - legacy inline-SL cid suffix ":SL" / "-SL" (regular endpoint)
+          - new algo SL cid prefix "sl-" (algo endpoint)
+        Errors are swallowed — this is a best-effort cleanup.
+        """
+        try:
+            for o in self.open_orders("linear", symbol):
+                cid_raw = o.get("orderLinkId") or ""
+                cid_parts = cid_raw.split(":")
+                if (len(cid_parts) == 2 and cid_parts[1] == "SL") or cid_raw.endswith("-SL"):
+                    self._cancel_by_order_id(symbol, str(o.get("orderId", "")))
+                    break
+        except Exception:
+            pass
+        try:
+            for ao in self.open_algo_orders(symbol):
+                aid = str(ao.get("algoId") or "")
+                if exclude_algo_id and aid == exclude_algo_id:
+                    continue
+                cid_raw = _decode_client_id(ao.get("clientAlgoId") or "")
+                cid_parts = cid_raw.split(":")
+                if ((len(cid_parts) == 2 and cid_parts[1] == "SL")
+                        or cid_raw.startswith("sl-")
+                        or cid_raw.endswith("-SL")):
+                    self._cancel_algo_order_by_id(ao.get("algoId"))
+                    break
+        except Exception:
+            pass
 
     def _position_size(self, symbol: str) -> float:
         """Returns the open position size for `symbol`, or 0 if none.
@@ -1229,6 +1411,21 @@ class BinanceFutures:
                     or order_type in ("STOP_MARKET", "TRAILING_STOP_MARKET")
                     or is_algo_spawn):
                 sym = o.get("s")
+                # Log when the narrow algo-spawn branch fires (MARKET +
+                # reduceOnly + closed_fully, NOT cid-tagged as SL/TRAIL).
+                # This is the only path that catches the auto-spawned
+                # market order produced when a /fapi/v1/algoOrder
+                # STOP_MARKET / TRAILING_STOP_MARKET triggers — Binance
+                # docs don't enumerate the spawned order's fields, so
+                # we want production telemetry to confirm it's actually
+                # catching real algo triggers (not over-firing on TP fills).
+                if is_algo_spawn and not (is_sl or is_trail
+                        or order_type in ("STOP_MARKET", "TRAILING_STOP_MARKET")):
+                    logger.warning(
+                        f"[algo-spawn cleanup] {sym} cid={cid_str} type={order_type} "
+                        f"reduce_only={reduce_only} cum_qty={cum_qty}/{orig_qty} — "
+                        f"sweeping reduce-only siblings"
+                    )
                 if is_sl:
                     with self._sl_lock:
                         self._sl_orders.pop(sym, None)

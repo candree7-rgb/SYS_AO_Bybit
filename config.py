@@ -139,6 +139,20 @@ USE_TRAIL_AFTER_TP1   = _get_bool("USE_TRAIL_AFTER_TP1","false")
 TRAIL_ACTIVATION_PCT  = _get_float("TRAIL_ACTIVATION_PCT","0.8")  # % from entry where trail arms
 TRAIL_CALLBACK_RATE   = _get_float("TRAIL_CALLBACK_RATE","0.3")   # % retracement from extreme → fire
 
+# Ignore all post-entry signal updates (SL/TP edits, DCA updates, TRADE
+# CLOSED notices). The bot's protective stack is fully self-contained:
+#   - Hard SL @ ±FIXED_SL_PCT (computed from config, not signal)
+#   - Algo TRAIL @ TRAIL_ACTIVATION_PCT + TRAIL_CALLBACK_RATE
+#   - Position-close detection via Binance ORDER_TRADE_UPDATE WS event
+# Multi-agent audit (2026-05) confirmed the minimum required signal
+# fields are {symbol, side, trigger}; every other field (provider SL,
+# TP1/2/3, DCAs) is either ignored, overwritten by FIXED_RISK_PROFILE,
+# or actively harmful (provider TP edits triggered orphan LIMIT TPs
+# that conflicted with the trail strategy — e.g. CHILLGUYUSDT 2026-05-11).
+# Setting this to False re-enables the legacy edit-follow behaviour
+# (NOT recommended in trail mode).
+IGNORE_POST_ENTRY_UPDATES = _get_bool("IGNORE_POST_ENTRY_UPDATES","true")
+
 # Pre-place-order RSI filter. Tick-precise + walk-forward validation
 # on 1013 signals (chronological 50/50 split) showed RSI_1m >= 74 at
 # signal time correlates with sub-30 % WR even under trail strategy —

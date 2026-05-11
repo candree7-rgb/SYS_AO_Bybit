@@ -43,8 +43,22 @@ def setup_logger() -> logging.Logger:
 def _apply_signal_update_to_trade(tr, txt, engine, log):
     """Apply parsed-from-text signal-update logic to a single trade.
     Used by both REST polling (check_signal_updates) and Gateway WS edit
-    push (fast_edit_handler in main()). Caller holds state_lock."""
+    push (fast_edit_handler in main()). Caller holds state_lock.
+
+    When IGNORE_POST_ENTRY_UPDATES is True (default in trail mode), this
+    function is a no-op. The bot's protective stack (hard SL @ ±FIXED_SL_PCT,
+    algo TRAIL @ ±TRAIL_ACTIVATION_PCT with TRAIL_CALLBACK_RATE callback)
+    handles the entire trade lifecycle autonomously via Binance WS events —
+    provider SL/TP edits, "TRADE CLOSED" messages, and DCA updates are all
+    informational and not load-bearing for safety. Multi-agent audit
+    confirmed: the minimum required signal field set is {symbol, side,
+    trigger}; every post-entry field is overwritten by FIXED_RISK_PROFILE
+    or unused in trail mode.
+    """
     try:
+        from config import IGNORE_POST_ENTRY_UPDATES
+        if IGNORE_POST_ENTRY_UPDATES:
+            return
         # Check for TRADE CLOSED (manual close by signal provider).
         # Detects both "TRADE CLOSED" (legacy) and "Closed P&L:" (AO Crusher).
         if is_trade_closed(txt):
@@ -236,6 +250,34 @@ def main():
             bybit.set_position_mode_one_way()
         except Exception as e:
             log.warning(f"could not enforce One-Way position mode: {e} (continuing)")
+
+    # Prime the in-memory _algo_orders / _sl_orders from whatever algos are
+    # live on Binance right now. After a restart these sets are empty, which
+    # has two failure modes:
+    #   1. _cancel_by_order_id pays an extra REST round-trip per cancel
+    #      (regular endpoint → -2013 → algo endpoint fallback).
+    #   2. set_trading_stop's orphan-scan doesn't know the symbol already
+    #      has an algo SL armed → could place a SECOND algo SL on the same
+    #      position. prime_algo_orders fills both dicts in one batched
+    #      /fapi/v1/openAlgoOrders call (no symbol param → all open algos).
+    # Restricted to live open_trades symbols so a delisted stale algo on an
+    # untracked symbol doesn't get pulled into our state.
+    if not DRY_RUN:
+        try:
+            tracked_syms = sorted({
+                tr.get("symbol")
+                for tr in st.get("open_trades", {}).values()
+                if tr.get("symbol") and tr.get("status") in ("open", "pending")
+            })
+            # If no tracked symbols, still prime account-wide so the
+            # _algo_orders set covers any straggler from a previous crash
+            # that startup_sync will want to clean up.
+            primed = bybit.prime_algo_orders(tracked_syms or None)
+            if primed:
+                log.info(f"♻️  Primed {primed} algo order(s) from Binance into in-memory cache")
+        except Exception as e:
+            log.warning(f"prime_algo_orders failed: {e} (continuing — first-cancel will be slower)")
+
     discord = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
 
     # Discord Gateway WebSocket: push-based new-message receiver. Replaces
