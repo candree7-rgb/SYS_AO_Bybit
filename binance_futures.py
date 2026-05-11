@@ -492,7 +492,7 @@ class BinanceFutures:
                 callback_rate=trailing,
                 activation_price=body.get("activePrice"),
                 close_position=bool(body.get("closeOnTrigger") or body.get("closePosition")),
-                quantity=qty if not body.get("closeOnTrigger") else None,
+                quantity=qty,  # always pass — enables fallback to qty+reduceOnly on -4136/-1106
                 client_order_id=_encode_link_id(link_id),
             )
 
@@ -564,8 +564,12 @@ class BinanceFutures:
             be rejected with -1106. Omitted here.
 
         Built-in fallbacks for live-trade robustness:
-          - If Binance rejects closePosition for this type (-1106), retry
-            with quantity + reduceOnly using the open position size.
+          - If Binance rejects closePosition for this type (-1106 or -4136
+            "Target strategy invalid for orderType TRAILING_STOP_MARKET,
+            closePosition true"), retry with quantity + reduceOnly. Seen
+            live on some symbols (e.g. AKEUSDT) in 2026-05 — Binance now
+            disallows closePosition=true with TRAILING_STOP_MARKET on
+            certain perp listings even though docs still describe it.
           - If activationPrice would immediately trigger (-2021 — mark
             already crossed it), retry without activationPrice so Binance
             defaults to the current mark.
@@ -597,19 +601,28 @@ class BinanceFutures:
                                          _build(close_position, True))
             return _wrap_order_response(resp)
         except BinanceAPIError as e:
-            # -1106: parameter sent when not required (e.g. closePosition on
-            # TRAILING_STOP_MARKET if the docs change)
-            if e.code == -1106 and close_position and quantity is not None:
+            # -1106 / -4136: closePosition rejected for TRAILING_STOP_MARKET.
+            # Seen live: AKEUSDT 2026-05 with -4136 "Target strategy invalid".
+            # Retry with quantity + reduceOnly using the open position size.
+            if e.code in (-1106, -4136) and close_position and quantity is not None:
                 resp = self._signed_request("POST", "/fapi/v1/order",
                                              _build(False, True))
                 return _wrap_order_response(resp)
             # -2021: order would immediately trigger (mark already past
             # activationPrice) — retry without activationPrice so the
-            # exchange defaults it to the current mark.
+            # exchange defaults it to the current mark. Also re-try the
+            # qty fallback path if closePosition was rejected upstream.
             if e.code == -2021 and activation_price is not None:
-                resp = self._signed_request("POST", "/fapi/v1/order",
-                                             _build(close_position, False))
-                return _wrap_order_response(resp)
+                try:
+                    resp = self._signed_request("POST", "/fapi/v1/order",
+                                                 _build(close_position, False))
+                    return _wrap_order_response(resp)
+                except BinanceAPIError as e2:
+                    if e2.code in (-1106, -4136) and close_position and quantity is not None:
+                        resp = self._signed_request("POST", "/fapi/v1/order",
+                                                     _build(False, False))
+                        return _wrap_order_response(resp)
+                    raise
             raise
 
     def _place_conditional_limit(

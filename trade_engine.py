@@ -599,11 +599,14 @@ class TradeEngine:
     def _place_trailing_stop_orders(self, trade: Dict[str, Any], side: str,
                                      entry: float, tick_size: float) -> None:
         """Submit ONE TRAILING_STOP_MARKET with closePosition=true.
-        The initial SL from the entry batchOrders stays as fallback —
-        whichever fires first closes the whole position; the other becomes
-        a no-op and gets cancelled by cleanup_closed_trades when size hits 0.
+
+        Independently of the trail, ensures a hard SL is on the position:
+        if the inline-SL leg of the entry batchOrders failed (-2021 from a
+        cross with mark, an exchange validation, etc.), we call
+        set_trading_stop here so the position is never left unprotected.
+        This is the "belt" — the trail is the "braces".
         """
-        from config import TRAIL_ACTIVATION_PCT, TRAIL_CALLBACK_RATE
+        from config import TRAIL_ACTIVATION_PCT, TRAIL_CALLBACK_RATE, INITIAL_SL_PCT
         symbol = trade["symbol"]
         # SHORT (side=Sell): activation BELOW entry → trail arms when price
         # drops to it. LONG: activation ABOVE entry. callbackRate is the %
@@ -621,10 +624,50 @@ class TradeEngine:
             self.log.warning(f"No position size yet for {symbol}; will retry trail-stop")
             return
 
+        # ── Belt: ensure hard SL is on the position ──
+        # If inline SL during entry batchOrders succeeded, trust it.
+        # Otherwise issue set_trading_stop here, BEFORE attempting the trail,
+        # so a failing trail can't leave the position unprotected.
+        if not bool(trade.get("sl_set_inline")):
+            sl_price = trade.get("sl_price")
+            if not sl_price:
+                # No signal SL stored — fall back to INITIAL_SL_PCT from entry.
+                sl_pct = INITIAL_SL_PCT / 100.0
+                sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
+            sl_price = self._round_price(float(sl_price), tick_size)
+            ts_body = {
+                "category": CATEGORY,
+                "symbol": symbol,
+                "positionIdx": 0,
+                "stopLoss": f"{sl_price:.10f}",
+                "tpslMode": "Full",
+            }
+            try:
+                if DRY_RUN:
+                    self.log.info(f"DRY_RUN set SL (trail-mode fallback): {ts_body}")
+                else:
+                    self.bybit.set_trading_stop(ts_body)
+                self.log.info(f"✅ Hard SL set @ {sl_price} (trail-mode fallback)")
+                trade["sl_set_inline"] = True  # mark as armed
+            except Exception as e:
+                self.log.error(
+                    f"🚨 CRITICAL: SL fallback FAILED for {symbol} @ {sl_price}: {e} — "
+                    f"position may be unprotected if trail also fails"
+                )
+                try:
+                    import telegram_alerts
+                    telegram_alerts.send_message(
+                        f"🚨 {symbol}: SL set FAILED — check manually!"
+                    )
+                except Exception:
+                    pass
+
+        # ── Braces: trailing stop ──
         body = {
             "category": CATEGORY,
             "symbol": symbol,
             "side": _opposite_side(side),  # BUY closes SHORT, SELL closes LONG
+            "qty": f"{size}",  # enables qty+reduceOnly fallback on -1106/-4136
             "trailingStop": TRAIL_CALLBACK_RATE,
             "activePrice": activation,
             "closeOnTrigger": True,  # maps to closePosition=true on Binance
@@ -644,7 +687,18 @@ class TradeEngine:
                 trade["trail_order_id"] = trail_oid
                 self.log.info(f"✅ TRAIL armed: {symbol} orderId={trail_oid}")
             except Exception as e:
-                self.log.error(f"❌ Failed to place trail-stop for {symbol}: {e}")
+                self.log.error(
+                    f"❌ Failed to place trail-stop for {symbol}: {e} — "
+                    f"position protected by hard SL only"
+                )
+                try:
+                    import telegram_alerts
+                    telegram_alerts.send_message(
+                        f"⚠️ {symbol}: TRAIL place failed ({e}). "
+                        f"Hard SL still armed."
+                    )
+                except Exception:
+                    pass
 
         trade["post_orders_placed"] = True
 
