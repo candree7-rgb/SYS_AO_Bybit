@@ -239,6 +239,46 @@ class BinanceFutures:
         data = self._public_request("GET", "/fapi/v1/ticker/price", {"symbol": symbol})
         return float(data["price"])
 
+    def compute_rsi_1m(self, symbol: str, period: int = 14, lookback: int = 30) -> Optional[float]:
+        """Fetch the last `lookback` 1m candles and return Wilder-smoothed RSI.
+
+        Used pre-place-order by fast_signal_handler when RSI_FILTER_MAX_1M
+        is set. Returns None if too few candles are available so the caller
+        can fail-open (don't filter out a signal just because the kline
+        endpoint hiccuped). Cost: one public GET, ~50ms RTT.
+        """
+        try:
+            data = self._public_request(
+                "GET",
+                "/fapi/v1/klines",
+                {"symbol": symbol, "interval": "1m", "limit": lookback},
+            )
+        except Exception:
+            return None
+        if not isinstance(data, list) or len(data) < period + 1:
+            return None
+        try:
+            closes = [float(k[4]) for k in data]
+        except (IndexError, ValueError, TypeError):
+            return None
+        # Wilder RSI: simple-average for first `period`, then exponential
+        gains = []
+        losses = []
+        for i in range(1, period + 1):
+            d = closes[i] - closes[i - 1]
+            gains.append(max(d, 0.0))
+            losses.append(max(-d, 0.0))
+        avg_g = sum(gains) / period
+        avg_l = sum(losses) / period
+        for i in range(period + 1, len(closes)):
+            d = closes[i] - closes[i - 1]
+            avg_g = (avg_g * (period - 1) + max(d, 0.0)) / period
+            avg_l = (avg_l * (period - 1) + max(-d, 0.0)) / period
+        if avg_l == 0:
+            return 100.0
+        rs = avg_g / avg_l
+        return 100.0 - 100.0 / (1.0 + rs)
+
     def instruments_info(self, category: str, symbol: str) -> Dict[str, Any]:  # noqa: ARG002
         """Return Bybit-shaped dict: priceFilter.tickSize, lotSizeFilter.qtyStep,
         lotSizeFilter.minOrderQty, leverageFilter.maxLeverage."""
