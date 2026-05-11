@@ -568,13 +568,26 @@ def main():
             # 1m-klines GET) — applied before placing the order so we
             # avoid the much slower batchOrders RTT when rejecting.
             if RSI_FILTER_MAX_1M > 0:
+                rsi = None
                 try:
                     rsi = bybit.compute_rsi_1m(sig["symbol"])
+                    if rsi is None:
+                        # too-few-candles or malformed klines (rare: brand-new listing)
+                        log.warning(
+                            f"RSI=None for {sig['symbol']} (insufficient klines) — fail-open"
+                        )
                 except Exception as e:
-                    rsi = None  # fail-open
-                    log.debug(f"RSI fetch failed for {sig['symbol']}: {e}")
+                    log.warning(
+                        f"RSI fetch failed for {sig['symbol']}: {type(e).__name__}: {e} "
+                        f"— fail-open"
+                    )
                 if rsi is not None and rsi >= RSI_FILTER_MAX_1M:
-                    log.info(f"⏭️  SKIP {sig['symbol']}: RSI_1m={rsi:.1f} >= {RSI_FILTER_MAX_1M} (filter)")
+                    msg = f"⏭️ SKIP {sig['symbol']}: RSI_1m={rsi:.1f} >= {RSI_FILTER_MAX_1M} (filter)"
+                    log.info(msg)
+                    try:
+                        telegram_alerts.send_message(msg)
+                    except Exception as te:
+                        log.debug(f"Telegram skip-notify failed: {te}")
                     return
 
             sh = signal_hash(sig)

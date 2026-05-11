@@ -239,22 +239,26 @@ class BinanceFutures:
         data = self._public_request("GET", "/fapi/v1/ticker/price", {"symbol": symbol})
         return float(data["price"])
 
-    def compute_rsi_1m(self, symbol: str, period: int = 14, lookback: int = 30) -> Optional[float]:
+    def compute_rsi_1m(
+        self, symbol: str, period: int = 14, lookback: int = 30, timeout: int = 2
+    ) -> Optional[float]:
         """Fetch the last `lookback` 1m candles and return Wilder-smoothed RSI.
 
         Used pre-place-order by fast_signal_handler when RSI_FILTER_MAX_1M
         is set. Returns None if too few candles are available so the caller
         can fail-open (don't filter out a signal just because the kline
         endpoint hiccuped). Cost: one public GET, ~50ms RTT.
+
+        `timeout` defaults to 2s (not the standard 10s) because this runs
+        in the hot signal-handling path — a hung request would cost us the
+        fill, which is worse than skipping the filter for one signal.
         """
-        try:
-            data = self._public_request(
-                "GET",
-                "/fapi/v1/klines",
-                {"symbol": symbol, "interval": "1m", "limit": lookback},
-            )
-        except Exception:
-            return None
+        data = self._public_request(
+            "GET",
+            "/fapi/v1/klines",
+            {"symbol": symbol, "interval": "1m", "limit": lookback},
+            timeout=timeout,
+        )
         if not isinstance(data, list) or len(data) < period + 1:
             return None
         try:
