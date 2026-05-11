@@ -17,6 +17,7 @@ from config import (
     WARMUP_SYMBOLS, BLACKLIST_SYMBOLS,
     DISABLE_PREFLIGHT_TP1, DISABLE_ENTRY_WATCHER,
     FIXED_RISK_PROFILE, FIXED_SL_PCT, FIXED_TP_PCTS, TP_SPLITS, BREAKEVEN_PROFIT_BUFFER_PCT,
+    USE_TRAIL_AFTER_TP1, TRAIL_ACTIVATION_PCT, TRAIL_CALLBACK_RATE,
     STATE_FILE, DRY_RUN, LOG_LEVEL
 )
 from binance_futures import BinanceFutures
@@ -344,6 +345,10 @@ def main():
     log.info(f"Config: USE_GATEWAY_WS={USE_GATEWAY_WS} (fallback after {GATEWAY_FALLBACK_FAILURES} failures)")
     log.info(f"Config: DISABLE_PREFLIGHT_TP1={DISABLE_PREFLIGHT_TP1}, DISABLE_ENTRY_WATCHER={DISABLE_ENTRY_WATCHER}")
     log.info(f"Config: FIXED_RISK_PROFILE={FIXED_RISK_PROFILE} SL={FIXED_SL_PCT}% TP={FIXED_TP_PCTS} splits={TP_SPLITS} BE+{BREAKEVEN_PROFIT_BUFFER_PCT}%")
+    if USE_TRAIL_AFTER_TP1:
+        log.info(f"Config: USE_TRAIL_AFTER_TP1=True | activation @ {TRAIL_ACTIVATION_PCT}% from entry, callback={TRAIL_CALLBACK_RATE}%")
+    else:
+        log.info(f"Config: USE_TRAIL_AFTER_TP1=False (TP1/2/3 ladder mode)")
     log.info(f"Config: DRY_RUN={DRY_RUN}, LOG_LEVEL={LOG_LEVEL}")
 
     # Initialize database if enabled

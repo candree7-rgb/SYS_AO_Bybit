@@ -113,16 +113,31 @@ ENTRY_TRIGGER_BUFFER_PCT     = _get_float("ENTRY_TRIGGER_BUFFER_PCT","0.0")
 ENTRY_LIMIT_PRICE_OFFSET_PCT = _get_float("ENTRY_LIMIT_PRICE_OFFSET_PCT","0.0")
 ENTRY_EXPIRATION_PRICE_PCT   = _get_float("ENTRY_EXPIRATION_PRICE_PCT","0.6")
 
-# Toggles for the two cancellation-mechanisms that the realistic-filter
+# Toggles for the two TP1-cross cancel-mechanisms that the realistic-filter
 # backtest showed are leaving 99 % of EV on the table:
 #   1. DISABLE_PREFLIGHT_TP1: skip the "last price ≤ TP1 → SKIP" check
 #      that fires before the entry order is even placed.
 #   2. DISABLE_ENTRY_WATCHER: don't subscribe a public-WS ticker watcher
 #      that cancels pending limits when price crosses TP1 before fill.
-# With both enabled the bot relies solely on ENTRY_EXPIRATION_MIN
+# With both enabled the bot relies on ENTRY_EXPIRATION_MIN
 # (default 180 min) to time-out unfilled limits.
 DISABLE_PREFLIGHT_TP1 = _get_bool("DISABLE_PREFLIGHT_TP1","false")
 DISABLE_ENTRY_WATCHER = _get_bool("DISABLE_ENTRY_WATCHER","false")
+
+# Trailing-stop strategy. When enabled, the bot skips TP1/TP2/TP3 limit
+# placement and uses a single Binance TRAILING_STOP_MARKET order instead:
+#   - activates when MARK price reaches TRAIL_ACTIVATION_PCT below entry
+#     (for SHORT) — typically the same as the provider's TP1 distance
+#   - then trails the lowest price, fires a MARKET buy when price
+#     retraces TRAIL_CALLBACK_RATE % from that low
+#   - the initial inline SL (placed in the same batchOrders) stays as a
+#     fallback in case price never reaches the activation level
+# Tick-precise backtest (verified slippage from real aggTrades, median
+# 0.03–0.05 %): TP1_activation=0.8 %, callback=0.3 %, SL=0.7 % → +12.25 %
+# EV / sig, $1k → $71M over 100 days, 23 % MaxDD.
+USE_TRAIL_AFTER_TP1   = _get_bool("USE_TRAIL_AFTER_TP1","false")
+TRAIL_ACTIVATION_PCT  = _get_float("TRAIL_ACTIVATION_PCT","0.8")  # % from entry where trail arms
+TRAIL_CALLBACK_RATE   = _get_float("TRAIL_CALLBACK_RATE","0.3")   # % retracement from extreme → fire
 
 # TP/SL
 MOVE_SL_TO_BE_ON_TP1 = _get_bool("MOVE_SL_TO_BE_ON_TP1","true")

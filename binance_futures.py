@@ -411,13 +411,30 @@ class BinanceFutures:
         symbol = body["symbol"]
         side = "BUY" if body["side"] == "Buy" else "SELL"
         order_type_raw = body.get("orderType", "Limit").upper()  # LIMIT or MARKET
-        qty = body["qty"]
+        qty = body["qty"] if "qty" in body else None
         price = body.get("price")
         tif = body.get("timeInForce", "GTC").upper()
         reduce_only = bool(body.get("reduceOnly"))
         link_id = body.get("orderLinkId", "")
         trigger_price = body.get("triggerPrice")
         sl_inline = body.get("stopLoss")
+        trailing = body.get("trailingStop")
+
+        # Trailing-stop standalone — used by trade_engine's
+        # place_post_entry_orders when USE_TRAIL_AFTER_TP1 is set. Submitted
+        # as a separate order from the initial inline SL (both armed; the
+        # one that fires first closes the position, the other becomes a
+        # closePosition no-op until cleanup_closed_trades cancels it).
+        if trailing is not None and sl_inline is None and trigger_price is None:
+            return self._place_trailing_stop_market(
+                symbol=symbol,
+                side=side,
+                callback_rate=trailing,
+                activation_price=body.get("activePrice"),
+                close_position=bool(body.get("closeOnTrigger") or body.get("closePosition")),
+                quantity=qty if not body.get("closeOnTrigger") else None,
+                client_order_id=_encode_link_id(link_id),
+            )
 
         # Conditional (DCA): triggerPrice present → STOP / STOP_MARKET
         if trigger_price is not None and not sl_inline:
@@ -459,6 +476,49 @@ class BinanceFutures:
             params["timeInForce"] = tif
         if reduce_only:
             params["reduceOnly"] = "true"
+        resp = self._signed_request("POST", "/fapi/v1/order", params)
+        return _wrap_order_response(resp)
+
+    def _place_trailing_stop_market(
+        self,
+        symbol: str,
+        side: str,
+        callback_rate: Any,
+        activation_price: Optional[Any],
+        close_position: bool,
+        quantity: Optional[Any],
+        client_order_id: str,
+    ) -> Dict[str, Any]:
+        """Place a Binance TRAILING_STOP_MARKET order.
+
+        Per Binance USDT-M Futures API docs (POST /fapi/v1/order):
+          - callbackRate: 0.1 .. 5.0 (one decimal, % retrace from extreme)
+          - activationPrice: optional; defaults to mark/last at place-time.
+            For SHORT (side=BUY) the trail arms when MARK price drops to
+            activationPrice; the extreme then tracks the lowest mark seen
+            and fires a MARKET BUY once mark retraces callbackRate %.
+          - closePosition=true is mutually exclusive with quantity and
+            reduceOnly. Must use one OR the other.
+        """
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": "TRAILING_STOP_MARKET",
+            "callbackRate": _fmt_num(callback_rate),
+            "workingType": "MARK_PRICE",
+            "priceProtect": "true",
+            "newClientOrderId": client_order_id,
+            "newOrderRespType": "ACK",
+        }
+        if close_position:
+            params["closePosition"] = "true"
+        elif quantity is not None:
+            params["quantity"] = self._qty_str(symbol, quantity)
+            params["reduceOnly"] = "true"
+        else:
+            raise RuntimeError("TRAILING_STOP_MARKET needs either closePosition=true OR quantity")
+        if activation_price is not None:
+            params["activationPrice"] = self._price_str(symbol, activation_price)
         resp = self._signed_request("POST", "/fapi/v1/order", params)
         return _wrap_order_response(resp)
 
@@ -853,16 +913,20 @@ class BinanceFutures:
         }
         if x == "TRADE":
             on_execution(ev)
-            # When the SL fires, drop the pointer (a future set_trading_stop
-            # call would otherwise try to cancel a non-existent order) AND
-            # eagerly cancel the residual reduceOnly TP/DCA orders for the
-            # symbol. Binance does NOT auto-cancel siblings of a closePosition
-            # SL — without this the orphaned TPs sit until the next cleanup
-            # poll and could interfere with a new trade on the same symbol.
-            if cid.endswith("-SL") or cid.endswith(":SL"):
+            # Position-closing order just fired (SL or TRAIL or one of the
+            # TPs). Binance does NOT auto-cancel sibling closePosition or
+            # reduceOnly orders when one closes the position to 0 — without
+            # explicit cleanup the orphans sit and could misfire on the
+            # next trade for the same symbol. Cancel ALL open closers.
+            cid_str = str(cid)
+            is_sl = cid_str.endswith("-SL") or cid_str.endswith(":SL")
+            is_trail = cid_str.endswith("-TRAIL") or cid_str.endswith(":TRAIL")
+            order_type = (o.get("o") or "").upper()
+            if is_sl or is_trail or order_type in ("STOP_MARKET", "TRAILING_STOP_MARKET"):
                 sym = o.get("s")
-                with self._sl_lock:
-                    self._sl_orders.pop(sym, None)
+                if is_sl:
+                    with self._sl_lock:
+                        self._sl_orders.pop(sym, None)
                 if sym:
                     self._cancel_reduce_only_for_symbol(sym)
         if on_order:
@@ -872,18 +936,41 @@ class BinanceFutures:
                 pass
 
     def _cancel_reduce_only_for_symbol(self, symbol: str) -> None:
-        """Cancel every open reduceOnly order on this symbol (TP/DCA siblings
-        of a just-fired SL). Best-effort; failures are logged at debug."""
+        """Cancel every open protective order on this symbol after one of
+        them fires (TP/DCA siblings of a just-fired SL, OR an orphan
+        TRAILING_STOP_MARKET that didn't fire). Includes reduceOnly orders
+        AND closePosition orders — the latter because trailing-stops with
+        closePosition=true won't auto-cancel when the SL closes the
+        position to 0, and Binance lets them linger as orphans that could
+        misfire on a subsequent trade for the same symbol.
+        """
         try:
             opens = self.open_orders("linear", symbol)
         except Exception:
             return
         for o in opens:
-            if not o.get("reduceOnly"):
+            # Cancel anything that's a position-closer: reduce-only OR
+            # close-position (returned as closeOnTrigger in our Bybit-
+            # shaped dict by _to_bybit_order_dict).
+            if not (o.get("reduceOnly") or o.get("closeOnTrigger")):
                 continue
             oid = str(o.get("orderId", ""))
             if oid:
                 self._cancel_by_order_id(symbol, oid)
+
+    def cancel_all_open_for_symbol(self, symbol: str) -> Dict[str, Any]:
+        """One-call cancel of every open order on a symbol via
+        DELETE /fapi/v1/allOpenOrders. Cleaner than enumerating + DELETE
+        per order when we want everything gone (e.g. after position close).
+        """
+        try:
+            return self._signed_request(
+                "DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}
+            )
+        except BinanceAPIError as e:
+            if e.code in (-2011, -2013):
+                return {"code": 0, "msg": "nothing-to-cancel"}
+            raise
 
     def _handle_account_update(self, a: Dict[str, Any], on_wallet, on_position):
         """ACCOUNT_UPDATE.a contains B (balances) and P (positions)."""
