@@ -15,7 +15,8 @@ from config import (
     POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC, SIGNAL_UPDATE_INTERVAL_OPEN_SEC,
     USE_GATEWAY_WS, GATEWAY_FALLBACK_FAILURES, GATEWAY_LOOP_SLEEP_SEC, GATEWAY_INITIAL_BACKFILL,
     WARMUP_SYMBOLS, BLACKLIST_SYMBOLS,
-    DISABLE_ENTRY_WATCHER,
+    DISABLE_PREFLIGHT_TP1, DISABLE_ENTRY_WATCHER,
+    FIXED_RISK_PROFILE, FIXED_SL_PCT, FIXED_TP_PCTS, TP_SPLITS, BREAKEVEN_PROFIT_BUFFER_PCT,
     STATE_FILE, DRY_RUN, LOG_LEVEL
 )
 from binance_futures import BinanceFutures
@@ -341,6 +342,8 @@ def main():
     log.info(f"Config: RISK_PCT={RISK_PCT}%, MAX_CONCURRENT={MAX_CONCURRENT_TRADES}, MAX_DAILY={MAX_TRADES_PER_DAY}")
     log.info(f"Config: POLL_SECONDS={POLL_SECONDS}, TC_MAX_LAG_SEC={TC_MAX_LAG_SEC}")
     log.info(f"Config: USE_GATEWAY_WS={USE_GATEWAY_WS} (fallback after {GATEWAY_FALLBACK_FAILURES} failures)")
+    log.info(f"Config: DISABLE_PREFLIGHT_TP1={DISABLE_PREFLIGHT_TP1}, DISABLE_ENTRY_WATCHER={DISABLE_ENTRY_WATCHER}")
+    log.info(f"Config: FIXED_RISK_PROFILE={FIXED_RISK_PROFILE} SL={FIXED_SL_PCT}% TP={FIXED_TP_PCTS} splits={TP_SPLITS} BE+{BREAKEVEN_PROFIT_BUFFER_PCT}%")
     log.info(f"Config: DRY_RUN={DRY_RUN}, LOG_LEVEL={LOG_LEVEL}")
 
     # Initialize database if enabled
@@ -507,6 +510,21 @@ def main():
     # ============================================================
     def fast_signal_handler(raw_msg):
         try:
+            # FIX #1: ALWAYS advance last_discord_id BEFORE any early-return
+            # so the safety-net REST poll doesn't keep re-fetching the same
+            # status-update messages forever. Previously this was only done
+            # AFTER signal-parse + dedupe passed, which meant TP1-hit /
+            # TRADE-CLOSED edits and other non-signal messages would never
+            # advance the cursor and trigger a false "WS may be dropping
+            # events" warning every minute.
+            mid_str = str(raw_msg.get("id", ""))
+            try:
+                if int(mid_str or "0") > int(st.get("last_discord_id") or "0"):
+                    with state_lock:
+                        st["last_discord_id"] = mid_str
+            except (ValueError, TypeError):
+                pass
+
             ts = discord.message_timestamp_unix(raw_msg)
             now = time.time()
             age = (now - ts) if ts else 0.0
