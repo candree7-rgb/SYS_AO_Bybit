@@ -22,6 +22,7 @@ Key translations
 """
 from __future__ import annotations
 
+import os
 import time
 import hmac
 import hashlib
@@ -566,8 +567,29 @@ class BinanceFutures:
     def _place_algo_order(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """POST /fapi/v1/algoOrder. Returns raw algo response with `algoId`.
         Caller is responsible for setting algoType, type, side, symbol etc.
+
+        Handles -4015 / -1102 duplicate-clientAlgoId by looking up the
+        existing algo and returning it. This makes retries idempotent —
+        a network timeout that's actually delivered to Binance won't be
+        billed as a double-placement.
         """
-        resp = self._signed_request("POST", "/fapi/v1/algoOrder", params)
+        try:
+            resp = self._signed_request("POST", "/fapi/v1/algoOrder", params)
+        except BinanceAPIError as e:
+            if e.code in (-4015, -1102) and params.get("clientAlgoId"):
+                cid = params["clientAlgoId"]
+                sym = params.get("symbol")
+                try:
+                    for ao in self.open_algo_orders(sym):
+                        if ao.get("clientAlgoId") == cid:
+                            resp = ao
+                            break
+                    else:
+                        raise
+                except Exception:
+                    raise e
+            else:
+                raise
         algo_id = resp.get("algoId")
         if algo_id is not None:
             with self._algo_lock:
@@ -663,10 +685,13 @@ class BinanceFutures:
             resp = self._place_algo_order(_build(True))
             return _wrap_algo_response(resp)
         except BinanceAPIError as e:
-            # -4135 INVALID_ACTIVATION_PRICE — mark already crossed it (e.g.
-            # for SHORT, mark already below activatePrice). Retry without
-            # activatePrice so Binance picks the current mark as the start.
-            if e.code == -4135 and activation_price is not None:
+            # Activation-price already crossed: Binance returns
+            # -4135 INVALID_ACTIVATION_PRICE at validation OR
+            # -2021 ORDER_WOULD_IMMEDIATELY_TRIGGER at trigger-check,
+            # depending on whether the cross is detected pre- or post-
+            # placement validation. Retry without activatePrice so the
+            # exchange defaults it to current mark.
+            if e.code in (-4135, -2021) and activation_price is not None:
                 resp = self._place_algo_order(_build(False))
                 return _wrap_algo_response(resp)
             raise
@@ -868,17 +893,37 @@ class BinanceFutures:
         reduceOnly=true and quantity matching the current position size.
 
         Recognised fields: symbol, stopLoss, takeProfit (optional),
-        trailingStop (optional), activePrice (optional).
+        trailingStop (optional), activePrice (optional), qty (optional —
+        if provided the caller's size is used, avoiding a second
+        position-size lookup race).
 
         Returns {"retCode":0, "result":{"orderId": "<algoId>", ...}}.
-        `noPosition: True` in result is returned only when no position
-        exists — caller must treat that as 'SL NOT armed'.
+        `noPosition: True` is returned when there is no position to
+        protect — caller must treat that as 'SL NOT armed'. The existing
+        SL is preserved in that case (we do NOT cancel-and-not-replace).
         """
         symbol = body["symbol"]
         new_sl = body.get("stopLoss")
         trailing = body.get("trailingStop")
 
-        # 1. Cancel existing SL order. Routed by _cancel_by_order_id which
+        # 1. POSITION CHECK FIRST — before touching the existing SL.
+        # The previous version cancelled the old SL unconditionally, then
+        # bailed if position cache was stale → position left naked. Now we
+        # verify position exists; only then proceed with cancel-and-replace.
+        if new_sl or trailing:
+            side_close = self._closing_side(symbol)
+            qty_override = body.get("qty")
+            try:
+                pos_size = float(qty_override) if qty_override is not None else self._position_size(symbol)
+            except (TypeError, ValueError):
+                pos_size = self._position_size(symbol)
+            if side_close is None or pos_size <= 0:
+                return {"retCode": 0, "result": {"noPosition": True}}
+        else:
+            side_close = None
+            pos_size = 0.0
+
+        # 2. Cancel existing SL order. Routed by _cancel_by_order_id which
         # checks _algo_orders set to pick the right endpoint.
         with self._sl_lock:
             old_sl = self._sl_orders.get(symbol)
@@ -908,13 +953,13 @@ class BinanceFutures:
         if not new_sl and not trailing:
             return {"retCode": 0, "result": {}}
 
-        # 2. Determine SL side + qty from current position.
-        side_close = self._closing_side(symbol)
-        pos_size = self._position_size(symbol)
-        if side_close is None or pos_size <= 0:
-            return {"retCode": 0, "result": {"noPosition": True}}
-
-        cid = f"sl-{symbol}-{int(time.time()*1000)}"[:36]
+        # 3. Build the algo order — side & size were resolved in step 1.
+        # Random 4-char suffix on cid prevents collisions when two
+        # SLs are placed in the same millisecond on the same symbol.
+        rnd = os.urandom(2).hex()
+        # Truncate symbol (not the timestamp) so the suffix is preserved
+        # on long symbols like 1000PEPEUSDT.
+        cid = f"sl-{symbol[:14]}-{int(time.time()*1000)}-{rnd}"[:36]
 
         params: Dict[str, Any] = {
             "algoType": "CONDITIONAL",
@@ -1113,11 +1158,28 @@ class BinanceFutures:
             # reduceOnly orders when one closes the position to 0 — without
             # explicit cleanup the orphans sit and could misfire on the
             # next trade for the same symbol. Cancel ALL open closers.
+            #
+            # IMPORTANT post-algoOrder migration: when an algo SL or TRAIL
+            # fires, Binance spawns a regular MARKET order whose:
+            #   - `o` (type) is `MARKET`, NOT STOP_MARKET/TRAILING_STOP_MARKET
+            #   - `c` (clientOrderId) is auto-generated, NOT our clientAlgoId
+            # So suffix and type checks alone miss algo triggers. We also
+            # match `reduceOnly==true AND fill completed the order`, which
+            # catches the spawned market regardless of how it was named.
             cid_str = str(cid)
             is_sl = cid_str.endswith("-SL") or cid_str.endswith(":SL")
             is_trail = cid_str.endswith("-TRAIL") or cid_str.endswith(":TRAIL")
             order_type = (o.get("o") or "").upper()
-            if is_sl or is_trail or order_type in ("STOP_MARKET", "TRAILING_STOP_MARKET"):
+            reduce_only = bool(o.get("R"))
+            try:
+                cum_qty = float(o.get("z") or 0)
+                orig_qty = float(o.get("q") or 0)
+            except (TypeError, ValueError):
+                cum_qty = orig_qty = 0.0
+            closed_fully = orig_qty > 0 and cum_qty >= orig_qty
+            if (is_sl or is_trail
+                    or order_type in ("STOP_MARKET", "TRAILING_STOP_MARKET")
+                    or (reduce_only and closed_fully)):
                 sym = o.get("s")
                 if is_sl:
                     with self._sl_lock:

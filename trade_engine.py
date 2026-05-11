@@ -641,6 +641,11 @@ class TradeEngine:
                 "positionIdx": 0,
                 "stopLoss": f"{sl_price:.10f}",
                 "tpslMode": "Full",
+                # Pass the position size we just measured for the trail so
+                # set_trading_stop doesn't do its own (potentially racing)
+                # re-read inside the binance adapter. Both legs of the
+                # belt-and-braces protection now cover the exact same qty.
+                "qty": f"{size}",
             }
             sl_armed = False
             try:
