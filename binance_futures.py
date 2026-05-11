@@ -566,30 +566,55 @@ class BinanceFutures:
     # ====================================================================== #
     def _place_algo_order(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """POST /fapi/v1/algoOrder. Returns raw algo response with `algoId`.
-        Caller is responsible for setting algoType, type, side, symbol etc.
 
-        Handles -4015 / -1102 duplicate-clientAlgoId by looking up the
-        existing algo and returning it. This makes retries idempotent —
-        a network timeout that's actually delivered to Binance won't be
-        billed as a double-placement.
+        Robustness features for live SL/TRAIL placement:
+          - Bounded retry on transient failures (HTTP 5xx, requests
+            ConnectionError/Timeout, Binance -1003 TOO_MANY_REQUESTS).
+            2 attempts with 80ms / 200ms backoff so total wall time
+            stays within our ~500ms post-fill protection budget.
+            Signed-validation errors (-1102, -4xxx etc) are NOT retried.
+          - -4015 / -1102 duplicate-clientAlgoId is handled by looking
+            up the existing algo via openAlgoOrders. Makes retries safe
+            against a network timeout that was actually delivered.
         """
-        try:
-            resp = self._signed_request("POST", "/fapi/v1/algoOrder", params)
-        except BinanceAPIError as e:
-            if e.code in (-4015, -1102) and params.get("clientAlgoId"):
-                cid = params["clientAlgoId"]
-                sym = params.get("symbol")
-                try:
-                    for ao in self.open_algo_orders(sym):
-                        if ao.get("clientAlgoId") == cid:
-                            resp = ao
+        last_err: Optional[Exception] = None
+        backoffs = [0.0, 0.08, 0.20]  # 3 attempts incl. first
+        resp: Optional[Dict[str, Any]] = None
+        for delay in backoffs:
+            if delay:
+                time.sleep(delay)
+            try:
+                resp = self._signed_request("POST", "/fapi/v1/algoOrder", params)
+                break
+            except BinanceAPIError as e:
+                if e.code in (-4015, -1102) and params.get("clientAlgoId"):
+                    cid = params["clientAlgoId"]
+                    sym = params.get("symbol")
+                    try:
+                        for ao in self.open_algo_orders(sym):
+                            if ao.get("clientAlgoId") == cid:
+                                resp = ao
+                                break
+                        if resp is not None:
                             break
-                    else:
-                        raise
-                except Exception:
-                    raise e
-            else:
+                    except Exception:
+                        pass
+                if e.code == -1003:  # TOO_MANY_REQUESTS — retry
+                    last_err = e
+                    continue
                 raise
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_err = e
+                continue
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", 0) if e.response is not None else 0
+                if 500 <= status < 600:
+                    last_err = e
+                    continue
+                raise
+        if resp is None:
+            assert last_err is not None
+            raise last_err
         algo_id = resp.get("algoId")
         if algo_id is not None:
             with self._algo_lock:
@@ -956,10 +981,11 @@ class BinanceFutures:
         # 3. Build the algo order — side & size were resolved in step 1.
         # Random 4-char suffix on cid prevents collisions when two
         # SLs are placed in the same millisecond on the same symbol.
-        rnd = os.urandom(2).hex()
         # Truncate symbol (not the timestamp) so the suffix is preserved
-        # on long symbols like 1000PEPEUSDT.
-        cid = f"sl-{symbol[:14]}-{int(time.time()*1000)}-{rnd}"[:36]
+        # on long symbols like 1000PEPEUSDT. Route through _encode_link_id
+        # so any future colon/pipe in `symbol` is regex-sanitised.
+        rnd = os.urandom(2).hex()
+        cid = _encode_link_id(f"sl-{symbol[:14]}-{int(time.time()*1000)}-{rnd}")
 
         params: Dict[str, Any] = {
             "algoType": "CONDITIONAL",
@@ -1240,8 +1266,16 @@ class BinanceFutures:
         /fapi/v1/openAlgoOrders (algo). After 2025-12-09 algo-SL/TRAIL
         orders are NOT cancelled by /fapi/v1/allOpenOrders, so this dual
         path is required for true 'everything gone' semantics.
+
+        Returns {"code": 0, "msg": "ok"} only when BOTH sweeps succeeded.
+        Partial outcomes are signalled so callers like cleanup_closed_trades
+        know to retry instead of marking the symbol clean. Orphan algos
+        cause cross-trade misfires — a partial failure must never look
+        like success.
         """
         regular_ok = True
+        algo_ok = True
+        algo_count = 0
         try:
             self._signed_request(
                 "DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}
@@ -1249,24 +1283,41 @@ class BinanceFutures:
         except BinanceAPIError as e:
             if e.code not in (-2011, -2013):
                 regular_ok = False
-                # don't raise — still try to clear algos
 
-        # Sweep algos one-by-one (no documented bulk endpoint that takes
-        # symbol-only filter that we trust to be present on all accounts).
-        try:
-            for a in self.open_algo_orders(symbol):
-                aid = a.get("algoId")
-                if aid is not None:
-                    try:
-                        self._cancel_algo_order_by_id(aid)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        # Enumerate algos. Retry once on transient failure before declaring
+        # algo-partial — an orphan algo here means the next trade on this
+        # symbol can be wrongly closed by a leftover trail.
+        algos: List[Dict[str, Any]] = []
+        for _attempt in range(2):
+            try:
+                algos = self.open_algo_orders(symbol)
+                break
+            except Exception:
+                if _attempt == 1:
+                    algo_ok = False
+                time.sleep(0.1)
+
+        for a in algos:
+            aid = a.get("algoId")
+            if aid is None:
+                continue
+            try:
+                self._cancel_algo_order_by_id(aid)
+                algo_count += 1
+            except Exception:
+                algo_ok = False
 
         with self._sl_lock:
             self._sl_orders.pop(symbol, None)
-        return {"code": 0, "msg": "ok" if regular_ok else "regular-partial"}
+
+        if regular_ok and algo_ok:
+            return {"code": 0, "msg": "ok", "algoCancelled": algo_count}
+        msg_parts = []
+        if not regular_ok:
+            msg_parts.append("regular-partial")
+        if not algo_ok:
+            msg_parts.append("algo-partial")
+        return {"code": -1, "msg": ",".join(msg_parts), "algoCancelled": algo_count}
 
     def _handle_account_update(self, a: Dict[str, Any], on_wallet, on_position):
         """ACCOUNT_UPDATE.a contains B (balances) and P (positions)."""
