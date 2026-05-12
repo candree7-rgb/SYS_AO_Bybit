@@ -67,8 +67,21 @@ class EntryWatcher:
             except Exception:
                 pass
 
-    def watch(self, trade_id: str, symbol: str, side: str, tp1_price: float, entry_oid: str):
-        """Start watching this symbol for TP1 cross. Idempotent per (symbol, trade_id)."""
+    def watch(self, trade_id: str, symbol: str, side: str, tp1_price: float, entry_oid: str,
+              entry_price: Optional[float] = None):
+        """Start watching this symbol for TP1 cross. Idempotent per (symbol, trade_id).
+
+        `entry_price` (optional but RECOMMENDED): the LIMIT entry trigger.
+        When provided, the watch starts in `armed=False` state and only
+        considers TP1-cross meaningful AFTER price has plausibly touched
+        the entry trigger (LIMIT-fill side). This prevents the original
+        bug where a SHORT signal posted with market already below TP1
+        would be cancelled instantly, before the entry's LIMIT SELL had
+        any chance to fill via a price retrace up to the trigger.
+
+        If `entry_price` is None (legacy callers / DRY_RUN paths), the
+        watch is armed=True from t=0 — old behavior preserved.
+        """
         if not tp1_price or tp1_price <= 0:
             self.log.debug(f"[watcher] skip {symbol}: no tp1_price")
             return
@@ -77,13 +90,17 @@ class EntryWatcher:
                 "side": side,
                 "tp1": float(tp1_price),
                 "entry_oid": entry_oid,
+                "entry": float(entry_price) if entry_price else None,
+                # Legacy callers (no entry_price) → armed immediately;
+                # new callers → armed only after entry-touch confirmed.
+                "armed": entry_price is None,
             }
             need_subscribe = symbol not in self._subscribed and self._ws is not None
         if need_subscribe:
             self._send_subscribe([symbol])
             with self._lock:
                 self._subscribed.add(symbol)
-            self.log.info(f"[watcher] subscribed {symbol}@aggTrade (tp1={tp1_price}, side={side})")
+            self.log.info(f"[watcher] subscribed {symbol}@aggTrade (tp1={tp1_price}, side={side}, entry={entry_price})")
 
     def unwatch(self, symbol: str, trade_id: Optional[str] = None):
         """Remove one trade (if trade_id given) or all trades for a symbol.
@@ -204,6 +221,30 @@ class EntryWatcher:
         for trade_id, w in symbol_watches:
             side = w["side"]
             tp1 = w["tp1"]
+            entry = w.get("entry")
+            armed = w.get("armed", True)
+            # Stage 1: arm the watch when price first touches the entry
+            # trigger (side-aware). Pre-arm, ANY TP1 cross is irrelevant
+            # because the entry hasn't had a chance to fill yet — this
+            # is the SHORT-pullback bug where market is already below
+            # TP1 at signal time and would prematurely kill the trade.
+            if not armed and entry is not None:
+                touched = (
+                    (side == "Sell" and last >= entry)
+                    or (side == "Buy" and last <= entry)
+                )
+                if touched:
+                    with self._lock:
+                        t = (self._watches.get(symbol) or {}).get(trade_id)
+                        if t:
+                            t["armed"] = True
+                    self.log.info(
+                        f"[watcher] {symbol} entry-touched (last={last}, entry={entry}) — TP1 watch armed"
+                    )
+                    armed = True
+            if not armed:
+                continue
+            # Stage 2: armed — original TP1-cross logic.
             crossed = (
                 (side == "Sell" and last <= tp1)
                 or (side == "Buy" and last >= tp1)

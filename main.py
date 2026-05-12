@@ -385,8 +385,13 @@ def main():
             tp1 = float(tps[0]) if tps else None
             if tp1:
                 try:
+                    # Pass trigger so the watcher arms only after entry-touch
+                    # (post-restart same as initial-place). Avoids prematurely
+                    # cancelling a pending trade whose market is currently past
+                    # TP1 but hasn't yet retraced to the entry trigger.
                     entry_watcher.watch(
-                        tr["id"], tr["symbol"], tr["order_side"], tp1, tr["entry_order_id"]
+                        tr["id"], tr["symbol"], tr["order_side"], tp1, tr["entry_order_id"],
+                        entry_price=float(tr.get("trigger") or 0) or None,
                     )
                 except Exception as e:
                     log.warning(f"   re-attach failed for {tr.get('symbol')}: {e}")
@@ -779,7 +784,16 @@ def main():
                 if tp1 and not DISABLE_ENTRY_WATCHER:
                     order_side = "Sell" if sig["side"] == "sell" else "Buy"
                     try:
-                        entry_watcher.watch(trade_id, sig["symbol"], order_side, tp1, oid)
+                        # Pass the entry trigger so the watcher arms ONLY
+                        # after price touches it. Prevents premature cancel
+                        # on SHORT setups where market is already below TP1
+                        # at signal time but entry hasn't filled yet (bug
+                        # affected ~27% of signals, of which 84% were
+                        # would-have-been winners).
+                        entry_watcher.watch(
+                            trade_id, sig["symbol"], order_side, tp1, oid,
+                            entry_price=float(sig["trigger"]),
+                        )
                     except Exception as e:
                         log.warning(f"entry_watcher.watch failed: {e}")
                 try:
