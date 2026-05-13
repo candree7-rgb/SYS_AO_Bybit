@@ -1631,7 +1631,6 @@ class TradeEngine:
                                 # position; if it fails the position is
                                 # running unprotected until manually closed.
                                 try:
-                                    import telegram_alerts
                                     telegram_alerts.send_message(
                                         f"🚨 {tr['symbol']}: EMERGENCY CLOSE FAILED ({e}). "
                                         f"Position may be open and unprotected — "
