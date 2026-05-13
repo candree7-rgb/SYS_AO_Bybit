@@ -1481,7 +1481,9 @@ class TradeEngine:
                         or (side == "Buy" and current_price <= trigger)
                     )
                     if touched:
-                        tr["entry_touched"] = True
+                        from state import state_lock as _state_lock
+                        with _state_lock:
+                            tr["entry_touched"] = True
                         self.log.info(
                             f"[poll-validity] {symbol} entry-touched "
                             f"(current={current_price}, trigger={trigger}) — TP1 check armed"
@@ -1525,8 +1527,21 @@ class TradeEngine:
                             )
                         except Exception as e:
                             self.log.warning(f"Failed to cancel entry for {symbol}: {e}")
+                    elif not oid:
+                        # Defensive: a live trade reached the cancel branch
+                        # with no entry_order_id. Shouldn't be reachable —
+                        # fast_signal_handler only inserts into open_trades
+                        # after a successful place_order returns an oid.
+                        # Log loudly so it's visible if it ever fires.
+                        self.log.error(
+                            f"🚨 {symbol}: cancel triggered but entry_order_id is missing — "
+                            f"marking status=cancelled_tp1_reached without API call. "
+                            f"Investigate: trade state {tr}"
+                        )
 
-                    tr["status"] = "cancelled_tp1_reached"
+                    from state import state_lock as _state_lock
+                    with _state_lock:
+                        tr["status"] = "cancelled_tp1_reached"
 
             except Exception as e:
                 self.log.warning(f"Entry validity check failed for {symbol}: {e}")
