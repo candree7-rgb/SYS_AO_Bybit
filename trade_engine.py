@@ -1427,10 +1427,23 @@ class TradeEngine:
                 tr["status"] = "expired"
 
     def check_entry_order_validity(self) -> None:
-        """Cancel entry orders if TP1 was already reached before entry filled.
+        """Cancel entry orders if TP1 was reached AFTER price first touched
+        the entry trigger but the entry order didn't fill (rare — typically
+        thin liquidity).
 
-        This prevents entries from being filled AFTER the signal has already
-        moved past TP1 (signal is "expired").
+        Two-stage arming logic — IDENTICAL to entry_watcher.py to keep both
+        cancel paths consistent:
+          Stage 1 — wait for price to touch the entry trigger (LIMIT-fill
+            side: SHORT needs price >= entry, LONG needs price <= entry).
+            Mark trade with `entry_touched=True`.
+          Stage 2 — only when armed, check if current price is past TP1.
+            If yes, cancel.
+
+        Without Stage 1 this method premature-cancels SHORT pullback setups
+        where market is already below TP1 at signal time and entry hasn't
+        had a chance to fill (~34% of signals in backtest). The matching
+        bug in entry_watcher.py was fixed in 2f9f494; this is the
+        sibling fix for the poll-based path.
         """
         pending_entries = [tr for tr in self.state.get("open_trades", {}).values() if tr.get("status") == "pending"]
         if not pending_entries:
@@ -1451,6 +1464,7 @@ class TradeEngine:
                 continue
 
             tp1_price = float(tp_prices[0])
+            trigger = float(tr.get("trigger") or 0)
 
             try:
                 current_price = self._last_price(symbol)
@@ -1458,16 +1472,42 @@ class TradeEngine:
                     self.log.warning(f"   {symbol}: Could not fetch current price for TP1 check")
                     continue
 
-                tp1_reached = False
+                # Stage 1: arm only after price touches the entry trigger
+                # (side-aware: SHORT needs current >= trigger, LONG needs
+                # current <= trigger — matches the LIMIT-fill side).
+                if not tr.get("entry_touched") and trigger > 0:
+                    touched = (
+                        (side == "Sell" and current_price >= trigger)
+                        or (side == "Buy" and current_price <= trigger)
+                    )
+                    if touched:
+                        tr["entry_touched"] = True
+                        self.log.info(
+                            f"[poll-validity] {symbol} entry-touched "
+                            f"(current={current_price}, trigger={trigger}) — TP1 check armed"
+                        )
+                    else:
+                        # Still waiting for price to retrace to entry.
+                        # Don't even consider TP1 — trade hasn't started.
+                        continue
 
+                # Legacy fallback: no `trigger` field on the trade (older
+                # state file from before the fix). Skip the validity check
+                # entirely rather than risk a premature cancel — 180min
+                # expiration will catch truly-stale entries.
+                if trigger <= 0:
+                    continue
+
+                # Stage 2: armed — original TP1-reached check.
+                tp1_reached = False
                 if side == "Buy":  # LONG: TP1 is above entry
                     if current_price >= tp1_price:
                         tp1_reached = True
-                        self.log.info(f"📈 TP1 reached before entry for {symbol} ({current_price} >= {tp1_price})")
+                        self.log.info(f"📈 TP1 reached after entry-touch for {symbol} ({current_price} >= {tp1_price})")
                 else:  # SHORT: TP1 is below entry
                     if current_price <= tp1_price:
                         tp1_reached = True
-                        self.log.info(f"📉 TP1 reached before entry for {symbol} ({current_price} <= {tp1_price})")
+                        self.log.info(f"📉 TP1 reached after entry-touch for {symbol} ({current_price} <= {tp1_price})")
 
                 if tp1_reached:
                     # Cancel entry order
@@ -1475,13 +1515,13 @@ class TradeEngine:
                     if oid and oid != "DRY_RUN":
                         try:
                             self.cancel_entry(symbol, oid)
-                            self.log.info(f"🚫 Canceled entry order for {symbol} - TP1 already reached")
+                            self.log.info(f"🚫 Canceled entry order for {symbol} - TP1 reached after entry-touch")
 
                             # Send Telegram notification
                             telegram_alerts.send_order_canceled(
                                 symbol=symbol,
                                 side=side,
-                                reason=f"TP1 reached before entry (Current: ${current_price:.6f}, TP1: ${tp1_price:.6f})"
+                                reason=f"TP1 reached after entry-touch (Current: ${current_price:.6f}, TP1: ${tp1_price:.6f})"
                             )
                         except Exception as e:
                             self.log.warning(f"Failed to cancel entry for {symbol}: {e}")
