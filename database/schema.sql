@@ -1,76 +1,88 @@
--- Trading Bot Database Schema
--- PostgreSQL Schema for Railway deployment
+-- SYS_AO_Bybit - PostgreSQL Schema (migrated from hype design, adapted for BE/SL/TP1-TP3)
+-- Railway PostgreSQL: auto-created on first startup via db_export.init_database()
+-- Manual setup: psql $DATABASE_URL -f database/schema.sql
 
--- Trades Table: Stores all trade details
+-- ══════════════════════════════════════════════════════════════════════════
+-- TRADES: Every closed trade with full P&L details
+-- ══════════════════════════════════════════════════════════════════════════
+
 CREATE TABLE IF NOT EXISTS trades (
-    id VARCHAR(100) PRIMARY KEY,
-    symbol VARCHAR(20) NOT NULL,
-    side VARCHAR(10) NOT NULL,  -- 'Long' or 'Short'
-    order_side VARCHAR(10) NOT NULL,  -- 'Buy' or 'Sell'
+    trade_id            VARCHAR(100) PRIMARY KEY,
+    symbol              VARCHAR(30) NOT NULL,
+    side                VARCHAR(10) NOT NULL,       -- 'long' or 'short'
 
     -- Pricing
-    entry_price DECIMAL(20, 8),
-    trigger_price DECIMAL(20, 8),
-    avg_entry DECIMAL(20, 8),  -- After DCA fills
+    entry_price         DECIMAL(20, 8),             -- Signal entry price
+    avg_price           DECIMAL(20, 8),             -- Weighted avg (= entry_price when no DCA, else weighted)
+    close_price         DECIMAL(20, 8),
 
-    -- Timing
-    placed_at TIMESTAMP WITH TIME ZONE,
-    filled_at TIMESTAMP WITH TIME ZONE,
-    closed_at TIMESTAMP WITH TIME ZONE,
-    duration_minutes INTEGER,
+    -- Position
+    total_qty           DECIMAL(20, 8),
+    total_margin        DECIMAL(20, 8),
+    leverage            INTEGER DEFAULT 5,
 
-    -- Performance
-    realized_pnl DECIMAL(20, 8),
-    pnl_pct_margin DECIMAL(10, 4),  -- PnL % relative to margin used
-    pnl_pct_equity DECIMAL(10, 6),  -- PnL % relative to equity before trade
-    margin_used DECIMAL(20, 8),
-    equity_at_close DECIMAL(20, 8),
-    is_win BOOLEAN,
+    -- P&L
+    realized_pnl        DECIMAL(20, 8) DEFAULT 0,
+    pnl_pct_margin      DECIMAL(10, 4),             -- PnL % of margin used
+    pnl_pct_equity      DECIMAL(10, 6),             -- PnL % of equity
+    equity_at_entry     DECIMAL(12, 2),
+    equity_at_close     DECIMAL(12, 2),
+    is_win              BOOLEAN,
 
-    -- Risk & Leverage Settings (captured at trade creation)
-    risk_pct DECIMAL(5, 2),          -- Risk % setting used (e.g. 5.00, 10.00)
-    risk_amount DECIMAL(12, 2),      -- Risk amount in $ (e.g. 200.00)
-    equity_at_entry DECIMAL(12, 2),  -- Account equity at trade entry (e.g. 4000.00)
-    leverage INTEGER,                -- Leverage setting used (e.g. 5, 10)
+    -- Exit details (BE / SL / TP1-TP3 strategy)
+    tp1_hit             BOOLEAN DEFAULT FALSE,
+    tps_hit             INTEGER DEFAULT 0,          -- Total TPs filled (0-3)
+    trail_pnl_pct       DECIMAL(10, 4) DEFAULT 0,   -- Trail price-% from avg
+    close_reason        VARCHAR(200),               -- 'TP1+trail', 'BE-trail', 'Hard SL', etc.
 
-    -- Trade Details
-    timeframe VARCHAR(10),           -- Signal timeframe (e.g. H1, M15, H4)
-    exit_reason VARCHAR(50),
-    tp_fills INTEGER DEFAULT 0,
-    tp_count INTEGER DEFAULT 3,
-    dca_fills INTEGER DEFAULT 0,
-    dca_count INTEGER DEFAULT 2,
-    trailing_used BOOLEAN DEFAULT FALSE,
+    -- Config / signal context
+    signal_leverage     INTEGER DEFAULT 0,          -- Original signal leverage
+    equity_pct_per_trade DECIMAL(5, 2) DEFAULT 5.0, -- Bot's risk % when trade was opened
+    timeframe           VARCHAR(10),                -- Signal timeframe (H1, M15, H4, ...)
 
     -- Multi-bot support
-    bot_id VARCHAR(50) DEFAULT 'ao',
+    bot_id              VARCHAR(50) DEFAULT 'ao',
+
+    -- Timing
+    opened_at           TIMESTAMPTZ,
+    closed_at           TIMESTAMPTZ,
+    duration_minutes    INTEGER,
 
     -- Metadata
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Daily Equity Table: Stores end-of-day equity snapshots
-CREATE TABLE IF NOT EXISTS daily_equity (
-    date DATE PRIMARY KEY,
-    equity DECIMAL(20, 8) NOT NULL,
-    daily_pnl DECIMAL(20, 8),  -- Change from previous day
-    daily_pnl_pct DECIMAL(10, 4),  -- % change from previous day
-    trades_count INTEGER DEFAULT 0,
-    wins_count INTEGER DEFAULT 0,
-    losses_count INTEGER DEFAULT 0,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_trades_closed_at ON trades(closed_at);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_is_win ON trades(is_win);
+CREATE INDEX IF NOT EXISTS idx_trades_side ON trades(side);
 CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id);
 CREATE INDEX IF NOT EXISTS idx_trades_timeframe ON trades(timeframe);
-CREATE INDEX IF NOT EXISTS idx_daily_equity_date ON daily_equity(date);
 
--- Function to update updated_at timestamp
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- DAILY EQUITY: Snapshot for equity chart in dashboard
+-- ══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS daily_equity (
+    date            DATE PRIMARY KEY,
+    equity          DECIMAL(20, 8) NOT NULL,
+    daily_pnl       DECIMAL(20, 8),
+    daily_pnl_pct   DECIMAL(10, 4),
+    trades_count    INTEGER DEFAULT 0,
+    wins_count      INTEGER DEFAULT 0,
+    losses_count    INTEGER DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_equity_date ON daily_equity(date);
+
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- AUTO-UPDATE TRIGGER
+-- ══════════════════════════════════════════════════════════════════════════
+
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -79,35 +91,86 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
--- Trigger to auto-update updated_at
-DROP TRIGGER IF EXISTS update_trades_updated_at ON trades;
-CREATE TRIGGER update_trades_updated_at
-    BEFORE UPDATE ON trades
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
-
--- Migration: Add bot_id column if it doesn't exist (for existing databases)
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name = 'trades' AND column_name = 'bot_id') THEN
-        ALTER TABLE trades ADD COLUMN bot_id VARCHAR(50) DEFAULT 'ao';
-        CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id);
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_trades_updated_at') THEN
+        CREATE TRIGGER update_trades_updated_at
+            BEFORE UPDATE ON trades
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column();
     END IF;
+END
+$$;
 
-    -- Migration: Add risk/leverage tracking columns (2026-01-07)
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name = 'trades' AND column_name = 'risk_pct') THEN
-        ALTER TABLE trades ADD COLUMN risk_pct DECIMAL(5, 2);
-        ALTER TABLE trades ADD COLUMN risk_amount DECIMAL(12, 2);
-        ALTER TABLE trades ADD COLUMN equity_at_entry DECIMAL(12, 2);
-        ALTER TABLE trades ADD COLUMN leverage INTEGER;
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- MIGRATIONS: Safe ADD COLUMN (idempotent, skips if exists)
+-- ══════════════════════════════════════════════════════════════════════════
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name='tps_hit') THEN
+        ALTER TABLE trades ADD COLUMN tps_hit INTEGER DEFAULT 0;
     END IF;
-
-    -- Migration: Add timeframe column (2026-01-11)
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name = 'trades' AND column_name = 'timeframe') THEN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name='trail_pnl_pct') THEN
+        ALTER TABLE trades ADD COLUMN trail_pnl_pct DECIMAL(10,4) DEFAULT 0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name='equity_pct_per_trade') THEN
+        ALTER TABLE trades ADD COLUMN equity_pct_per_trade DECIMAL(5,2) DEFAULT 5.0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name='timeframe') THEN
         ALTER TABLE trades ADD COLUMN timeframe VARCHAR(10);
         CREATE INDEX IF NOT EXISTS idx_trades_timeframe ON trades(timeframe);
     END IF;
-END $$;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name='bot_id') THEN
+        ALTER TABLE trades ADD COLUMN bot_id VARCHAR(50) DEFAULT 'ao';
+        CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id);
+    END IF;
+END
+$$;
+
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- DISCORD_SIGNALS: Historical signal-message dump for backtesting
+-- Populated by export_signals.py / EXPORT_HISTORY=1 startup mode.
+-- One row per Discord message that looked like a signal.
+-- ══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS discord_signals (
+    msg_id              VARCHAR(40) PRIMARY KEY,
+    channel_id          VARCHAR(40),
+    timestamp_iso       TIMESTAMP WITH TIME ZONE,
+    edited_iso          TIMESTAMP WITH TIME ZONE,
+
+    -- Parsed signal fields
+    base_symbol         VARCHAR(30),
+    symbol              VARCHAR(40),                -- base + USDT
+    side                VARCHAR(10),                -- 'SHORT' or 'LONG'
+    trigger_price       DECIMAL(30, 12),
+    sl_price            DECIMAL(30, 12),
+    tp1                 DECIMAL(30, 12),
+    tp2                 DECIMAL(30, 12),
+    tp3                 DECIMAL(30, 12),
+    tp4                 DECIMAL(30, 12),
+
+    -- Final state of the message at export time
+    tp1_hit             BOOLEAN DEFAULT FALSE,
+    tp2_hit             BOOLEAN DEFAULT FALSE,
+    tp3_hit             BOOLEAN DEFAULT FALSE,
+    tp4_hit             BOOLEAN DEFAULT FALSE,
+    status              VARCHAR(20),                -- win/loss/breakeven/active/cancelled/closed/unknown
+    closed_pnl_pct      DECIMAL(10, 4),
+    open_pnl_pct        DECIMAL(10, 4),
+
+    -- Was the strict signal_parser.parse_signal() able to read this as a fresh signal?
+    fresh_parsable      BOOLEAN DEFAULT FALSE,
+
+    -- Raw text for offline re-parsing if format changes
+    raw_text            TEXT,
+
+    imported_at         TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_signals_symbol      ON discord_signals(symbol);
+CREATE INDEX IF NOT EXISTS idx_signals_timestamp   ON discord_signals(timestamp_iso);
+CREATE INDEX IF NOT EXISTS idx_signals_status      ON discord_signals(status);

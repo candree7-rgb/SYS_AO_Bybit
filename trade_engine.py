@@ -7,12 +7,14 @@ import db_export
 import telegram_alerts
 
 from config import (
-    CATEGORY, ACCOUNT_TYPE, QUOTE, LEVERAGE, RISK_PCT,
+    CATEGORY, ACCOUNT_TYPE, QUOTE, LEVERAGE, RISK_PCT, BOT_ID,
     ENTRY_EXPIRATION_MIN, ENTRY_TOO_FAR_PCT, ENTRY_TRIGGER_BUFFER_PCT, ENTRY_LIMIT_PRICE_OFFSET_PCT,
     ENTRY_EXPIRATION_PRICE_PCT,
     TP_SPLITS, DCA_QTY_MULTS, INITIAL_SL_PCT, FALLBACK_TP_PCT,
     MOVE_SL_TO_BE_ON_TP1, BREAKEVEN_PROFIT_BUFFER_PCT,
     TRAIL_AFTER_TP_INDEX, TRAIL_DISTANCE_PCT, TRAIL_ACTIVATE_ON_TP,
+    FIXED_RISK_PROFILE, FIXED_SL_PCT, FIXED_TP_PCTS,
+    LEVERAGE_OVERRIDES,
     DRY_RUN
 )
 
@@ -23,14 +25,21 @@ def _pos_side(side: str) -> str:
     return "Long" if side == "Buy" else "Short"
 
 class TradeEngine:
-    def __init__(self, bybit, state: dict, logger):
-        self.bybit = bybit
+    def __init__(self, client, state: dict, logger, entry_watcher=None):
+        # `client` is a BinanceFutures instance exposing the Bybit-shaped
+        # API (place_order/cancel_order/positions/wallet_equity/etc.).
+        # Attribute kept as `self.bybit` to minimise diffs in the methods
+        # below; callers never need to know the underlying exchange.
+        self.bybit = client
         self.state = state
         self.log = logger
+        self.entry_watcher = entry_watcher
         self._instrument_cache: Dict[str, Dict[str, float]] = {}  # symbol -> rules
         self._cache_ttl = 300  # 5 min cache
         self._cache_times: Dict[str, float] = {}
         self._last_stats_day: str = ""
+        # Symbols whose leverage we have already set this session
+        self._leverage_set: set = set()
 
     # ---------- startup sync ----------
     def startup_sync(self) -> None:
@@ -72,6 +81,30 @@ class TradeEngine:
                 self.log.warning("   These positions will NOT be managed automatically!")
             else:
                 self.log.info(f"✅ Startup sync: {len(open_positions)} position(s), all tracked")
+
+            # Hydrate the Binance client's SL pointer from open SL orders so
+            # set_trading_stop (BE-move on TP1) works after a process
+            # restart instead of falling through to the open-orders scan
+            # path on every call. Identifies SL orders by either the
+            # ":SL"/"|SL" suffix we use or the Binance stopOrderType field.
+            if hasattr(self.bybit, "_sl_orders"):
+                for pos in open_positions:
+                    sym = pos.get("symbol")
+                    if not sym:
+                        continue
+                    try:
+                        for o in self.bybit.open_orders(CATEGORY, sym):
+                            link = (o.get("orderLinkId") or "")
+                            stop_type = (o.get("stopOrderType") or "")
+                            if link.endswith(":SL") or link.endswith("|SL") or stop_type == "Stop":
+                                oid = str(o.get("orderId", ""))
+                                if oid:
+                                    with self.bybit._sl_lock:
+                                        self.bybit._sl_orders[sym] = oid
+                                    self.log.info(f"♻️  Hydrated SL pointer: {sym} → {oid}")
+                                break
+                    except Exception as e:
+                        self.log.debug(f"SL hydration failed for {sym}: {e}")
 
             # Log performance report at startup
             if self.state.get("trade_history"):
@@ -140,11 +173,20 @@ class TradeEngine:
         info = self.bybit.instruments_info(CATEGORY, symbol)
         lot = info.get("lotSizeFilter") or {}
         price_filter = info.get("priceFilter") or {}
+        leverage_filter = info.get("leverageFilter") or {}
         qty_step = float(lot.get("qtyStep") or lot.get("basePrecision") or "0.000001")
         min_qty  = float(lot.get("minOrderQty") or "0")
         tick_size = float(price_filter.get("tickSize") or "0.0001")
+        # Bybit returns this as a string like "12.5" or "100"; default to a
+        # large value so unknown returns don't accidentally cap leverage.
+        max_leverage = float(leverage_filter.get("maxLeverage") or "100")
 
-        rules = {"qty_step": qty_step, "min_qty": min_qty, "tick_size": tick_size}
+        rules = {
+            "qty_step": qty_step,
+            "min_qty": min_qty,
+            "tick_size": tick_size,
+            "max_leverage": max_leverage,
+        }
         self._instrument_cache[symbol] = rules
         self._cache_times[symbol] = now
         return rules
@@ -162,11 +204,45 @@ class TradeEngine:
             qty = min_qty
         return float(f"{qty:.10f}")
 
+    def _effective_leverage(self, symbol: str):
+        """Effective leverage = min(env LEVERAGE, override, exchange max).
+
+        Resolution order:
+          1. LEVERAGE_OVERRIDES env (manually configured per symbol)
+          2. Bybit instrument-info maxLeverage (auto-detected, cached)
+          3. fall back to env LEVERAGE
+        Whichever is smallest wins — we never exceed what Bybit allows."""
+        base = symbol.replace(QUOTE, "").upper()
+        manual = LEVERAGE_OVERRIDES.get(base)
+        try:
+            exchange_max = self._get_instrument_rules(symbol).get("max_leverage", LEVERAGE)
+        except Exception:
+            exchange_max = LEVERAGE
+        candidates = [LEVERAGE]
+        if manual is not None:
+            candidates.append(manual)
+        candidates.append(exchange_max)
+        return min(candidates)
+
+    def _effective_risk_pct(self, symbol: str) -> float:
+        """Scale risk_pct so that notional stays constant when leverage is
+        capped below the env default. e.g. default 10%/20x → SIREN at 5x →
+        40%/5x. Same notional exposure, same $-risk per trade."""
+        eff_lev = self._effective_leverage(symbol)
+        if eff_lev == LEVERAGE:
+            return RISK_PCT
+        # notional_default = RISK_PCT * LEVERAGE; keep equal:
+        return RISK_PCT * LEVERAGE / eff_lev
+
     def calc_base_qty(self, symbol: str, entry_price: float) -> float:
-        # Risk model: margin = equity * RISK_PCT; notional = margin * LEVERAGE; qty = notional / price
-        equity = self.bybit.wallet_equity(ACCOUNT_TYPE)
-        margin = equity * (RISK_PCT / 100.0)
-        notional = margin * LEVERAGE
+        # Risk model: margin = equity * effective_risk_pct;
+        #             notional = margin * effective_leverage;
+        #             qty = notional / price
+        equity = self.bybit.wallet_equity(ACCOUNT_TYPE)  # cached
+        eff_risk = self._effective_risk_pct(symbol)
+        eff_lev = self._effective_leverage(symbol)
+        margin = equity * (eff_risk / 100.0)
+        notional = margin * eff_lev
         qty = notional / entry_price
 
         rules = self._get_instrument_rules(symbol)
@@ -203,7 +279,14 @@ class TradeEngine:
                 return p
         return None
 
-    def position_size_avg(self, symbol: str) -> tuple[float, float]:
+    def position_size_avg(self, symbol: str, fresh: bool = False) -> tuple[float, float]:
+        # Prefer WS-cached position (sub-ms) over REST. Pass fresh=True for
+        # safety-critical paths (orphan detection in cleanup_closed_trades)
+        # where we need ground-truth from Bybit, not a possibly-stale cache.
+        if not fresh:
+            cached = self.bybit.get_cached_position(symbol)
+            if cached is not None:
+                return cached
         p = self._position(symbol)
         if not p:
             return 0.0, 0.0
@@ -213,6 +296,16 @@ class TradeEngine:
 
     # ---------- core actions ----------
     def place_conditional_entry(self, sig: Dict[str, Any], trade_id: str) -> Optional[str]:
+        """Place-first model: minimum work in critical path.
+
+        Skips: last_price call, too_far check, beyond_expiry check.
+        The entry_watcher (Bybit public-WS ticker) cancels the order if TP1
+        is crossed before the conditional fills — that's the safety net.
+
+        Bybit calls in critical path (warm path, leverage cached, equity cached):
+            place_order — that's it (~200ms total).
+        Cold path (first trade on new symbol) adds set_leverage (~150ms).
+        """
         symbol = sig["symbol"]
         side   = "Sell" if sig["side"] == "sell" else "Buy"
         trigger = float(sig["trigger"])
@@ -225,24 +318,54 @@ class TradeEngine:
                 self.log.info(f"⏭️  SKIP {symbol} – already managed by bot '{other_bot}' (symbol locked)")
                 return None
 
-        # ensure leverage set
-        try:
-            if not DRY_RUN:
-                self.bybit.set_leverage(CATEGORY, symbol, LEVERAGE)
-        except Exception as e:
-            self.log.warning(f"set_leverage failed for {symbol}: {e}")
-
-        last = self.bybit.last_price(CATEGORY, symbol)
-        if self._too_far(side, last, trigger):
-            self.log.info(f"SKIP {symbol} – too far past trigger (last={last}, trigger={trigger})")
-            return None
-        if self._beyond_expiry_price(side, last, trigger):
-            self.log.info(f"SKIP {symbol} – beyond expiry-price rule (last={last}, trigger={trigger})")
-            return None
-
-        # Get instrument rules for price/qty rounding
         rules = self._get_instrument_rules(symbol)
         tick_size = rules["tick_size"]
+
+        # ── Apply fixed risk profile (overrides signal SL/TPs) ──────────────
+        # Mutates `sig` so main.py persists the final values into trade state.
+        if FIXED_RISK_PROFILE:
+            if side == "Sell":
+                sl_price = trigger * (1 + FIXED_SL_PCT / 100.0)
+                tp_prices = [trigger * (1 - p / 100.0) for p in FIXED_TP_PCTS]
+            else:
+                sl_price = trigger * (1 - FIXED_SL_PCT / 100.0)
+                tp_prices = [trigger * (1 + p / 100.0) for p in FIXED_TP_PCTS]
+            sl_price = self._round_price(sl_price, tick_size)
+            tp_prices = [self._round_price(p, tick_size) for p in tp_prices]
+            sig["sl_price"] = sl_price
+            sig["tp_prices"] = tp_prices
+        else:
+            sl_price = float(sig.get("sl_price") or 0) or None
+            if sl_price:
+                sl_price = self._round_price(sl_price, tick_size)
+
+        # ── Cold-path: parallelize set_leverage + wallet_equity ────────────
+        # On a fresh symbol both set_leverage and wallet_equity may be cold
+        # (each ~150ms). They're independent — fire them in parallel via a
+        # tiny thread pool. Warm path: both return instantly from cache.
+        # SAFETY: if set_leverage fails (and it's not the "already set"
+        # 110043 path), we ABORT the trade rather than place at unknown
+        # leverage. Otherwise Bybit could open the position with the
+        # account-default leverage (e.g. 10x when we wanted 5x for SIREN),
+        # which silently breaks the qty calc and risks margin call.
+        need_lev = symbol not in self._leverage_set and not DRY_RUN
+        if need_lev:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_lev = ex.submit(self._set_leverage_safe, symbol)
+                f_eq  = ex.submit(self.bybit.wallet_equity, ACCOUNT_TYPE)
+                lev_ok = f_lev.result()
+                # equity result discarded — cached for calc_base_qty below
+                try:
+                    f_eq.result()
+                except Exception:
+                    pass
+                if not lev_ok:
+                    self.log.error(
+                        f"❌ ABORT {symbol}: set_leverage failed and we don't "
+                        f"know what leverage Bybit will apply — refusing to place"
+                    )
+                    return None
+                self._leverage_set.add(symbol)
 
         # buffer: slightly earlier trigger if desired
         trigger_adj = trigger * (1 - ENTRY_TRIGGER_BUFFER_PCT / 100.0) if side == "Buy" else trigger * (1 + ENTRY_TRIGGER_BUFFER_PCT / 100.0)
@@ -258,9 +381,48 @@ class TradeEngine:
                 limit_price = trigger * (1 - off)
         limit_price = self._round_price(limit_price, tick_size)
 
-        qty = self.calc_base_qty(symbol, trigger)
-        td = self._trigger_direction(last, trigger_adj)
+        qty = self.calc_base_qty(symbol, trigger)  # uses cached equity (sub-ms warm)
 
+        # Pre-flight: if market is already past TP1, abort BEFORE
+        # submitting. Realistic-filter sweep showed this rejects ~40 % of
+        # signals — most of which would still be profitable (price often
+        # rallies back to trigger and the move continues to TP2/TP3).
+        # Gate behind DISABLE_PREFLIGHT_TP1 so it can be toggled live.
+        from config import DISABLE_PREFLIGHT_TP1
+        if not DISABLE_PREFLIGHT_TP1:
+            try:
+                last = self._last_price(symbol)
+            except Exception as e:
+                self.log.warning(f"last_price lookup failed for {symbol}: {e} — skipping pre-flight check")
+                last = None
+            tps_for_check = sig.get("tp_prices") or []
+            if last is not None and tps_for_check:
+                tp1 = float(tps_for_check[0])
+                already_past_tp1 = (
+                    (side == "Sell" and last <= tp1)
+                    or (side == "Buy" and last >= tp1)
+                )
+                if already_past_tp1:
+                    self.log.info(
+                        f"⏭️  SKIP {symbol}: market last={last} already past TP1={tp1} "
+                        f"({'short' if side == 'Sell' else 'long'} would enter into instant loss)"
+                    )
+                    return None
+
+        # Plain LIMIT order — no triggerPrice/triggerDirection.
+        # Why not conditional?
+        #   - Bybit's conditional requires triggerDirection match the market
+        #     at place-time (110093 if mismatch). Volatile alts can drop
+        #     0.4% in the 500ms place_order roundtrip → race.
+        #   - For our use case (entry at trigger price OR better), plain
+        #     LIMIT does the same thing: order sits in the orderbook,
+        #     fills the moment the market matches our limit_price.
+        #   - entry_watcher still cancels on TP1-cross before fill.
+        # SHORT @ trigger 0.079341, market 0.07912:
+        #   plain limit sell @ 0.079341 → waits for market to rise to 0.079341
+        # SHORT @ trigger 0.079341, market 0.080:
+        #   plain limit sell @ 0.079341 → fills IMMEDIATELY at best bid
+        #   (which is >= 0.079341, so we sell at a BETTER price than trigger)
         body = {
             "category": CATEGORY,
             "symbol": symbol,
@@ -269,38 +431,159 @@ class TradeEngine:
             "qty": f"{qty:.10f}",
             "price": f"{limit_price:.10f}",
             "timeInForce": "GTC",
-            "triggerDirection": td,
-            "triggerPrice": f"{trigger_adj:.10f}",
-            "triggerBy": "LastPrice",
             "reduceOnly": False,
             "closeOnTrigger": False,
             "orderLinkId": trade_id,
         }
 
+        # ── Inline stopLoss in the entry order ──────────────────────────────
+        # Inline SL: Bybit attaches it to the position when the entry fills;
+        # Binance translates this to a batchOrders [LIMIT, STOP_MARKET]
+        # submitted in 1 RTT. The exchange may report SL leg failure even
+        # though the entry succeeded — see slInlineOk handling below.
+        sl_inline_requested = False
+        if sl_price:
+            body["stopLoss"] = f"{sl_price:.10f}"
+            body["slTriggerBy"] = "LastPrice"
+            body["tpslMode"] = "Full"
+            sl_inline_requested = True
+        sig["_base_qty"] = qty          # consumed by main.py — avoid recompute
+
         if DRY_RUN:
             self.log.info(f"DRY_RUN ENTRY {symbol}: {body}")
+            sig["_sl_inline"] = sl_inline_requested
             return "DRY_RUN"
 
         try:
-            self.log.debug(f"Bybit place_order request: {body}")
+            self.log.debug(f"place_order request: {body}")
             resp = self.bybit.place_order(body)
-            self.log.debug(f"Bybit place_order response: {resp}")
-            oid = (resp.get("result") or {}).get("orderId")
-            if oid:
-                self.log.info(f"✅ Bybit order created: {symbol} orderId={oid}")
+            self.log.debug(f"place_order response: {resp}")
+            result = resp.get("result") or {}
+            oid = result.get("orderId")
+            # The Binance client reports whether the inline SL leg actually
+            # was accepted. Only mark the trade as "SL set" if it really is —
+            # otherwise place_post_entry_orders will re-issue an SL after fill.
+            if sl_inline_requested:
+                sl_actually_inline = bool(result.get("slInlineOk", True))
+                if not sl_actually_inline:
+                    self.log.warning(
+                        f"⚠️ {symbol}: inline SL leg of batchOrders failed — "
+                        f"will re-set SL after entry fill"
+                    )
+                sig["_sl_inline"] = sl_actually_inline
             else:
-                self.log.warning(f"⚠️ Bybit response has no orderId: {resp}")
+                sig["_sl_inline"] = False
+            if oid:
+                if sig.get("_sl_inline"):
+                    self.log.info(f"✅ Order created: {symbol} orderId={oid} (SL inline @ {sl_price})")
+                else:
+                    self.log.info(f"✅ Order created: {symbol} orderId={oid} (SL will be set post-fill)")
+            else:
+                self.log.warning(f"⚠️ Order response has no orderId: {resp}")
             return oid
         except Exception as e:
-            self.log.error(f"❌ Bybit place_order FAILED for {symbol}: {e}")
+            self.log.error(f"❌ place_order FAILED for {symbol}: {e}")
             return None
 
-    def cancel_entry(self, symbol: str, order_id: str) -> None:
+    def _last_price(self, symbol: str) -> float:
+        """Fetch last price, preferring entry_watcher's WS ticker cache.
+        Falls back to REST. Subscribes the symbol on first miss so subsequent
+        reads hit the WS cache (sub-ms)."""
+        if self.entry_watcher is not None:
+            cached = self.entry_watcher.get_last_price(symbol)
+            if cached is not None:
+                return cached
+            try:
+                self.entry_watcher.ensure_subscribed(symbol)
+            except Exception:
+                pass
+        return self.bybit.last_price(CATEGORY, symbol)
+
+    def _safe_equity_refresh(self):
+        """Background equity cache refresh — swallows errors silently
+        because the next REST call will retry anyway."""
+        try:
+            self.bybit.wallet_equity(ACCOUNT_TYPE, force_refresh=True)
+        except Exception:
+            pass
+
+    def _set_leverage_safe(self, symbol: str) -> bool:
+        """Set margin-mode (idempotent) + leverage. Treats Bybit's 110043
+        (not modified) and Binance's -4045/-4046 (already set) as cached
+        success. On Binance -4028 (invalid leverage) re-attempts with the
+        requested value halved, since some symbols have leverage caps
+        below LEVERAGE_OVERRIDES default and our exchangeInfo cache may
+        be stale."""
+        eff_lev = self._effective_leverage(symbol)
+        if eff_lev != LEVERAGE:
+            self.log.info(
+                f"[engine] {symbol}: leverage override {eff_lev}x "
+                f"(default {LEVERAGE}x), risk {self._effective_risk_pct(symbol):.1f}% "
+                f"(default {RISK_PCT}%) — same notional"
+            )
+        # Margin-mode first (Binance rejects mode change once a position
+        # exists). Bybit client doesn't have set_margin_mode — guarded.
+        try:
+            from config import MARGIN_MODE as _mm
+            if hasattr(self.bybit, "set_margin_mode"):
+                self.bybit.set_margin_mode(symbol, _mm)
+        except Exception as e:
+            self.log.debug(f"set_margin_mode {symbol}: {e}")
+
+        # Retry-with-halving loop for Binance -4028. After 4 halvings
+        # (20 → 10 → 5 → 2 → 1) we give up.
+        attempt_lev = eff_lev
+        for _ in range(5):
+            try:
+                self.bybit.set_leverage(CATEGORY, symbol, attempt_lev)
+                if attempt_lev != eff_lev:
+                    self.log.info(
+                        f"[engine] {symbol}: clamped leverage to {attempt_lev}x "
+                        f"(symbol cap below requested {eff_lev}x)"
+                    )
+                return True
+            except Exception as e:
+                msg = str(e)
+                if "110043" in msg or "-4045" in msg or "-4046" in msg:
+                    return True
+                if "-4028" in msg and attempt_lev > 1:
+                    new_lev = max(1, int(attempt_lev) // 2)
+                    if new_lev == int(attempt_lev):
+                        new_lev = max(1, int(attempt_lev) - 1)
+                    attempt_lev = new_lev
+                    continue
+                self.log.warning(f"set_leverage failed for {symbol}: {e}")
+                return False
+        self.log.warning(f"set_leverage gave up for {symbol} after halving retries")
+        return False
+
+    def cancel_entry(self, symbol: str, order_id: str, trade_id: Optional[str] = None) -> None:
         body = {"category": CATEGORY, "symbol": symbol, "orderId": order_id}
         if DRY_RUN:
             self.log.info(f"DRY_RUN cancel entry: {body}")
-            return
-        self.bybit.cancel_order(body)
+        else:
+            try:
+                self.bybit.cancel_order(body)
+            except Exception as e:
+                self.log.debug(f"cancel_entry {symbol} {order_id}: {e}")
+            # Also kill the inline SL that was placed alongside this entry
+            # in the same batchOrders call. Without this it lingers as an
+            # orphaned STOP_MARKET closePosition=true and would fire on a
+            # subsequent trade for the same symbol (same-symbol race).
+            if trade_id:
+                try:
+                    self.bybit.cancel_order({
+                        "category": CATEGORY,
+                        "symbol": symbol,
+                        "orderLinkId": f"{trade_id}:SL",
+                    })
+                except Exception as e:
+                    self.log.debug(f"orphan-SL cancel for {symbol}: {e}")
+        if self.entry_watcher:
+            # Pass trade_id so we don't accidentally clear watches for
+            # OTHER pending trades on the same symbol (rare but real
+            # when MAX_CONCURRENT_TRADES allows multiple).
+            self.entry_watcher.unwatch(symbol, trade_id)
 
     def _generate_fallback_tps(self, entry: float, side: str, tick_size: float) -> List[float]:
         """Generate fallback TP prices based on % distance from entry."""
@@ -312,6 +595,170 @@ class TradeEngine:
                 tp = entry * (1 + pct / 100.0)
             tps.append(self._round_price(tp, tick_size))
         return tps
+
+    def _place_trailing_stop_orders(self, trade: Dict[str, Any], side: str,
+                                     entry: float, tick_size: float) -> None:
+        """Submit ONE TRAILING_STOP_MARKET with closePosition=true.
+
+        Independently of the trail, ensures a hard SL is on the position:
+        if the inline-SL leg of the entry batchOrders failed (-2021 from a
+        cross with mark, an exchange validation, etc.), we call
+        set_trading_stop here so the position is never left unprotected.
+        This is the "belt" — the trail is the "braces".
+        """
+        from config import TRAIL_ACTIVATION_PCT, TRAIL_CALLBACK_RATE, INITIAL_SL_PCT
+        symbol = trade["symbol"]
+        # SHORT (side=Sell): activation BELOW entry → trail arms when price
+        # drops to it. LONG: activation ABOVE entry. callbackRate is the %
+        # retracement from the post-activation extreme that fires market exit.
+        if side == "Sell":
+            activation = entry * (1 - TRAIL_ACTIVATION_PCT / 100.0)
+        else:
+            activation = entry * (1 + TRAIL_ACTIVATION_PCT / 100.0)
+        activation = self._round_price(activation, tick_size)
+
+        # Position size check — the entry must have filled before we can
+        # arm a trail. Backstop in case the WS handler dispatches us early.
+        size, _avg = self.position_size_avg(symbol)
+        if size <= 0:
+            self.log.warning(f"No position size yet for {symbol}; will retry trail-stop")
+            return
+
+        # ── Belt: ensure hard SL is on the position ──
+        # If inline SL during entry batchOrders succeeded, trust it.
+        # Otherwise issue set_trading_stop here, BEFORE attempting the trail,
+        # so a failing trail can't leave the position unprotected.
+        if not bool(trade.get("sl_set_inline")):
+            sl_price = trade.get("sl_price")
+            if not sl_price:
+                # No signal SL stored — fall back to INITIAL_SL_PCT from entry.
+                sl_pct = INITIAL_SL_PCT / 100.0
+                sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
+            sl_price = self._round_price(float(sl_price), tick_size)
+            ts_body = {
+                "category": CATEGORY,
+                "symbol": symbol,
+                "positionIdx": 0,
+                "stopLoss": f"{sl_price:.10f}",
+                "tpslMode": "Full",
+                # Pass the position size we just measured for the trail so
+                # set_trading_stop doesn't do its own (potentially racing)
+                # re-read inside the binance adapter. Both legs of the
+                # belt-and-braces protection now cover the exact same qty.
+                "qty": f"{size}",
+            }
+            sl_armed = False
+            try:
+                if DRY_RUN:
+                    self.log.info(f"DRY_RUN set SL (trail-mode fallback): {ts_body}")
+                    sl_armed = True
+                else:
+                    resp = self.bybit.set_trading_stop(ts_body)
+                    # set_trading_stop may silently no-op when the position
+                    # cache lag / REST fail makes _closing_side return None:
+                    # it then returns {"noPosition": True} with retCode 0.
+                    # Treat that — and any response without orderId — as
+                    # a failure so we don't falsely mark sl_set_inline.
+                    result = (resp or {}).get("result") or {}
+                    if result.get("noPosition"):
+                        raise RuntimeError(
+                            f"set_trading_stop returned noPosition for {symbol} — "
+                            f"SL was NOT armed"
+                        )
+                    if not result.get("orderId"):
+                        raise RuntimeError(
+                            f"set_trading_stop returned no orderId for {symbol}: {result}"
+                        )
+                    sl_armed = True
+                if sl_armed:
+                    self.log.info(f"✅ Hard SL set @ {sl_price} (trail-mode fallback)")
+                    trade["sl_set_inline"] = True
+            except Exception as e:
+                self.log.error(
+                    f"🚨 CRITICAL: SL fallback FAILED for {symbol} @ {sl_price}: {e} — "
+                    f"position may be unprotected if trail also fails"
+                )
+                try:
+                    import telegram_alerts
+                    telegram_alerts.send_message(
+                        f"🚨 {symbol}: SL set FAILED ({type(e).__name__}: {e}) — "
+                        f"check manually!"
+                    )
+                except Exception:
+                    pass
+
+        # ── Idempotency: don't place a second TRAIL on retry/restart ──
+        if trade.get("trail_order_id"):
+            self.log.info(f"Trail already armed for {symbol} (oid={trade['trail_order_id']}); skipping")
+            trade["post_orders_placed"] = True
+            return
+
+        # ── Braces: trailing stop ──
+        body = {
+            "category": CATEGORY,
+            "symbol": symbol,
+            "side": _opposite_side(side),  # BUY closes SHORT, SELL closes LONG
+            "qty": f"{size}",  # enables qty+reduceOnly fallback on -1106/-4136
+            "trailingStop": TRAIL_CALLBACK_RATE,
+            "activePrice": activation,
+            "closeOnTrigger": True,  # maps to closePosition=true on Binance
+            "orderLinkId": f"{trade['id']}:TRAIL",
+        }
+        self.log.info(
+            f"📈 TRAIL placed for {symbol}: activation @ {activation} "
+            f"({TRAIL_ACTIVATION_PCT}% from entry), callback={TRAIL_CALLBACK_RATE}%"
+        )
+        if DRY_RUN:
+            self.log.info(f"DRY_RUN TRAIL: {body}")
+            trade["trail_order_id"] = "DRY_RUN"
+        else:
+            try:
+                resp = self.bybit.place_order(body)
+                trail_oid = (resp.get("result") or {}).get("orderId")
+                trade["trail_order_id"] = trail_oid
+                self.log.info(f"✅ TRAIL armed: {symbol} orderId={trail_oid}")
+            except Exception as e:
+                self.log.error(
+                    f"❌ Failed to place trail-stop for {symbol}: {e} — "
+                    f"position protected by hard SL only"
+                )
+                try:
+                    import telegram_alerts
+                    telegram_alerts.send_message(
+                        f"⚠️ {symbol}: TRAIL place failed ({e}). "
+                        f"Hard SL still armed."
+                    )
+                except Exception:
+                    pass
+
+        # Only mark post-orders placed if AT LEAST ONE protection leg armed.
+        # If both the hard-SL belt AND the trail failed (e.g. the algo place
+        # exhausted its 3 retries on transient 5xx and surfaced as an
+        # exception that we caught + telegram-alerted above), leaving this
+        # flag False makes the main loop retry on the next tick
+        # (main.py:821: `if status==open and not post_orders_placed:
+        # place_post_entry_orders(tr)`). Without this gate a failed-retry
+        # trade would be permanently stuck unprotected.
+        # NB: sl_set_inline is set EITHER by the inline-SL on the entry
+        # batchOrders (place_entry path) OR by the trail-mode fallback above
+        # at line ~675; both mean a hard STOP_MARKET is live on the
+        # position. trail_order_id is set only on successful trail place.
+        sl_armed = bool(trade.get("sl_set_inline"))
+        trail_armed = bool(trade.get("trail_order_id"))
+        if sl_armed or trail_armed:
+            trade["post_orders_placed"] = True
+        else:
+            self.log.error(
+                f"🚨 {symbol}: NEITHER hard SL nor trail armed — leaving "
+                f"post_orders_placed=False so main loop retries next tick"
+            )
+            try:
+                import telegram_alerts
+                telegram_alerts.send_message(
+                    f"🚨 {symbol}: BOTH protection legs failed — will retry next tick"
+                )
+            except Exception:
+                pass
 
     def place_post_entry_orders(self, trade: Dict[str, Any]) -> None:
         """Places SL + TP ladder + DCA conditionals after entry is filled.
@@ -329,6 +776,17 @@ class TradeEngine:
         qty_step = rules["qty_step"]
         min_qty = rules["min_qty"]
 
+        # ── Trailing-stop strategy ─────────────────────────────────────────
+        # When USE_TRAIL_AFTER_TP1 is set we skip the TP1/TP2/TP3 ladder
+        # entirely and submit a single Binance TRAILING_STOP_MARKET that
+        # arms at TP1-distance and trails the lowest mark price thereafter.
+        # The initial SL from the entry batchOrders stays armed as the
+        # pre-activation fallback. Tick-precise backtest (verified
+        # slippage from real aggTrades): +12.25 % EV / sig at trail=0.3 %.
+        from config import USE_TRAIL_AFTER_TP1, TRAIL_ACTIVATION_PCT, TRAIL_CALLBACK_RATE
+        if USE_TRAIL_AFTER_TP1:
+            return self._place_trailing_stop_orders(trade, side, entry, tick_size)
+
         # ---- Get position size FIRST (needed for TP quantities) ----
         size, _avg = self.position_size_avg(symbol)
         if size <= 0:
@@ -337,10 +795,19 @@ class TradeEngine:
             return
 
         # ---- Calculate SL price ----
-        sl_pct = INITIAL_SL_PCT / 100.0
-        sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
-        sl_price = self._round_price(sl_price, tick_size)
-        self.log.info(f"📍 SL at {INITIAL_SL_PCT}% from entry: {sl_price}")
+        # If the SL was already attached inline to the entry order
+        # (FIXED_RISK_PROFILE or signal had its own SL), Bybit picks it up
+        # automatically when the conditional fills. Skip the redundant
+        # set_trading_stop call (~150ms saved).
+        sl_already_inline = bool(trade.get("sl_set_inline"))
+        if sl_already_inline:
+            sl_price = float(trade.get("sl_price") or 0)
+            self.log.info(f"📍 SL inline from entry order @ {sl_price} (skipping set_trading_stop)")
+        else:
+            sl_pct = INITIAL_SL_PCT / 100.0
+            sl_price = entry * (1 + sl_pct) if side == "Sell" else entry * (1 - sl_pct)
+            sl_price = self._round_price(sl_price, tick_size)
+            self.log.info(f"📍 SL at {INITIAL_SL_PCT}% from entry: {sl_price}")
 
         tp_prices: List[float] = trade.get("tp_prices") or []
         splits: List[float] = trade.get("tp_splits") or TP_SPLITS
@@ -393,7 +860,7 @@ class TradeEngine:
         dca_prices: List[float] = trade.get("dca_prices") or []
         dca_to_place = min(len(dca_prices), len(DCA_QTY_MULTS))
         self.log.info(f"📊 Placing {dca_to_place} DCAs (mults: {DCA_QTY_MULTS[:dca_to_place]})")
-        last = self.bybit.last_price(CATEGORY, symbol)
+        last = self._last_price(symbol)
 
         for j in range(1, dca_to_place + 1):
             price = self._round_price(float(dca_prices[j-1]), tick_size)
@@ -450,19 +917,19 @@ class TradeEngine:
                 self.bybit.set_trading_stop(ts_body)
                 return "SL", 0, None
 
-            # Run SL + all orders in parallel (max 6 workers: 1 SL + 3 TPs + 2 DCAs)
+            # Run SL (if not inline) + all orders in parallel
             with ThreadPoolExecutor(max_workers=6) as executor:
-                # Submit SL first (highest priority)
-                sl_future = executor.submit(set_sl)
-                # Submit all TP and DCA orders
+                sl_future = None
+                if not sl_already_inline:
+                    sl_future = executor.submit(set_sl)
                 order_futures = [executor.submit(place_order, o) for o in all_orders]
 
-                # Wait for SL first
-                try:
-                    sl_future.result()
-                    self.log.info(f"✅ SL set successfully")
-                except Exception as e:
-                    self.log.warning(f"SL setting failed: {e}")
+                if sl_future is not None:
+                    try:
+                        sl_future.result()
+                        self.log.info(f"✅ SL set successfully")
+                    except Exception as e:
+                        self.log.warning(f"SL setting failed: {e}")
 
                 # Process order results
                 for future in as_completed(order_futures):
@@ -587,6 +1054,15 @@ class TradeEngine:
 
     # ---------- reactive events ----------
     def on_execution(self, ev: Dict[str, Any]) -> None:
+        # Called from Bybit private WS thread. Hold state_lock around the
+        # whole method so concurrent main-loop / fast_signal_handler
+        # readers don't see partial mutations and save_state never
+        # serializes a half-updated dict.
+        from state import state_lock as _state_lock
+        with _state_lock:
+            self._on_execution_locked(ev)
+
+    def _on_execution_locked(self, ev: Dict[str, Any]) -> None:
         link = ev.get("orderLinkId") or ev.get("orderLinkID") or ""
         if not link:
             return
@@ -595,8 +1071,31 @@ class TradeEngine:
         if link in self.state.get("open_trades", {}):
             tr = self.state["open_trades"][link]
             if tr.get("status") == "pending":
-                # some execution payloads contain execPrice/lastPrice
-                exec_price = ev.get("execPrice") or ev.get("price") or ev.get("lastPrice") or tr.get("trigger")
+                # Only act on a FULLY filled entry. Partial fills generate
+                # multiple TRADE events; if we placed TPs after the first
+                # partial, the TP qty would be sized to half the position
+                # and the rest would drift unprotected. Bybit and Binance
+                # both publish status="Filled" / "FILLED" only on full
+                # completion. Anything else (PartiallyFilled / PARTIALLY_FILLED)
+                # is ignored — we wait for the full-fill event.
+                exec_status = (ev.get("orderStatus") or ev.get("execStatus") or "").upper()
+                if exec_status not in ("FILLED", ""):
+                    # Empty status = legacy Bybit shape; trust it.
+                    self.log.debug(
+                        f"[entry] partial fill {tr['symbol']} status={exec_status} — waiting for FILLED"
+                    )
+                    return
+                # Prefer the avg fill price (avgPrice) over the last-trade
+                # price (lastPrice/execPrice) so partial sequences resolve to
+                # the VWAP not the last tick. trigger is the last-resort
+                # fallback when the venue did not echo any price.
+                exec_price = (
+                    ev.get("avgPrice")
+                    or ev.get("execPrice")
+                    or ev.get("lastPrice")
+                    or ev.get("price")
+                    or tr.get("trigger")
+                )
                 try:
                     tr["entry_price"] = float(exec_price)
                 except Exception:
@@ -608,6 +1107,9 @@ class TradeEngine:
                 tr.setdefault("tp_fills", 0)
                 tr.setdefault("tp_fills_list", [])
                 self.log.info(f"✅ ENTRY FILLED {tr['symbol']} @ {tr.get('entry_price')}")
+                # Stop watching this entry — it's filled, no longer pending.
+                if self.entry_watcher:
+                    self.entry_watcher.unwatch(tr["symbol"], tr.get("id"))
 
                 # Send Telegram notification
                 telegram_alerts.send_trade_opened(
@@ -726,7 +1228,26 @@ class TradeEngine:
 
         for attempt in range(max_retries):
             try:
-                self.bybit.set_trading_stop(body)
+                resp = self.bybit.set_trading_stop(body)
+                # set_trading_stop returns {"result": {"noPosition": True}}
+                # when the position cache reports size=0 — that means the
+                # SL was NOT armed (or the position was already closed).
+                # Treat as failure and retry; the last-attempt path will
+                # log + return False just like an exception would.
+                result = (resp or {}).get("result") or {}
+                if result.get("noPosition"):
+                    if attempt < max_retries - 1:
+                        self.log.warning(
+                            f"SL move attempt {attempt+1}: noPosition for {symbol} "
+                            f"— retrying in 100ms..."
+                        )
+                        time.sleep(0.1)
+                        continue
+                    self.log.warning(
+                        f"⚠️ SL move {symbol}: position size = 0, no SL armed "
+                        f"(position already closed?)"
+                    )
+                    return False
                 return True
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -757,7 +1278,7 @@ class TradeEngine:
         tick_size = rules["tick_size"]
 
         # Get current market price
-        current_price = self.bybit.last_price(CATEGORY, symbol)
+        current_price = self._last_price(symbol)
 
         if len(tp_prices) < tp_num:
             anchor = current_price
@@ -814,8 +1335,18 @@ class TradeEngine:
         2. Price shot through TP1 so fast the limit order wasn't filled
 
         In both cases, we should move SL to BE.
+
+        Skipped entirely when USE_TRAIL_AFTER_TP1 is on — the bot's
+        trailing-stop arms server-side at TP1 distance and replaces the
+        BE-move semantics. A BE-move here would cancel the initial SL,
+        leaving the trail-stop alone (which is fine until it activates)
+        but creating an unnecessary order replace and breaking the
+        "two-protection-orders-armed" invariant.
         """
         if DRY_RUN:
+            return
+        from config import USE_TRAIL_AFTER_TP1
+        if USE_TRAIL_AFTER_TP1:
             return
 
         for tid, tr in list(self.state.get("open_trades", {}).items()):
@@ -851,7 +1382,7 @@ class TradeEngine:
             # Check 2: Did price go THROUGH TP1 level? (even if order wasn't filled)
             if not should_move_to_be:
                 try:
-                    current_price = self.bybit.last_price(CATEGORY, symbol)
+                    current_price = self._last_price(symbol)
                     if side == "Buy":  # LONG: TP1 is above entry
                         if current_price >= tp1_price:
                             should_move_to_be = True
@@ -896,10 +1427,23 @@ class TradeEngine:
                 tr["status"] = "expired"
 
     def check_entry_order_validity(self) -> None:
-        """Cancel entry orders if TP1 was already reached before entry filled.
+        """Cancel entry orders if TP1 was reached AFTER price first touched
+        the entry trigger but the entry order didn't fill (rare — typically
+        thin liquidity).
 
-        This prevents entries from being filled AFTER the signal has already
-        moved past TP1 (signal is "expired").
+        Two-stage arming logic — IDENTICAL to entry_watcher.py to keep both
+        cancel paths consistent:
+          Stage 1 — wait for price to touch the entry trigger (LIMIT-fill
+            side: SHORT needs price >= entry, LONG needs price <= entry).
+            Mark trade with `entry_touched=True`.
+          Stage 2 — only when armed, check if current price is past TP1.
+            If yes, cancel.
+
+        Without Stage 1 this method premature-cancels SHORT pullback setups
+        where market is already below TP1 at signal time and entry hasn't
+        had a chance to fill (~34% of signals in backtest). The matching
+        bug in entry_watcher.py was fixed in 2f9f494; this is the
+        sibling fix for the poll-based path.
         """
         pending_entries = [tr for tr in self.state.get("open_trades", {}).values() if tr.get("status") == "pending"]
         if not pending_entries:
@@ -920,23 +1464,52 @@ class TradeEngine:
                 continue
 
             tp1_price = float(tp_prices[0])
+            trigger = float(tr.get("trigger") or 0)
 
             try:
-                current_price = self.bybit.last_price(CATEGORY, symbol)
+                current_price = self._last_price(symbol)
                 if not current_price:
                     self.log.warning(f"   {symbol}: Could not fetch current price for TP1 check")
                     continue
 
-                tp1_reached = False
+                # Stage 1: arm only after price touches the entry trigger
+                # (side-aware: SHORT needs current >= trigger, LONG needs
+                # current <= trigger — matches the LIMIT-fill side).
+                if not tr.get("entry_touched") and trigger > 0:
+                    touched = (
+                        (side == "Sell" and current_price >= trigger)
+                        or (side == "Buy" and current_price <= trigger)
+                    )
+                    if touched:
+                        from state import state_lock as _state_lock
+                        with _state_lock:
+                            tr["entry_touched"] = True
+                        self.log.info(
+                            f"[poll-validity] {symbol} entry-touched "
+                            f"(current={current_price}, trigger={trigger}) — TP1 check armed"
+                        )
+                    else:
+                        # Still waiting for price to retrace to entry.
+                        # Don't even consider TP1 — trade hasn't started.
+                        continue
 
+                # Legacy fallback: no `trigger` field on the trade (older
+                # state file from before the fix). Skip the validity check
+                # entirely rather than risk a premature cancel — 180min
+                # expiration will catch truly-stale entries.
+                if trigger <= 0:
+                    continue
+
+                # Stage 2: armed — original TP1-reached check.
+                tp1_reached = False
                 if side == "Buy":  # LONG: TP1 is above entry
                     if current_price >= tp1_price:
                         tp1_reached = True
-                        self.log.info(f"📈 TP1 reached before entry for {symbol} ({current_price} >= {tp1_price})")
+                        self.log.info(f"📈 TP1 reached after entry-touch for {symbol} ({current_price} >= {tp1_price})")
                 else:  # SHORT: TP1 is below entry
                     if current_price <= tp1_price:
                         tp1_reached = True
-                        self.log.info(f"📉 TP1 reached before entry for {symbol} ({current_price} <= {tp1_price})")
+                        self.log.info(f"📉 TP1 reached after entry-touch for {symbol} ({current_price} <= {tp1_price})")
 
                 if tp1_reached:
                     # Cancel entry order
@@ -944,18 +1517,31 @@ class TradeEngine:
                     if oid and oid != "DRY_RUN":
                         try:
                             self.cancel_entry(symbol, oid)
-                            self.log.info(f"🚫 Canceled entry order for {symbol} - TP1 already reached")
+                            self.log.info(f"🚫 Canceled entry order for {symbol} - TP1 reached after entry-touch")
 
                             # Send Telegram notification
                             telegram_alerts.send_order_canceled(
                                 symbol=symbol,
                                 side=side,
-                                reason=f"TP1 reached before entry (Current: ${current_price:.6f}, TP1: ${tp1_price:.6f})"
+                                reason=f"TP1 reached after entry-touch (Current: ${current_price:.6f}, TP1: ${tp1_price:.6f})"
                             )
                         except Exception as e:
                             self.log.warning(f"Failed to cancel entry for {symbol}: {e}")
+                    elif not oid:
+                        # Defensive: a live trade reached the cancel branch
+                        # with no entry_order_id. Shouldn't be reachable —
+                        # fast_signal_handler only inserts into open_trades
+                        # after a successful place_order returns an oid.
+                        # Log loudly so it's visible if it ever fires.
+                        self.log.error(
+                            f"🚨 {symbol}: cancel triggered but entry_order_id is missing — "
+                            f"marking status=cancelled_tp1_reached without API call. "
+                            f"Investigate: trade state {tr}"
+                        )
 
-                    tr["status"] = "cancelled_tp1_reached"
+                    from state import state_lock as _state_lock
+                    with _state_lock:
+                        tr["status"] = "cancelled_tp1_reached"
 
             except Exception as e:
                 self.log.warning(f"Entry validity check failed for {symbol}: {e}")
@@ -977,7 +1563,7 @@ class TradeEngine:
                 continue
 
             try:
-                current_price = self.bybit.last_price(CATEGORY, symbol)
+                current_price = self._last_price(symbol)
                 if not current_price:
                     continue
 
@@ -1012,9 +1598,11 @@ class TradeEngine:
                     # Position closed - cancel all pending orders for this trade!
                     self._cancel_all_trade_orders(tr)
 
-                    # SAFETY CHECK: Verify position is REALLY closed after canceling orders
-                    # (prevents leaving unprotected positions open)
-                    size_verify, _ = self.position_size_avg(tr["symbol"])
+                    # SAFETY CHECK: Verify position is REALLY closed after canceling orders.
+                    # fresh=True forces a Bybit REST call here (not WS cache) — the WS
+                    # event for the close might be in-flight while we read, leading us
+                    # to falsely conclude the position is closed.
+                    size_verify, _ = self.position_size_avg(tr["symbol"], fresh=True)
                     if size_verify > 0:
                         self.log.error(f"🚨 CRITICAL: Position {tr['symbol']} still open ({size_verify}) after cleanup!")
                         self.log.error(f"   Forcing MARKET CLOSE to protect position...")
@@ -1038,6 +1626,18 @@ class TradeEngine:
                             except Exception as e:
                                 self.log.error(f"❌ FAILED to force close {tr['symbol']}: {e}")
                                 self.log.error(f"   ⚠️ MANUAL INTERVENTION REQUIRED!")
+                                # Page operator via Telegram — this is the
+                                # last-ditch close attempt for an orphan
+                                # position; if it fails the position is
+                                # running unprotected until manually closed.
+                                try:
+                                    telegram_alerts.send_message(
+                                        f"🚨 {tr['symbol']}: EMERGENCY CLOSE FAILED ({e}). "
+                                        f"Position may be open and unprotected — "
+                                        f"close manually in Binance NOW."
+                                    )
+                                except Exception:
+                                    pass
                                 # Don't mark trade as closed if we couldn't close the position
                                 continue
 
@@ -1050,6 +1650,16 @@ class TradeEngine:
                     # Export to Database IMMEDIATELY (not waiting for archive)
                     if db_export.is_enabled():
                         self._export_trade_to_db(tr)
+
+                    # Background-refresh equity cache so the NEXT signal's
+                    # qty calc uses the fresh post-trade balance (not the
+                    # stale 60s-old cached value). Fire-and-forget thread,
+                    # doesn't block the maintenance loop.
+                    import threading as _t
+                    _t.Thread(
+                        target=lambda: self._safe_equity_refresh(),
+                        daemon=True,
+                    ).start()
 
                     # Send Telegram notification
                     telegram_alerts.send_trade_closed(
@@ -1077,22 +1687,28 @@ class TradeEngine:
                     del self.state["open_trades"][tid]
 
     def _cancel_all_trade_orders(self, trade: Dict[str, Any]) -> None:
-        """Cancel all pending DCA and TP orders for a closed trade."""
+        """Cancel all pending orders for a closed trade — DCA, TP, SL, TRAIL.
+
+        Must sweep BOTH endpoints since the algo-order migration: algo SL
+        and algo TRAIL do NOT appear in /fapi/v1/openOrders. Without the
+        algo sweep, an algo SL/TRAIL would linger and could misfire on the
+        next trade for the same symbol (reduceOnly=true makes the misfire
+        a no-op on zero position, but a NEW position would be wrongly
+        closed).
+        """
         if DRY_RUN:
             self.log.info(f"DRY_RUN: Would cancel orders for {trade['symbol']}")
             return
 
         symbol = trade["symbol"]
         trade_id = trade["id"]
+        cancelled = 0
 
+        # ── Regular orders (LIMIT TPs, conditional DCAs) ──
         try:
-            # Get all open orders for this symbol
             open_orders = self.bybit.open_orders(CATEGORY, symbol)
-
-            cancelled = 0
             for order in open_orders:
                 link_id = order.get("orderLinkId") or ""
-                # Check if this order belongs to our trade (DCA or TP)
                 if link_id.startswith(trade_id + ":"):
                     order_id = order.get("orderId")
                     if order_id:
@@ -1105,15 +1721,52 @@ class TradeEngine:
                             cancelled += 1
                             self.log.info(f"🗑️ Cancelled orphan order: {link_id}")
                         except Exception as e:
-                            # Ignore "order not found" errors
                             if "not found" not in str(e).lower():
                                 self.log.warning(f"Failed to cancel {link_id}: {e}")
-
-            if cancelled > 0:
-                self.log.info(f"🧹 Cleaned up {cancelled} pending order(s) for {symbol}")
-
         except Exception as e:
-            self.log.warning(f"Failed to cleanup orders for {symbol}: {e}")
+            self.log.warning(f"Failed to cleanup regular orders for {symbol}: {e}")
+
+        # ── Algo orders (algo SL via set_trading_stop, algo TRAIL) ──
+        # Binance stores clientAlgoId in the form _encode_link_id produced
+        # at place-time (pipes→underscores, colons→dashes, truncated to
+        # 36 chars while preserving the trailing "-SUFFIX"). We can't just
+        # compare raw cid against trade_id+":" — that silently failed for
+        # trail orphans and left them hanging post-SL-fire (observed live
+        # on BUSDT, LABUSDT 2026-05-13).
+        #
+        # Robust fix: recompute the EXACT cid that place_order would have
+        # produced for this trade's TRAIL (encoded + truncated identically)
+        # and exact-match. For algo SL, the cid starts with "sl-" which is
+        # safe-charset and passes through encode unchanged.
+        from binance_futures import _encode_link_id
+        try:
+            expected_trail_cid = _encode_link_id(f"{trade_id}:TRAIL")
+            # Legacy "*:SL" suffix isn't used in the new algo SL path
+            # (set_trading_stop builds its own "sl-{sym}-{ts}-{rnd}" cid),
+            # but we include the legacy form for safety.
+            expected_legacy_sl_cid = _encode_link_id(f"{trade_id}:SL")
+            algos = self.bybit.open_algo_orders(symbol)
+            for ao in algos:
+                cid_raw = ao.get("clientAlgoId") or ""
+                is_match = (
+                    cid_raw == expected_trail_cid
+                    or cid_raw == expected_legacy_sl_cid
+                    or cid_raw.startswith("sl-")  # new algo SL prefix
+                )
+                if is_match:
+                    aid = ao.get("algoId")
+                    if aid is not None:
+                        try:
+                            self.bybit._cancel_algo_order_by_id(aid)
+                            cancelled += 1
+                            self.log.info(f"🗑️ Cancelled orphan algo: {cid_raw} (algoId={aid})")
+                        except Exception as e:
+                            self.log.warning(f"Failed to cancel algo {cid_raw}: {e}")
+        except Exception as e:
+            self.log.warning(f"Failed to cleanup algo orders for {symbol}: {e}")
+
+        if cancelled > 0:
+            self.log.info(f"🧹 Cleaned up {cancelled} pending order(s) for {symbol}")
 
     def _export_trade_to_db(self, trade: Dict[str, Any]) -> None:
         """Export trade to PostgreSQL database immediately after close."""
@@ -1351,29 +2004,10 @@ class TradeEngine:
         # Note: Daily equity update moved to log_daily_stats() to ensure it runs daily even without trades
 
     # ---------- signal update methods ----------
-    def _move_sl(self, symbol: str, new_sl: float) -> bool:
-        """Move stop loss to new price."""
-        if DRY_RUN:
-            self.log.info(f"DRY_RUN: Would move SL for {symbol} to {new_sl}")
-            return True
-
-        try:
-            rules = self._get_instrument_rules(symbol)
-            new_sl = self._round_price(new_sl, rules["tick_size"])
-
-            body = {
-                "category": CATEGORY,
-                "symbol": symbol,
-                "positionIdx": 0,
-                "stopLoss": f"{new_sl:.10f}",
-                "tpslMode": "Full",
-            }
-            self.bybit.set_trading_stop(body)
-            self.log.info(f"✅ SL moved to {new_sl} for {symbol}")
-            return True
-        except Exception as e:
-            self.log.warning(f"Failed to move SL for {symbol}: {e}")
-            return False
+    # NOTE: a second `_move_sl` definition used to live here. It silently
+    # overrode the retry-enabled implementation above (line ~849), causing
+    # the TP1→BE move to lose its 3-attempt retry on volatile markets.
+    # Removed — use the canonical `_move_sl(symbol, sl_price, max_retries=3)`.
 
     def update_tp_orders(self, trade: Dict[str, Any], new_tps: List[float]) -> bool:
         """Cancel old TP orders and place new ones with updated prices."""
@@ -1488,7 +2122,7 @@ class TradeEngine:
         min_qty = rules["min_qty"]
 
         dca_to_place = min(len(dca_prices), len(DCA_QTY_MULTS))
-        last = self.bybit.last_price(CATEGORY, symbol)
+        last = self._last_price(symbol)
 
         self.log.info(f"📊 Placing {dca_to_place} DCAs for {symbol}")
 

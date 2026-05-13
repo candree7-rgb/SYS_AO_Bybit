@@ -52,6 +52,20 @@ class DiscordReader:
             params["after"] = str(max_id)
         return collected
 
+    def fetch_before(self, before_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Fetch up to `limit` messages older than `before_id`. Returns
+        the page (not all history). Used by export_signals.py to walk
+        backwards through the channel via a moving cursor."""
+        params = {"limit": max(1, min(limit, 100))}
+        if before_id:
+            params["before"] = str(before_id)
+        r = self._request_with_retry(
+            f"https://discord.com/api/v10/channels/{self.channel_id}/messages",
+            params
+        )
+        r.raise_for_status()
+        return r.json() or []
+
     def fetch_message(self, message_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a single message by ID using 'around' parameter (works with user tokens).
 

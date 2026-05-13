@@ -1,262 +1,193 @@
-import { Pool } from 'pg';
-import { getActiveBotIds } from './bot-config';
+import { Pool } from 'pg'
 
-// Create PostgreSQL connection pool
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
-});
+})
+
+// ── Interfaces ──────────────────────────────────────────────────────────
 
 export interface Trade {
-  id: string;
-  symbol: string;
-  side: string;
-  order_side: string;
-  entry_price: number;
-  trigger_price: number;
-  avg_entry: number | null;
-  placed_at: Date;
-  filled_at: Date | null;
-  closed_at: Date | null;
-  duration_minutes: number | null;
-  realized_pnl: number;
-  pnl_pct_margin: number;
-  pnl_pct_equity: number;
-  margin_used: number;
-  equity_at_close: number;
-  is_win: boolean;
-  exit_reason: string;
-  risk_pct: number | null;
-  risk_amount: number | null;
-  equity_at_entry: number | null;
-  leverage: number | null;
-  timeframe: string | null;
-  tp_fills: number;
-  tp_count: number;
-  dca_fills: number;
-  dca_count: number;
-  trailing_used: boolean;
-  bot_id: string;
-  created_at: Date;
-  updated_at: Date;
+  trade_id: string
+  symbol: string
+  side: string
+  entry_price: number
+  avg_price: number
+  close_price: number
+  total_qty: number
+  total_margin: number
+  leverage: number
+  realized_pnl: number
+  pnl_pct_margin: number
+  pnl_pct_equity: number
+  equity_at_entry: number
+  equity_at_close: number
+  is_win: boolean
+  tp1_hit: boolean
+  tps_hit: number
+  trail_pnl_pct: number
+  close_reason: string
+  signal_leverage: number
+  equity_pct_per_trade: number | null
+  timeframe: string | null
+  bot_id: string
+  opened_at: Date
+  closed_at: Date
+  duration_minutes: number
 }
 
 export interface DailyEquity {
-  date: Date;
-  equity: number;
-  daily_pnl: number;
-  daily_pnl_pct: number;
-  trades_count: number;
-  wins_count: number;
-  losses_count: number;
-  created_at: Date;
+  date: Date
+  equity: number
+  daily_pnl: number
+  daily_pnl_pct: number
+  trades_count: number
+  wins_count: number
+  losses_count: number
+  created_at: Date
 }
 
 export interface Stats {
-  total_trades: number;
-  wins: number;
-  losses: number;
-  breakeven: number;  // TP1+ reached but closed at/below 0
-  win_rate: number;
-  total_pnl: number;
-  total_pnl_pct: number;  // Total PnL as % of average equity
-  avg_pnl: number;
-  avg_pnl_pct: number;  // Average PnL as % of equity (all trades)
-  avg_win: number;
-  avg_win_pct: number;  // Average win as % of equity
-  avg_loss: number;
-  avg_loss_pct: number;  // Average loss as % of equity (only pure SL trades)
-  win_loss_ratio: number;
-  best_trade: number;
-  worst_trade: number;
-  avg_tp_fills: number;
-  avg_dca_fills: number;
-  trailing_exits: number;
-  sl_exits: number;
-  be_exits: number;
+  total_trades: number
+  wins: number
+  losses: number
+  breakeven: number
+  win_rate: number
+  total_pnl: number
+  total_pnl_pct: number
+  avg_pnl: number
+  avg_pnl_pct: number
+  avg_win: number
+  avg_win_pct: number
+  avg_loss: number
+  avg_loss_pct: number
+  win_loss_ratio: number
+  profit_factor: number
+  best_trade: number
+  worst_trade: number
+  tp_rate: number
+  sl_rate: number
+  avg_duration: number
+  trailing_exits: number
+  sl_exits: number
+  be_exits: number
 }
 
-export interface TPDistribution {
-  tp_level: number;
-  count: number;
+export interface ExitDistribution {
+  level: string
+  count: number
+  percentage: number
 }
 
-export interface DCADistribution {
-  dca_level: number;
-  count: number;
-}
+// ── Queries ─────────────────────────────────────────────────────────────
 
-export async function getTrades(limit: number = 100, offset: number = 0, botId?: string, timeframe?: string): Promise<Trade[]> {
-  const client = await pool.connect();
+export async function getTrades(
+  limit: number = 50,
+  days?: number,
+  from?: string,
+  to?: string,
+  excludeWeekends?: boolean
+): Promise<Trade[]> {
+  const client = await pool.connect()
   try {
-    let query = `SELECT * FROM trades`;
-    const params: any[] = [];
-    const conditions: string[] = [];
-
-    // Handle bot filtering
-    if (!botId || botId === 'all') {
-      const activeBotIds = getActiveBotIds();
-      if (activeBotIds.length > 0) {
-        conditions.push(`bot_id = ANY($${params.length + 1})`);
-        params.push(activeBotIds);
-      }
-    } else if (botId) {
-      conditions.push(`bot_id = $${params.length + 1}`);
-      params.push(botId);
-    }
-
-    // Handle timeframe filtering
-    if (timeframe && timeframe !== 'all') {
-      conditions.push(`timeframe = $${params.length + 1}`);
-      params.push(timeframe);
-    }
-
-    if (conditions.length > 0) {
-      query += ` WHERE ${conditions.join(' AND ')}`;
-    }
-
-    query += ` ORDER BY closed_at DESC NULLS LAST, placed_at DESC`;
-
-    // Add limit and offset
-    const limitParam = params.length + 1;
-    const offsetParam = params.length + 2;
-    query += ` LIMIT $${limitParam} OFFSET $${offsetParam}`;
-    params.push(limit, offset);
-
-    const result = await client.query(query, params);
-    return result.rows;
-  } finally {
-    client.release();
-  }
-}
-
-export async function getDailyEquity(days?: number, from?: string, to?: string): Promise<DailyEquity[]> {
-  const client = await pool.connect();
-  try {
-    let query = `SELECT * FROM daily_equity`;
-    const params: any[] = [];
-    const conditions: string[] = [];
-
-    // Use custom date range if provided, otherwise use days limit
+    let whereClause = 'WHERE closed_at IS NOT NULL'
     if (from && to) {
-      conditions.push(`date >= $1`);
-      conditions.push(`date <= $2`);
-      params.push(from, to);
-    }
-
-    if (conditions.length > 0) {
-      query += ` WHERE ${conditions.join(' AND ')}`;
-    }
-
-    // Apply limit only if no custom date range and days is specified
-    if (days && !from && !to) {
-      const limitIndex = params.length + 1;
-      query += ` ORDER BY date DESC LIMIT $${limitIndex}`;
-      params.push(days);
-      const result = await client.query(query, params);
-      return result.rows.reverse();
-    }
-
-    query += ` ORDER BY date ASC`;
-    const result = await client.query(query, params);
-    return result.rows;
-  } finally {
-    client.release();
-  }
-}
-
-/**
- * Get cumulative PnL curve for a specific bot by summing up realized_pnl from trades
- * This creates a pseudo-equity curve showing the bot's performance over time
- */
-export async function getBotCumulativePnL(botId: string, days?: number, from?: string, to?: string, timeframe?: string): Promise<DailyEquity[]> {
-  const client = await pool.connect();
-  try {
-    // Use CTE to first aggregate by day, then apply window function for cumulative sum
-    let query = `
-      WITH daily_aggregates AS (
-        SELECT
-          DATE(closed_at) as date,
-          SUM(realized_pnl) as daily_pnl,
-          COUNT(*) as trades_count,
-          SUM(CASE WHEN is_win THEN 1 ELSE 0 END) as wins_count,
-          SUM(CASE WHEN NOT is_win THEN 1 ELSE 0 END) as losses_count,
-          MIN(closed_at) as created_at
-        FROM trades
-        WHERE bot_id = $1 AND closed_at IS NOT NULL
-    `;
-
-    const params: any[] = [botId];
-
-    // Use custom date range if provided, otherwise use days
-    if (from && to) {
-      query += ` AND DATE(closed_at) >= $2 AND DATE(closed_at) <= $3`;
-      params.push(from, to);
+      whereClause += ` AND closed_at >= '${from}' AND closed_at <= '${to}'`
     } else if (days) {
-      query += ` AND closed_at >= NOW() - INTERVAL '${days} days'`;
+      whereClause += ` AND closed_at >= NOW() - INTERVAL '${days} days'`
+    }
+    if (excludeWeekends) {
+      whereClause += ` AND EXTRACT(DOW FROM opened_at) NOT IN (0, 6)`
     }
 
-    // Timeframe filtering
-    if (timeframe && timeframe !== 'all') {
-      const timeframeParam = params.length + 1;
-      query += ` AND timeframe = $${timeframeParam}`;
-      params.push(timeframe);
-    }
-
-    query += `
-        GROUP BY DATE(closed_at)
-      )
-      SELECT
-        date,
-        SUM(daily_pnl) OVER (ORDER BY date) as equity,
-        daily_pnl,
-        0 as daily_pnl_pct,
-        trades_count,
-        wins_count,
-        losses_count,
-        created_at
-      FROM daily_aggregates
-      ORDER BY date ASC
-    `;
-
-    const result = await client.query(query, params);
-
-    // Calculate daily_pnl_pct based on previous day's equity
-    const rows = result.rows.map((row, idx) => {
-      const prevEquity = idx > 0 ? parseFloat(result.rows[idx - 1].equity) : 0;
-      const dailyPnl = parseFloat(row.daily_pnl);
-      const dailyPnlPct = prevEquity > 0 ? (dailyPnl / prevEquity) * 100 : 0;
-
-      return {
-        ...row,
-        equity: parseFloat(row.equity),
-        daily_pnl: dailyPnl,
-        daily_pnl_pct: parseFloat(dailyPnlPct.toFixed(4)),
-        trades_count: parseInt(row.trades_count),
-        wins_count: parseInt(row.wins_count),
-        losses_count: parseInt(row.losses_count),
-      };
-    });
-
-    return rows;
+    const result = await client.query(
+      `SELECT * FROM trades ${whereClause} ORDER BY closed_at DESC LIMIT $1`,
+      [limit]
+    )
+    return result.rows
   } finally {
-    client.release();
+    client.release()
   }
 }
 
-export async function getStats(days?: number, botId?: string, timeframe?: string): Promise<Stats> {
-  const client = await pool.connect();
+export async function getDailyEquity(
+  days?: number,
+  from?: string,
+  to?: string
+): Promise<DailyEquity[]> {
+  const client = await pool.connect()
   try {
-    let query = `
+    let query = `SELECT * FROM daily_equity`
+    const params: any[] = []
+    const conditions: string[] = []
+
+    if (from && to) {
+      conditions.push(`date >= $1`)
+      conditions.push(`date <= $2`)
+      params.push(from, to)
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(' AND ')}`
+    }
+
+    if (days && !from && !to) {
+      const limitIndex = params.length + 1
+      query += ` ORDER BY date DESC LIMIT $${limitIndex}`
+      params.push(days)
+      const result = await client.query(query, params)
+      return result.rows.reverse()
+    }
+
+    query += ` ORDER BY date ASC`
+    const result = await client.query(query, params)
+    return result.rows
+  } finally {
+    client.release()
+  }
+}
+
+export async function getStats(
+  days?: number,
+  from?: string,
+  to?: string,
+  excludeWeekends?: boolean
+): Promise<Stats> {
+  const client = await pool.connect()
+  try {
+    let dateFilter = ''
+    if (from && to) {
+      dateFilter = ` AND closed_at >= '${from}' AND closed_at <= '${to}'`
+    } else if (days) {
+      dateFilter = ` AND closed_at >= NOW() - INTERVAL '${days} days'`
+    }
+    if (excludeWeekends) {
+      dateFilter += ` AND EXTRACT(DOW FROM opened_at) NOT IN (0, 6)`
+    }
+
+    // BE/SL/TP1-TP3 exit classification (cumulative TPs: TP3 implies TP1+TP2)
+    const query = `
+      WITH enriched AS (
+        SELECT *,
+          CASE
+            WHEN close_reason ILIKE '%trail%' AND tp1_hit THEN 3
+            WHEN close_reason ILIKE '%tp3%' THEN 3
+            WHEN close_reason ILIKE '%tp2%' THEN 2
+            WHEN tp1_hit THEN 1
+            ELSE 0
+          END as tp_fills
+        FROM trades
+        WHERE closed_at IS NOT NULL AND side != 'update'${dateFilter}
+      )
       SELECT
         COUNT(*) as total_trades,
         SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
         SUM(CASE WHEN tp_fills = 0 AND realized_pnl < 0 THEN 1 ELSE 0 END) as losses,
         SUM(CASE WHEN tp_fills >= 1 AND realized_pnl <= 0 THEN 1 ELSE 0 END) as breakeven,
         SUM(realized_pnl) as total_pnl,
-        AVG(equity_at_close) as avg_equity,
+        AVG(NULLIF(equity_at_entry, 0)) as avg_equity,
         AVG(realized_pnl) as avg_pnl,
         AVG(pnl_pct_equity) as avg_pnl_pct,
         AVG(CASE WHEN realized_pnl > 0 THEN realized_pnl END) as avg_win,
@@ -265,87 +196,49 @@ export async function getStats(days?: number, botId?: string, timeframe?: string
         AVG(CASE WHEN tp_fills = 0 AND realized_pnl < 0 THEN pnl_pct_equity END) as avg_loss_pct,
         MAX(realized_pnl) as best_trade,
         MIN(realized_pnl) as worst_trade,
-        AVG(tp_fills) as avg_tp_fills,
-        AVG(dca_fills) as avg_dca_fills,
-        SUM(CASE WHEN exit_reason = 'trailing_stop' THEN 1 ELSE 0 END) as trailing_exits,
-        SUM(CASE WHEN exit_reason = 'stop_loss' THEN 1 ELSE 0 END) as sl_exits,
-        SUM(CASE WHEN exit_reason = 'breakeven' THEN 1 ELSE 0 END) as be_exits
-      FROM trades
-    `;
+        SUM(CASE WHEN realized_pnl > 0 THEN realized_pnl ELSE 0 END) as gross_profit,
+        ABS(SUM(CASE WHEN realized_pnl < 0 THEN realized_pnl ELSE 0 END)) as gross_loss,
+        AVG(duration_minutes) as avg_duration,
+        SUM(CASE WHEN close_reason ILIKE '%trail%' THEN 1 ELSE 0 END) as trailing_exits,
+        SUM(CASE WHEN (close_reason ILIKE '%sl%' OR close_reason ILIKE '%stop%') AND realized_pnl < 0 AND tp_fills = 0 THEN 1 ELSE 0 END) as sl_exits,
+        SUM(CASE WHEN close_reason ILIKE '%be%' THEN 1 ELSE 0 END) as be_exits,
+        SUM(CASE WHEN tp_fills >= 1 THEN 1 ELSE 0 END) as tp_hits
+      FROM enriched
+    `
 
-    const conditions: string[] = [];
-    if (days) {
-      conditions.push(`closed_at >= NOW() - INTERVAL '${days} days'`);
-    }
+    const result = await client.query(query)
+    const row = result.rows[0]
 
-    // Handle bot filtering
-    if (!botId || botId === 'all') {
-      // Default to active bots only (when no botId or 'all')
-      const activeBotIds = getActiveBotIds();
-      if (activeBotIds.length > 0) {
-        const botList = activeBotIds.map(id => `'${id}'`).join(', ');
-        conditions.push(`bot_id IN (${botList})`);
-      }
-    } else if (botId) {
-      // Specific bot
-      conditions.push(`bot_id = '${botId}'`);
-    }
-
-    // Handle timeframe filtering
-    if (timeframe && timeframe !== 'all') {
-      conditions.push(`timeframe = '${timeframe}'`);
-    }
-
-    if (conditions.length > 0) {
-      query += ` WHERE ${conditions.join(' AND ')}`;
-    }
-
-    const result = await client.query(query);
-    const row = result.rows[0];
-
-    if (!row || row.total_trades === 0) {
+    if (!row || parseInt(row.total_trades) === 0) {
       return {
-        total_trades: 0,
-        wins: 0,
-        losses: 0,
-        breakeven: 0,
-        win_rate: 0,
-        total_pnl: 0,
-        total_pnl_pct: 0,
-        avg_pnl: 0,
-        avg_pnl_pct: 0,
-        avg_win: 0,
-        avg_win_pct: 0,
-        avg_loss: 0,
-        avg_loss_pct: 0,
-        win_loss_ratio: 0,
-        best_trade: 0,
-        worst_trade: 0,
-        avg_tp_fills: 0,
-        avg_dca_fills: 0,
-        trailing_exits: 0,
-        sl_exits: 0,
-        be_exits: 0,
-      };
+        total_trades: 0, wins: 0, losses: 0, breakeven: 0, win_rate: 0,
+        total_pnl: 0, total_pnl_pct: 0, avg_pnl: 0, avg_pnl_pct: 0,
+        avg_win: 0, avg_win_pct: 0, avg_loss: 0, avg_loss_pct: 0,
+        win_loss_ratio: 0, profit_factor: 0, best_trade: 0, worst_trade: 0,
+        tp_rate: 0, sl_rate: 0, avg_duration: 0,
+        trailing_exits: 0, sl_exits: 0, be_exits: 0,
+      }
     }
 
-    const wins = parseInt(row.wins || 0);
-    const losses = parseInt(row.losses || 0);
-    const breakeven = parseInt(row.breakeven || 0);
-    const total_trades = parseInt(row.total_trades);
-
-    const avg_win = parseFloat(row.avg_win || 0);
-    const avg_win_pct = parseFloat(row.avg_win_pct || 0);
-    const avg_loss = parseFloat(row.avg_loss || 0);
-    const avg_loss_pct = parseFloat(row.avg_loss_pct || 0);
-    const win_loss_ratio = avg_loss !== 0 ? Math.abs(avg_win / avg_loss) : 0;
-
-    const total_pnl = parseFloat(row.total_pnl || 0);
-    const avg_equity = parseFloat(row.avg_equity || 0);
-    const total_pnl_pct = avg_equity > 0 ? (total_pnl / avg_equity) * 100 : 0;
-
-    // Win rate includes wins + breakeven (TP1 reached = strategic success)
-    const win_rate = total_trades > 0 ? ((wins + breakeven) / total_trades) * 100 : 0;
+    const wins = parseInt(row.wins || 0)
+    const losses = parseInt(row.losses || 0)
+    const breakeven = parseInt(row.breakeven || 0)
+    const total_trades = parseInt(row.total_trades)
+    const avg_win = parseFloat(row.avg_win || 0)
+    const avg_loss = parseFloat(row.avg_loss || 0)
+    const win_loss_ratio = avg_loss !== 0 ? Math.abs(avg_win / avg_loss) : 0
+    const total_pnl = parseFloat(row.total_pnl || 0)
+    const avg_equity = parseFloat(row.avg_equity || 0)
+    const total_pnl_pct = avg_equity > 0 ? (total_pnl / avg_equity) * 100 : 0
+    const win_rate = total_trades > 0 ? ((wins + breakeven) / total_trades) * 100 : 0
+    const gross_profit = parseFloat(row.gross_profit || 0)
+    const gross_loss = parseFloat(row.gross_loss || 0)
+    const profit_factor = gross_loss > 0 ? gross_profit / gross_loss : gross_profit > 0 ? Infinity : 0
+    const tp_hits = parseInt(row.tp_hits || 0)
+    const sl_exits_count = parseInt(row.sl_exits || 0)
+    const tp_rate = total_trades > 0 ? (tp_hits / total_trades) * 100 : 0
+    const sl_rate = total_trades > 0 ? (sl_exits_count / total_trades) * 100 : 0
+    const avg_duration = parseFloat(row.avg_duration || 0)
 
     return {
       total_trades,
@@ -358,140 +251,91 @@ export async function getStats(days?: number, botId?: string, timeframe?: string
       avg_pnl: parseFloat(row.avg_pnl || 0),
       avg_pnl_pct: parseFloat(row.avg_pnl_pct || 0),
       avg_win,
-      avg_win_pct: parseFloat(avg_win_pct.toFixed(2)),
+      avg_win_pct: parseFloat(parseFloat(row.avg_win_pct || 0).toFixed(2)),
       avg_loss,
-      avg_loss_pct: parseFloat(avg_loss_pct.toFixed(2)),
+      avg_loss_pct: parseFloat(parseFloat(row.avg_loss_pct || 0).toFixed(2)),
       win_loss_ratio: parseFloat(win_loss_ratio.toFixed(2)),
+      profit_factor: parseFloat(profit_factor.toFixed(2)),
       best_trade: parseFloat(row.best_trade || 0),
       worst_trade: parseFloat(row.worst_trade || 0),
-      avg_tp_fills: parseFloat(row.avg_tp_fills || 0),
-      avg_dca_fills: parseFloat(row.avg_dca_fills || 0),
+      tp_rate: parseFloat(tp_rate.toFixed(1)),
+      sl_rate: parseFloat(sl_rate.toFixed(1)),
+      avg_duration,
       trailing_exits: parseInt(row.trailing_exits || 0),
-      sl_exits: parseInt(row.sl_exits || 0),
+      sl_exits: sl_exits_count,
       be_exits: parseInt(row.be_exits || 0),
-    };
+    }
   } finally {
-    client.release();
+    client.release()
   }
 }
 
-export async function getTPDistribution(tpCount: number = 3, botId?: string, timeframe?: string): Promise<TPDistribution[]> {
-  const client = await pool.connect();
+export async function getExitDistribution(
+  days?: number,
+  from?: string,
+  to?: string,
+  excludeWeekends?: boolean
+): Promise<ExitDistribution[]> {
+  const client = await pool.connect()
   try {
-    // Build filter conditions
-    const filters: string[] = [];
-
-    // Bot filtering
-    if (!botId || botId === 'all') {
-      const activeBotIds = getActiveBotIds();
-      if (activeBotIds.length > 0) {
-        const botList = activeBotIds.map(id => `'${id}'`).join(', ');
-        filters.push(`bot_id IN (${botList})`);
-      }
-    } else if (botId) {
-      filters.push(`bot_id = '${botId}'`);
+    let dateFilter = ''
+    if (from && to) {
+      dateFilter = ` AND closed_at >= '${from}' AND closed_at <= '${to}'`
+    } else if (days) {
+      dateFilter = ` AND closed_at >= NOW() - INTERVAL '${days} days'`
+    }
+    if (excludeWeekends) {
+      dateFilter += ` AND EXTRACT(DOW FROM opened_at) NOT IN (0, 6)`
     }
 
-    // Timeframe filtering
-    if (timeframe && timeframe !== 'all') {
-      filters.push(`timeframe = '${timeframe}'`);
-    }
-
-    const filterClause = filters.length > 0 ? `AND ${filters.join(' AND ')}` : '';
-
-    // Build dynamic query based on tpCount
-    const queries: string[] = [];
-    for (let i = 1; i <= tpCount; i++) {
-      queries.push(`SELECT ${i} as tp_level, COUNT(*) as count FROM trades WHERE tp_fills >= ${i} AND closed_at IS NOT NULL ${filterClause}`);
-    }
-
+    // BE/SL/TP1-TP3: cumulative — TP3 implies TP1+TP2
     const result = await client.query(`
-      ${queries.join(' UNION ALL ')}
-      ORDER BY tp_level
-    `);
-    return result.rows;
+      WITH trade_data AS (
+        SELECT
+          CASE
+            WHEN close_reason ILIKE '%trail%' AND tp1_hit THEN 3
+            WHEN close_reason ILIKE '%tp3%' THEN 3
+            WHEN close_reason ILIKE '%tp2%' THEN 2
+            WHEN tp1_hit THEN 1
+            ELSE 0
+          END as max_tp_hit,
+          CASE
+            WHEN close_reason ILIKE '%sl%' OR (close_reason ILIKE '%stop%' AND close_reason NOT ILIKE '%trail%') THEN true
+            ELSE false
+          END as is_sl
+        FROM trades
+        WHERE closed_at IS NOT NULL AND side != 'update'${dateFilter}
+      ),
+      total AS (SELECT COUNT(*) as cnt FROM trade_data)
+      SELECT level, count FROM (
+        SELECT 'TP1' as level, COUNT(*) as count, 1 as sort_order FROM trade_data WHERE max_tp_hit >= 1
+        UNION ALL
+        SELECT 'TP2', COUNT(*), 2 FROM trade_data WHERE max_tp_hit >= 2
+        UNION ALL
+        SELECT 'TP3', COUNT(*), 3 FROM trade_data WHERE max_tp_hit >= 3
+        UNION ALL
+        SELECT 'Stop Loss', COUNT(*), 4 FROM trade_data WHERE max_tp_hit = 0 AND is_sl
+        UNION ALL
+        SELECT 'Other', COUNT(*), 5 FROM trade_data WHERE max_tp_hit = 0 AND NOT is_sl
+      ) sub
+      ORDER BY sort_order
+    `)
+
+    const totalTrades = await client.query(`
+      SELECT COUNT(*) as cnt FROM trades WHERE closed_at IS NOT NULL AND side != 'update'${dateFilter}
+    `)
+    const total = parseInt(totalTrades.rows[0]?.cnt || '0')
+
+    return result.rows
+      .map((r: any) => ({
+        level: r.level,
+        count: parseInt(r.count),
+        percentage: total > 0 ? (parseInt(r.count) / total) * 100 : 0,
+      }))
+      .filter((d: ExitDistribution) => d.count > 0)
   } finally {
-    client.release();
+    client.release()
   }
 }
 
-export async function getDCADistribution(dcaCount: number = 2, botId?: string, timeframe?: string): Promise<DCADistribution[]> {
-  const client = await pool.connect();
-  try {
-    // Build filter conditions
-    const filters: string[] = [];
-
-    // Bot filtering
-    if (!botId || botId === 'all') {
-      const activeBotIds = getActiveBotIds();
-      if (activeBotIds.length > 0) {
-        const botList = activeBotIds.map(id => `'${id}'`).join(', ');
-        filters.push(`bot_id IN (${botList})`);
-      }
-    } else if (botId) {
-      filters.push(`bot_id = '${botId}'`);
-    }
-
-    // Timeframe filtering
-    if (timeframe && timeframe !== 'all') {
-      filters.push(`timeframe = '${timeframe}'`);
-    }
-
-    const filterClause = filters.length > 0 ? `AND ${filters.join(' AND ')}` : '';
-
-    // Build dynamic query based on dcaCount
-    // DCA0 = exactly 0 DCAs filled, DCA1 = exactly 1 DCA filled, etc.
-    const queries: string[] = [];
-    for (let i = 0; i <= dcaCount; i++) {
-      queries.push(`SELECT ${i} as dca_level, COUNT(*) as count FROM trades WHERE dca_fills = ${i} AND closed_at IS NOT NULL ${filterClause}`);
-    }
-
-    const result = await client.query(`
-      ${queries.join(' UNION ALL ')}
-      ORDER BY dca_level
-    `);
-    return result.rows;
-  } finally {
-    client.release();
-  }
-}
-
-/**
- * Get all available timeframes from trades
- */
-export async function getAvailableTimeframes(botId?: string): Promise<string[]> {
-  const client = await pool.connect();
-  try {
-    let query = `
-      SELECT DISTINCT timeframe
-      FROM trades
-      WHERE timeframe IS NOT NULL AND closed_at IS NOT NULL
-    `;
-
-    const conditions: string[] = [];
-
-    // Handle bot filtering
-    if (!botId || botId === 'all') {
-      const activeBotIds = getActiveBotIds();
-      if (activeBotIds.length > 0) {
-        const botList = activeBotIds.map(id => `'${id}'`).join(', ');
-        conditions.push(`bot_id IN (${botList})`);
-      }
-    } else if (botId) {
-      conditions.push(`bot_id = '${botId}'`);
-    }
-
-    if (conditions.length > 0) {
-      query += ` AND ${conditions.join(' AND ')}`;
-    }
-
-    query += ` ORDER BY timeframe ASC`;
-
-    const result = await client.query(query);
-    return result.rows.map(row => row.timeframe);
-  } finally {
-    client.release();
-  }
-}
-
-export { pool };
+export { pool }

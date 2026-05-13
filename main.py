@@ -1,22 +1,33 @@
+import os
 import sys
 import time
 import random
 import threading
 import logging
+import queue as _queue
 
 from config import (
     DISCORD_TOKEN, CHANNEL_ID,
-    BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_DEMO, RECV_WINDOW, ACCOUNT_TYPE,
+    BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_TESTNET, RECV_WINDOW, ACCOUNT_TYPE,
+    MARGIN_MODE,
     CATEGORY, QUOTE, LEVERAGE, RISK_PCT,
     MAX_CONCURRENT_TRADES, MAX_TRADES_PER_DAY, TC_MAX_LAG_SEC,
     POLL_SECONDS, POLL_JITTER_MAX, SIGNAL_UPDATE_INTERVAL_SEC, SIGNAL_UPDATE_INTERVAL_OPEN_SEC,
+    USE_GATEWAY_WS, GATEWAY_FALLBACK_FAILURES, GATEWAY_LOOP_SLEEP_SEC, GATEWAY_INITIAL_BACKFILL,
+    WARMUP_SYMBOLS, BLACKLIST_SYMBOLS,
+    DISABLE_PREFLIGHT_TP1, DISABLE_ENTRY_WATCHER,
+    FIXED_RISK_PROFILE, FIXED_SL_PCT, FIXED_TP_PCTS, TP_SPLITS, BREAKEVEN_PROFIT_BUFFER_PCT,
+    USE_TRAIL_AFTER_TP1, TRAIL_ACTIVATION_PCT, TRAIL_CALLBACK_RATE,
+    RSI_FILTER_MAX_1M,
     STATE_FILE, DRY_RUN, LOG_LEVEL
 )
-from bybit_v5 import BybitV5
+from binance_futures import BinanceFutures
 from discord_reader import DiscordReader
-from signal_parser import parse_signal, signal_hash, parse_signal_update
-from state import load_state, save_state, utc_day_key
+from discord_gateway import DiscordGateway
+from signal_parser import parse_signal, signal_hash, parse_signal_update, is_trade_closed
+from state import load_state, save_state, utc_day_key, state_lock
 from trade_engine import TradeEngine
+from entry_watcher import EntryWatcher
 import db_export
 import telegram_alerts
 
@@ -24,195 +35,158 @@ def setup_logger() -> logging.Logger:
     log = logging.getLogger("bot")
     log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     h = logging.StreamHandler(sys.stdout)  # stdout so Railway shows INFO as normal (not red)
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
+    fmt = logging.Formatter("%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s", "%H:%M:%S")
     h.setFormatter(fmt)
     log.handlers[:] = [h]
     return log
 
-def check_signal_updates(discord, engine, st, log):
-    """Re-read Discord messages for open/pending trades and apply SL/TP/DCA updates."""
+def _apply_signal_update_to_trade(tr, txt, engine, log):
+    """Apply parsed-from-text signal-update logic to a single trade.
+    Used by both REST polling (check_signal_updates) and Gateway WS edit
+    push (fast_edit_handler in main()). Caller holds state_lock.
 
-    # Find all active trades that have a discord_msg_id
+    When IGNORE_POST_ENTRY_UPDATES is True (default in trail mode), this
+    function is a no-op. The bot's protective stack (hard SL @ ±FIXED_SL_PCT,
+    algo TRAIL @ ±TRAIL_ACTIVATION_PCT with TRAIL_CALLBACK_RATE callback)
+    handles the entire trade lifecycle autonomously via Binance WS events —
+    provider SL/TP edits, "TRADE CLOSED" messages, and DCA updates are all
+    informational and not load-bearing for safety. Multi-agent audit
+    confirmed: the minimum required signal field set is {symbol, side,
+    trigger}; every post-entry field is overwritten by FIXED_RISK_PROFILE
+    or unused in trail mode.
+    """
+    try:
+        from config import IGNORE_POST_ENTRY_UPDATES
+        if IGNORE_POST_ENTRY_UPDATES:
+            return
+        # Check for TRADE CLOSED (manual close by signal provider).
+        # Detects both "TRADE CLOSED" (legacy) and "Closed P&L:" (AO Crusher).
+        if is_trade_closed(txt):
+            log.warning(f"🚨 Signal CLOSED detected for {tr['symbol']} - sending Telegram alert")
+            if tr.get("status") == "open":
+                direction = "SHORT" if tr["order_side"] == "Sell" else "LONG"
+                message = (
+                    f"🚨 <b>Signal Provider Closed Trade</b>\n\n"
+                    f"<b>{tr['symbol']}</b> {direction}\n"
+                    f"Status: Position still OPEN\n\n"
+                    f"⚠️ Consider closing position manually"
+                )
+                telegram_alerts.send_message(message)
+                log.info(f"   Telegram alert sent for {tr['symbol']}")
+            elif tr.get("status") == "pending":
+                entry_oid = tr.get("entry_order_id")
+                if entry_oid and entry_oid != "DRY_RUN":
+                    try:
+                        engine.cancel_entry(tr["symbol"], entry_oid, tr.get("id"))
+                        telegram_alerts.send_order_canceled(
+                            symbol=tr["symbol"],
+                            side=tr["order_side"],
+                            reason="Signal provider closed trade"
+                        )
+                    except Exception as e:
+                        log.warning(f"Failed to cancel entry for {tr['symbol']}: {e}")
+                tr["status"] = "cancelled"
+                tr["exit_reason"] = "signal_closed"
+            return
+
+        # Check for TRADE CANCELLED
+        if "TRADE CANCELLED" in txt.upper() or "CLOSED WITHOUT ENTRY" in txt.upper():
+            log.warning(f"❌ Signal CANCELLED for {tr['symbol']} - cancelling all orders")
+            if tr.get("status") == "pending":
+                entry_oid = tr.get("entry_order_id")
+                if entry_oid:
+                    engine.cancel_entry(tr["symbol"], entry_oid, tr.get("id"))
+            if tr.get("status") == "open":
+                engine._cancel_all_trade_orders(tr)
+            tr["status"] = "cancelled"
+            tr["exit_reason"] = "signal_cancelled"
+            return
+
+        # Parse SL/TP/DCA from the text
+        sig = parse_signal_update(txt)
+        new_sl = sig.get("sl_price")
+        new_tps = sig.get("tp_prices") or []
+        new_dcas = sig.get("dca_prices") or []
+        old_sl = tr.get("sl_price")
+        old_tps = tr.get("tp_prices") or []
+        old_dcas = tr.get("dca_prices") or []
+        is_open = tr.get("status") == "open"
+
+        # SL Update Check
+        if new_sl and new_sl != old_sl and not tr.get("sl_moved_to_be"):
+            log.info(f"🔄 Signal SL updated for {tr['symbol']}: {old_sl} → {new_sl}")
+            tr["sl_price"] = new_sl
+            if is_open:
+                engine._move_sl(tr["symbol"], new_sl)
+
+        # TP Update Check (detect ANY change in TP prices)
+        tps_changed = False
+        if new_tps and len(new_tps) > 0:
+            new_tps = new_tps[:3]
+            if len(new_tps) != len(old_tps):
+                tps_changed = True
+            elif any(abs(float(new_tps[i]) - float(old_tps[i])) > 0.0000001
+                     for i in range(min(len(new_tps), len(old_tps)))):
+                tps_changed = True
+        if tps_changed:
+            log.info(f"🔄 Signal TPs changed for {tr['symbol']}: {old_tps} → {new_tps}")
+            if is_open and tr.get("post_orders_placed"):
+                engine.update_tp_orders(tr, new_tps)
+            else:
+                tr["tp_prices"] = new_tps
+
+        # DCA Update Check
+        dcas_changed = False
+        if new_dcas:
+            if len(new_dcas) != len(old_dcas):
+                dcas_changed = True
+            elif old_dcas and any(abs(float(new_dcas[i]) - float(old_dcas[i])) > 0.0000001
+                                 for i in range(min(len(new_dcas), len(old_dcas)))):
+                dcas_changed = True
+        if dcas_changed or (new_dcas and not old_dcas):
+            log.info(f"🔄 Signal DCA updated for {tr['symbol']}: {old_dcas} → {new_dcas}")
+            tr["dca_prices"] = new_dcas
+            if is_open and not tr.get("dca_orders_placed"):
+                engine.place_dca_orders(tr)
+    except Exception as e:
+        log.debug(f"Signal update apply failed for {tr.get('symbol')}: {e}")
+
+
+def check_signal_updates(discord, engine, st, log):
+    """REST-fallback signal-update poller. Re-fetches Discord messages
+    for active trades and applies updates via _apply_signal_update_to_trade.
+    The Gateway WS MESSAGE_UPDATE push is the primary path; this runs at
+    a slower cadence (60s) as a safety net."""
     active_trades = [
         tr for tr in st.get("open_trades", {}).values()
         if tr.get("status") in ("pending", "open") and tr.get("discord_msg_id")
     ]
-
     if not active_trades:
         return
 
-    log.info(f"🔍 Checking {len(active_trades)} trade(s) for signal updates...")
-
+    log.info(f"🔍 Checking {len(active_trades)} trade(s) for signal updates (REST poll)...")
     for tr in active_trades:
         try:
             msg_id = tr.get("discord_msg_id")
             if not msg_id:
                 continue
-
-            # Fetch the current Discord message
             msg = discord.fetch_message(str(msg_id))
             if not msg:
-                # Track failed fetch attempts to avoid log spam
-                failed_fetches = tr.get("discord_fetch_failures", 0)
-                failed_fetches += 1
+                failed_fetches = tr.get("discord_fetch_failures", 0) + 1
                 tr["discord_fetch_failures"] = failed_fetches
-
-                # Log only first time and every 10th attempt
                 if failed_fetches == 1:
-                    log.warning(f"   {tr.get('symbol')}: Could not fetch Discord msg {msg_id} (message deleted or API issue)")
+                    log.warning(f"   {tr.get('symbol')}: Could not fetch Discord msg {msg_id}")
                 elif failed_fetches >= 10:
-                    log.warning(f"   {tr.get('symbol')}: Still unable to fetch msg {msg_id} after {failed_fetches} attempts - removing discord_msg_id")
-                    tr["discord_msg_id"] = None  # Stop trying after 10 failed attempts
+                    log.warning(f"   {tr.get('symbol')}: Removing discord_msg_id after {failed_fetches} failures")
+                    tr["discord_msg_id"] = None
                 continue
-
-            # Extract text from the message
             txt = discord.extract_text(msg)
             if not txt:
                 continue
-
-            # Check for TRADE CLOSED (manual close by signal provider)
-            if "TRADE CLOSED" in txt.upper():
-                log.warning(f"🚨 Signal CLOSED detected for {tr['symbol']} - sending Telegram alert")
-
-                # Send Telegram warning (don't auto-close position)
-                if tr.get("status") == "open":
-                    direction = "SHORT" if tr["order_side"] == "Sell" else "LONG"
-                    message = (
-                        f"🚨 <b>Signal Provider Closed Trade</b>\n\n"
-                        f"<b>{tr['symbol']}</b> {direction}\n"
-                        f"Status: Position still OPEN\n\n"
-                        f"⚠️ Consider closing position manually"
-                    )
-                    telegram_alerts.send_message(message)
-                    log.info(f"   Telegram alert sent for {tr['symbol']}")
-                elif tr.get("status") == "pending":
-                    # Cancel entry order for pending trades
-                    entry_oid = tr.get("entry_order_id")
-                    if entry_oid and entry_oid != "DRY_RUN":
-                        try:
-                            engine.cancel_entry(tr["symbol"], entry_oid)
-                            telegram_alerts.send_order_canceled(
-                                symbol=tr["symbol"],
-                                side=tr["order_side"],
-                                reason="Signal provider closed trade"
-                            )
-                        except Exception as e:
-                            log.warning(f"Failed to cancel entry for {tr['symbol']}: {e}")
-                    tr["status"] = "cancelled"
-                    tr["exit_reason"] = "signal_closed"
-                continue
-
-            # Check for TRADE CANCELLED
-            if "TRADE CANCELLED" in txt.upper() or "CLOSED WITHOUT ENTRY" in txt.upper():
-                log.warning(f"❌ Signal CANCELLED for {tr['symbol']} - cancelling all orders")
-                # Cancel Entry Order if pending
-                if tr.get("status") == "pending":
-                    entry_oid = tr.get("entry_order_id")
-                    if entry_oid:
-                        engine.cancel_entry(tr["symbol"], entry_oid)
-                # Cancel all TP/DCA Orders if open
-                if tr.get("status") == "open":
-                    engine._cancel_all_trade_orders(tr)
-                tr["status"] = "cancelled"
-                tr["exit_reason"] = "signal_cancelled"
-                continue
-
-            # Check for TP1 HIT while entry is still pending
-            if tr.get("status") == "pending":
-                # Check if TP1 is marked as HIT in Discord message
-                # Examples: "TP1: $0.13798 ✅ HIT (+20.00%)" or "TP1 ✅" or "✅ TP1 HIT"
-                txt_upper = txt.upper()
-                tp1_hit = False
-
-                # Check for various TP1 HIT patterns
-                if "TP1" in txt_upper and ("HIT" in txt_upper or "✅" in txt):
-                    # Verify it's actually marked as hit, not just mentioned
-                    # Look for patterns like "TP1 ✅", "TP1: ... ✅", "TP1 HIT"
-                    import re
-                    # Match: TP1 followed (within ~50 chars) by either ✅ or HIT
-                    if re.search(r'TP1.{0,50}(✅|HIT)', txt_upper):
-                        tp1_hit = True
-
-                if tp1_hit:
-                    log.warning(f"🚫 TP1 marked as HIT in Discord for {tr['symbol']} - cancelling pending entry")
-                    entry_oid = tr.get("entry_order_id")
-                    if entry_oid and entry_oid != "DRY_RUN":
-                        try:
-                            engine.cancel_entry(tr["symbol"], entry_oid)
-                            telegram_alerts.send_order_canceled(
-                                symbol=tr["symbol"],
-                                side=tr["order_side"],
-                                reason="TP1 marked as HIT in signal (entry not filled)"
-                            )
-                            log.info(f"   Entry order cancelled for {tr['symbol']}")
-                        except Exception as e:
-                            log.warning(f"Failed to cancel entry for {tr['symbol']}: {e}")
-                    tr["status"] = "cancelled_tp1_hit"
-                    tr["exit_reason"] = "tp1_hit_before_entry"
-                    continue
-
-            # Parse SL/TP/DCA from the text
-            sig = parse_signal_update(txt)
-
-            new_sl = sig.get("sl_price")
-            new_tps = sig.get("tp_prices") or []
-            new_dcas = sig.get("dca_prices") or []
-
-            old_sl = tr.get("sl_price")
-            old_tps = tr.get("tp_prices") or []
-            old_dcas = tr.get("dca_prices") or []
-
-            is_open = tr.get("status") == "open"
-
-            # SL Update Check
-            if new_sl and new_sl != old_sl and not tr.get("sl_moved_to_be"):
-                log.info(f"🔄 Signal SL updated for {tr['symbol']}: {old_sl} → {new_sl}")
-                tr["sl_price"] = new_sl
-                if is_open:
-                    engine._move_sl(tr["symbol"], new_sl)
-
-            # TP Update Check (detect ANY change in TP prices)
-            tps_changed = False
-            if new_tps and len(new_tps) > 0:
-                # Limit to max 3 TPs (ignore TP4+ because we trail after TP3)
-                new_tps = new_tps[:3]
-
-                if len(new_tps) != len(old_tps):
-                    tps_changed = True
-                elif any(abs(float(new_tps[i]) - float(old_tps[i])) > 0.0000001
-                         for i in range(min(len(new_tps), len(old_tps)))):
-                    tps_changed = True
-
-            if tps_changed:
-                log.info(f"🔄 Signal TPs changed for {tr['symbol']}: {old_tps} → {new_tps}")
-                if is_open and tr.get("post_orders_placed"):
-                    engine.update_tp_orders(tr, new_tps)
-                else:
-                    tr["tp_prices"] = new_tps
-
-            # DCA Update Check (detect ANY change in DCA prices, not just additions)
-            dcas_changed = False
-            if new_dcas:
-                # Always use all available DCAs (config allows up to 3)
-                if len(new_dcas) != len(old_dcas):
-                    dcas_changed = True
-                elif old_dcas and any(abs(float(new_dcas[i]) - float(old_dcas[i])) > 0.0000001
-                                     for i in range(min(len(new_dcas), len(old_dcas)))):
-                    dcas_changed = True
-
-            if dcas_changed or (new_dcas and not old_dcas):
-                log.info(f"🔄 Signal DCA updated for {tr['symbol']}: {old_dcas} → {new_dcas}")
-                tr["dca_prices"] = new_dcas
-                # If DCAs not placed yet or changed significantly, place/update them
-                if is_open and not tr.get("dca_orders_placed"):
-                    engine.place_dca_orders(tr)
-                # Note: If DCAs change after placement, we log but don't cancel/replace
-                # (safer to let existing DCAs stay active)
-
+            with state_lock:
+                _apply_signal_update_to_trade(tr, txt, engine, log)
         except Exception as e:
             log.debug(f"Signal update check failed for {tr.get('symbol')}: {e}")
-
-    # Save state
     save_state(STATE_FILE, st)
 
 def main():
@@ -222,27 +196,227 @@ def main():
     missing = [k for k,v in {
         "DISCORD_TOKEN": DISCORD_TOKEN,
         "CHANNEL_ID": CHANNEL_ID,
-        "BYBIT_API_KEY": BYBIT_API_KEY,
-        "BYBIT_API_SECRET": BYBIT_API_SECRET,
+        "BINANCE_API_KEY": BINANCE_API_KEY,
+        "BINANCE_API_SECRET": BINANCE_API_SECRET,
     }.items() if not v]
     if missing:
         raise SystemExit(f"Missing ENV(s): {', '.join(missing)}")
 
+    # ── EXPORT_HISTORY / ANALYZE_HISTORY one-shot modes ──────────────────
+    # Setting either flag in Railway env runs that one-shot job at startup
+    # then exits cleanly. Both can be set together: export populates DB,
+    # analyze reads from DB, prints results, sends Telegram summary, dumps
+    # analysis.json. Idempotent — re-running EXPORT just refreshes rows.
+    do_export   = os.getenv("EXPORT_HISTORY", "").strip().lower() in ("1", "true", "yes")
+    do_analyze  = os.getenv("ANALYZE_HISTORY", "").strip().lower() in ("1", "true", "yes")
+    if do_export or do_analyze:
+        if db_export.is_enabled():
+            log.info("   db_export enabled — initializing schema")
+            db_export.init_database()
+
+        if do_export:
+            log.info("📤 EXPORT_HISTORY=1 — dumping channel history to discord_signals table…")
+            from export_signals import run_export
+            try:
+                limit = int(os.getenv("LIMIT", "0"))
+            except ValueError:
+                limit = 0
+            after_id = os.getenv("AFTER_ID", "").strip() or None
+            skip_files = os.getenv("SKIP_FILES", "1").strip().lower() in ("1", "true", "yes")
+            reader = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
+            run_export(reader, CHANNEL_ID, limit_total=limit,
+                       after_id=after_id, skip_files=skip_files, logger=log)
+            log.info("📤 EXPORT_HISTORY done.")
+
+        if do_analyze:
+            log.info("📊 ANALYZE_HISTORY=1 — running strategy analysis…")
+            from analyze_signals import run_analysis
+            run_analysis(logger=log)
+
+        log.info("🏁 One-shot job complete. Unset EXPORT_HISTORY / ANALYZE_HISTORY in Railway "
+                 "and redeploy to resume normal trading.")
+        return  # exit cleanly
+
     st = load_state(STATE_FILE)
 
-    bybit = BybitV5(BYBIT_API_KEY, BYBIT_API_SECRET, testnet=BYBIT_TESTNET, demo=BYBIT_DEMO, recv_window=RECV_WINDOW)
+    bybit = BinanceFutures(
+        BINANCE_API_KEY, BINANCE_API_SECRET,
+        testnet=BINANCE_TESTNET, recv_window=RECV_WINDOW,
+    )
+    # Force One-Way mode account-wide before any orders go out — set_leverage
+    # and STOP_MARKET closePosition=true rely on this. Idempotent.
+    if not DRY_RUN:
+        try:
+            bybit.set_position_mode_one_way()
+        except Exception as e:
+            log.warning(f"could not enforce One-Way position mode: {e} (continuing)")
+
+    # Prime the in-memory _algo_orders / _sl_orders from whatever algos are
+    # live on Binance right now. After a restart these sets are empty, which
+    # has two failure modes:
+    #   1. _cancel_by_order_id pays an extra REST round-trip per cancel
+    #      (regular endpoint → -2013 → algo endpoint fallback).
+    #   2. set_trading_stop's orphan-scan doesn't know the symbol already
+    #      has an algo SL armed → could place a SECOND algo SL on the same
+    #      position. prime_algo_orders fills both dicts in one batched
+    #      /fapi/v1/openAlgoOrders call (no symbol param → all open algos).
+    # Restricted to live open_trades symbols so a delisted stale algo on an
+    # untracked symbol doesn't get pulled into our state.
+    if not DRY_RUN:
+        try:
+            tracked_syms = sorted({
+                tr.get("symbol")
+                for tr in st.get("open_trades", {}).values()
+                if tr.get("symbol") and tr.get("status") in ("open", "pending")
+            })
+            # If no tracked symbols, still prime account-wide so the
+            # _algo_orders set covers any straggler from a previous crash
+            # that startup_sync will want to clean up.
+            prime_result = bybit.prime_algo_orders(tracked_syms or None)
+            primed = prime_result.get("count", 0)
+            sl_count = prime_result.get("sl_count", 0)
+            trails_by_tid = prime_result.get("trails_by_trade_id", {}) or {}
+            if primed:
+                log.info(
+                    f"♻️  Primed {primed} algo order(s) ({sl_count} SLs, "
+                    f"{len(trails_by_tid)} TRAILs) from Binance into in-memory cache"
+                )
+            # Hydrate trail_order_id on open trades so the idempotency check
+            # in _place_trailing_stop_orders does NOT place a second TRAIL
+            # for a trade whose trail was already armed pre-restart.
+            if trails_by_tid:
+                with state_lock:
+                    hydrated = 0
+                    for trade_id, trade in st.get("open_trades", {}).items():
+                        if trade_id in trails_by_tid and not trade.get("trail_order_id"):
+                            trade["trail_order_id"] = trails_by_tid[trade_id]
+                            hydrated += 1
+                    if hydrated:
+                        log.info(f"♻️  Hydrated trail_order_id on {hydrated} open trade(s)")
+        except Exception as e:
+            log.warning(f"prime_algo_orders failed: {e} (continuing — first-cancel will be slower)")
+
     discord = DiscordReader(DISCORD_TOKEN, CHANNEL_ID)
-    engine = TradeEngine(bybit, st, log)
+
+    # Discord Gateway WebSocket: push-based new-message receiver. Replaces
+    # REST polling for new signals (~50-300ms vs 0-4s). REST fetch_after
+    # below stays as fallback if the gateway exceeds GATEWAY_FALLBACK_FAILURES.
+    # Fast path: on_signal_callback wires directly into the gateway thread
+    # (set after fast_signal_handler is defined below).
+    gateway: "DiscordGateway | None" = None
+    if USE_GATEWAY_WS:
+        gateway = DiscordGateway(DISCORD_TOKEN, CHANNEL_ID, log)
+
+    # Live TP1-cross watcher: cancels pending conditional entries the moment
+    # the market last-price crosses TP1 (so we never enter into a trade where
+    # the opportunity is already gone). Pure Bybit WS — no Discord polling.
+    def on_tp1_cross(trade_id, symbol, side, entry_oid):
+        # Called from EntryWatcher's WS thread — must hold state_lock
+        # around state mutations to stay consistent with main loop and
+        # fast_signal_handler readers.
+        try:
+            if entry_oid and entry_oid != "DRY_RUN":
+                engine.cancel_entry(symbol, entry_oid, trade_id)
+        except Exception as e:
+            log.warning(f"on_tp1_cross: cancel_entry failed for {symbol}: {e}")
+        with state_lock:
+            tr = st.get("open_trades", {}).get(trade_id)
+            # Guard: only flip status if still pending. If the entry
+            # already filled (race between our cancel call and Bybit's
+            # fill-then-WS-push) the trade is "open" with a real
+            # position — don't lie about it.
+            if tr and tr.get("status") == "pending":
+                tr["status"] = "cancelled_tp1_hit"
+                tr["exit_reason"] = "tp1_hit_before_entry"
+            elif tr and tr.get("status") == "open":
+                log.warning(f"[on_tp1_cross] {symbol} entry already FILLED before cancel reached Bybit — leaving status=open")
+        try:
+            telegram_alerts.send_order_canceled(
+                symbol=symbol,
+                side=side,
+                reason="TP1 reached on live ticker before entry filled",
+            )
+        except Exception:
+            pass
+        save_state(STATE_FILE, st)
+
+    entry_watcher = EntryWatcher(bybit, on_tp1_cross, log)
+    engine = TradeEngine(bybit, st, log, entry_watcher=entry_watcher)
+    # Skip starting the WS-ticker thread if the cancel feature is disabled.
+    # The watcher object is still constructed (other code reads
+    # entry_watcher.get_last_price for price-cache hits) but the connect
+    # loop and TP1-cross logic stay dormant.
+    if DISABLE_ENTRY_WATCHER:
+        log.info("⚙️  ENTRY_WATCHER disabled — TP1-cross-cancel will not fire (relying on ENTRY_EXPIRATION_MIN timeout only)")
+    else:
+        entry_watcher.start()
+
+    # Backfill via REST once before connecting Gateway so messages posted
+    # during downtime aren't lost. Pre-load them straight into the gateway
+    # queue if WS is enabled, so the main loop processes them via the same
+    # drain path as live messages.
+    if gateway and GATEWAY_INITIAL_BACKFILL:
+        try:
+            after = st.get("last_discord_id")
+            backfill = discord.fetch_after(after, limit=50)
+            if backfill:
+                log.info(f"[gateway] backfilling {len(backfill)} message(s) from REST")
+                for m in sorted(backfill, key=lambda x: int(x.get("id", "0"))):
+                    try:
+                        gateway.msg_queue.put_nowait(m)
+                    except Exception:
+                        break
+        except Exception as e:
+            log.warning(f"[gateway] backfill failed: {e}")
+
+    # Re-attach entry_watcher for any trades that were pending when the
+    # bot last shut down. Without this, after a restart the conditional
+    # entry sits on Bybit but our TP1-cross safety net is gone until the
+    # entry fills — opening a window where we can enter into a guaranteed
+    # losing trade. With it: watcher resumes the moment the WS connects.
+    pending_at_restart = [
+        tr for tr in st.get("open_trades", {}).values()
+        if tr.get("status") == "pending" and tr.get("entry_order_id")
+    ]
+    if pending_at_restart and not DISABLE_ENTRY_WATCHER:
+        log.info(f"♻️  Re-attaching entry_watcher for {len(pending_at_restart)} pending trade(s) from previous session")
+        for tr in pending_at_restart:
+            tps = tr.get("tp_prices") or []
+            tp1 = float(tps[0]) if tps else None
+            if tp1:
+                try:
+                    # Pass trigger so the watcher arms only after entry-touch
+                    # (post-restart same as initial-place). Avoids prematurely
+                    # cancelling a pending trade whose market is currently past
+                    # TP1 but hasn't yet retraced to the entry trigger.
+                    entry_watcher.watch(
+                        tr["id"], tr["symbol"], tr["order_side"], tp1, tr["entry_order_id"],
+                        entry_price=float(tr.get("trigger") or 0) or None,
+                    )
+                except Exception as e:
+                    log.warning(f"   re-attach failed for {tr.get('symbol')}: {e}")
+
+    # gateway.start() is deferred to AFTER fast_signal_handler is defined
+    # (further down in main()), so the callback is wired before the WS
+    # thread can dispatch its first message.
 
     log.info("="*58)
     mode_str = " | DRY_RUN" if DRY_RUN else ""
-    mode_str += " | DEMO" if BYBIT_DEMO else ""
-    mode_str += " | TESTNET" if BYBIT_TESTNET else ""
-    log.info("Discord → Bybit Bot (One-way)" + mode_str)
+    mode_str += " | TESTNET" if BINANCE_TESTNET else ""
+    log.info("Discord → Binance Futures Bot (One-way)" + mode_str)
     log.info("="*58)
-    log.info(f"Config: CATEGORY={CATEGORY}, QUOTE={QUOTE}, LEVERAGE={LEVERAGE}x")
+    log.info(f"Config: QUOTE={QUOTE}, LEVERAGE={LEVERAGE}x, MARGIN={MARGIN_MODE}")
     log.info(f"Config: RISK_PCT={RISK_PCT}%, MAX_CONCURRENT={MAX_CONCURRENT_TRADES}, MAX_DAILY={MAX_TRADES_PER_DAY}")
     log.info(f"Config: POLL_SECONDS={POLL_SECONDS}, TC_MAX_LAG_SEC={TC_MAX_LAG_SEC}")
+    log.info(f"Config: USE_GATEWAY_WS={USE_GATEWAY_WS} (fallback after {GATEWAY_FALLBACK_FAILURES} failures)")
+    log.info(f"Config: DISABLE_PREFLIGHT_TP1={DISABLE_PREFLIGHT_TP1}, DISABLE_ENTRY_WATCHER={DISABLE_ENTRY_WATCHER}")
+    log.info(f"Config: FIXED_RISK_PROFILE={FIXED_RISK_PROFILE} SL={FIXED_SL_PCT}% TP={FIXED_TP_PCTS} splits={TP_SPLITS} BE+{BREAKEVEN_PROFIT_BUFFER_PCT}%")
+    if USE_TRAIL_AFTER_TP1:
+        log.info(f"Config: USE_TRAIL_AFTER_TP1=True | activation @ {TRAIL_ACTIVATION_PCT}% from entry, callback={TRAIL_CALLBACK_RATE}%")
+    else:
+        log.info(f"Config: USE_TRAIL_AFTER_TP1=False (TP1/2/3 ladder mode)")
+    if RSI_FILTER_MAX_1M > 0:
+        log.info(f"Config: RSI_FILTER_MAX_1M={RSI_FILTER_MAX_1M} (skip signal if RSI_1m >= this)")
     log.info(f"Config: DRY_RUN={DRY_RUN}, LOG_LEVEL={LOG_LEVEL}")
 
     # Initialize database if enabled
@@ -256,6 +430,73 @@ def main():
     # Startup sync - check for orphaned positions
     engine.startup_sync()
 
+    # ── Bybit cache pre-warm ───────────────────────────────────────────────
+    # Pre-fetch wallet_equity + (instrument_rules + set_leverage) for the
+    # symbols we'll likely trade, all in parallel. Eliminates the ~300ms
+    # cold-path penalty on the first trade per symbol after bot start.
+    def _bybit_warmup():
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        if not WARMUP_SYMBOLS and not DRY_RUN:
+            # Always pre-warm equity even if no symbol list provided
+            try:
+                bybit.wallet_equity(ACCOUNT_TYPE, force_refresh=True)
+                log.info("🔥 Warmup: equity cached")
+            except Exception as e:
+                log.warning(f"warmup: equity failed: {e}")
+            return
+        if DRY_RUN:
+            log.info("🔥 Warmup skipped (DRY_RUN)")
+            return
+
+        log.info(f"🔥 Warming up Binance caches: equity + {len(WARMUP_SYMBOLS)} symbols (margin={MARGIN_MODE})...")
+        t0 = time.time()
+
+        # Light per-call delay to stay under Binance's order-rate limit
+        # (300 orders / 10s, but warmup only does GET + 2 POSTs per
+        # symbol; conservative anyway).
+        warmup_lock = threading.Lock()
+        last_call_ts = [0.0]
+
+        def warm_symbol(base):
+            with warmup_lock:
+                gap = time.time() - last_call_ts[0]
+                if gap < 0.1:
+                    time.sleep(0.1 - gap)
+                last_call_ts[0] = time.time()
+            symbol = f"{base}{QUOTE}"
+            try:
+                engine._get_instrument_rules(symbol)
+                # Margin mode must be set BEFORE first leverage call —
+                # Binance rejects margin-mode change once a position
+                # exists; setting it here on every cold symbol keeps the
+                # account state explicit. Idempotent (-4046 ignored).
+                try:
+                    bybit.set_margin_mode(symbol, MARGIN_MODE)
+                except Exception as e:
+                    log.debug(f"set_margin_mode {symbol}: {e}")
+                if engine._set_leverage_safe(symbol):
+                    engine._leverage_set.add(symbol)
+                return (symbol, True, None)
+            except Exception as e:
+                return (symbol, False, str(e))
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            eq_f = ex.submit(bybit.wallet_equity, ACCOUNT_TYPE, True)
+            sym_futures = [ex.submit(warm_symbol, b) for b in WARMUP_SYMBOLS]
+            try:
+                eq_f.result()
+            except Exception as e:
+                log.warning(f"warmup: equity failed: {e}")
+            ok = sum(1 for f in sym_futures if (r := f.result())[1])
+            failed = [r[0] for f in sym_futures if not (r := f.result())[1]]
+        elapsed = (time.time() - t0) * 1000.0
+        msg = f"🔥 Warmup done: {ok}/{len(WARMUP_SYMBOLS)} symbols + equity, {elapsed:.0f}ms"
+        if failed:
+            msg += f" (failed: {','.join(failed[:5])})"
+        log.info(msg)
+
+    _bybit_warmup()
+
     # Heartbeat tracking
     last_heartbeat = time.time()
     HEARTBEAT_INTERVAL = 300  # Log heartbeat every 5 minutes
@@ -263,6 +504,25 @@ def main():
     # Signal update tracking (dynamic intervals: 60s for pending, 10s for open)
     last_signal_update_check_pending = time.time() - (SIGNAL_UPDATE_INTERVAL_SEC - 5)  # First check after 5 seconds
     last_signal_update_check_open = time.time() - (SIGNAL_UPDATE_INTERVAL_OPEN_SEC - 3)  # First check after 3 seconds
+
+    # Discord REST safety-net: even when Gateway WS is healthy, the WS can
+    # silently drop messages (we hit this on XION). Every 60s, fetch the
+    # last few messages via REST and re-dispatch through fast_signal_handler.
+    # The signal_hash dedupe inside fast_signal_handler ensures already-
+    # processed messages are skipped. Cost: ~1 REST call/min, negligible.
+    DISCORD_SAFETYNET_INTERVAL_SEC = 60
+    last_discord_safetynet = time.time()
+
+    # State-write throttle: writing state.json on every loop iteration adds
+    # 50-200ms on slow filesystems and is wasteful when nothing changed.
+    # Throttle to once per second; trade-mutating paths force a save.
+    last_state_save = 0.0
+    STATE_SAVE_INTERVAL_SEC = 1.0
+    def _save_state_throttled(force: bool = False):
+        nonlocal last_state_save
+        if force or (time.time() - last_state_save) >= STATE_SAVE_INTERVAL_SEC:
+            save_state(STATE_FILE, st)
+            last_state_save = time.time()
 
     # ----- WS thread -----
     ws_err = {"err": None}
@@ -284,7 +544,15 @@ def main():
     def ws_loop():
         while True:
             try:
-                bybit.run_private_ws(on_execution=on_execution, on_order=on_order, on_error=on_ws_error)
+                # wallet/position cache writes happen inside bybit_v5.py.
+                # No callbacks needed — engine reads from get_cached_position()
+                # and bybit.wallet_equity() (which checks WS cache first).
+                bybit.run_private_ws(
+                    on_execution=on_execution,
+                    on_order=on_order,
+                    on_error=on_ws_error,
+                    account_type=ACCOUNT_TYPE,
+                )
             except Exception as e:
                 on_ws_error(e)
             time.sleep(3)
@@ -300,13 +568,293 @@ def main():
         k = utc_day_key()
         st.setdefault("daily_counts", {})[k] = int(st.get("daily_counts", {}).get(k, 0)) + 1
 
+    # state_lock is the shared module-level RLock from state.py — every
+    # state mutation across all threads (main loop, fast_signal_handler,
+    # WS callbacks, on_tp1_cross) acquires the same lock so save_state
+    # never sees a dict mid-mutation. RLock allows the same thread to
+    # re-enter (e.g. fast_signal_handler holds it across check+persist).
+
+    # ============================================================
+    # Fast signal handler — invoked DIRECTLY from the gateway thread
+    # via asyncio.to_thread on every Discord WS push. Bypasses the
+    # main loop's queue + maintenance ops for minimum push→order
+    # latency, especially when the main loop is busy with Bybit
+    # API calls for active position monitoring.
+    # ============================================================
+    def fast_signal_handler(raw_msg):
+        try:
+            # FIX #1: ALWAYS advance last_discord_id BEFORE any early-return
+            # so the safety-net REST poll doesn't keep re-fetching the same
+            # status-update messages forever. Previously this was only done
+            # AFTER signal-parse + dedupe passed, which meant TP1-hit /
+            # TRADE-CLOSED edits and other non-signal messages would never
+            # advance the cursor and trigger a false "WS may be dropping
+            # events" warning every minute.
+            mid_str = str(raw_msg.get("id", ""))
+            try:
+                if int(mid_str or "0") > int(st.get("last_discord_id") or "0"):
+                    with state_lock:
+                        st["last_discord_id"] = mid_str
+            except (ValueError, TypeError):
+                pass
+
+            ts = discord.message_timestamp_unix(raw_msg)
+            now = time.time()
+            age = (now - ts) if ts else 0.0
+            if ts and age > TC_MAX_LAG_SEC:
+                return  # backfill / replay — too old to act on
+
+            txt = discord.extract_text(raw_msg)
+            if not txt:
+                return
+
+            sig = parse_signal(txt, quote=QUOTE)
+            if not sig:
+                if "SIGNAL" in txt.upper() or "ENTRY" in txt.upper():
+                    log.warning(f"⚠️ Possible signal NOT parsed: {txt[:300]}...")
+                return
+
+            age_ms = age * 1000.0 if ts else -1
+            log.info(f"📨 [WS] Signal parsed: {sig['symbol']} {sig['side'].upper()} @ {sig['trigger']} (discord_age={age_ms:.0f}ms)")
+
+            # Symbol blacklist — skip signals on coins with proven negative
+            # EV in the user's backtest (e.g. HIGH had -3.2% EV/trade
+            # across 16 trades). Configured via BLACKLIST_SYMBOLS env.
+            base_sym = (sig.get("base") or "").upper()
+            if base_sym in BLACKLIST_SYMBOLS:
+                log.info(f"⏭️  SKIP {sig['symbol']}: blacklisted base={base_sym}")
+                return
+
+            # RSI_1m pre-place filter. Walk-forward-validated on 1013
+            # signals: skipping when RSI_1m >= 74 keeps ~78 % of signals
+            # but rejects almost only the negative-EV ones (the high-RSI
+            # quintile has 27-31 % WR; the rejected bucket runs near zero
+            # EV even on the held-out test half). Cost ~50ms (one extra
+            # 1m-klines GET) — applied before placing the order so we
+            # avoid the much slower batchOrders RTT when rejecting.
+            if RSI_FILTER_MAX_1M > 0:
+                rsi = None
+                try:
+                    rsi = bybit.compute_rsi_1m(sig["symbol"])
+                    if rsi is None:
+                        # too-few-candles or malformed klines (rare: brand-new listing)
+                        log.warning(
+                            f"RSI=None for {sig['symbol']} (insufficient klines) — fail-open"
+                        )
+                except Exception as e:
+                    log.warning(
+                        f"RSI fetch failed for {sig['symbol']}: {type(e).__name__}: {e} "
+                        f"— fail-open"
+                    )
+                if rsi is not None and rsi >= RSI_FILTER_MAX_1M:
+                    msg = f"⏭️ SKIP {sig['symbol']}: RSI_1m={rsi:.1f} >= {RSI_FILTER_MAX_1M} (filter)"
+                    log.info(msg)
+                    try:
+                        telegram_alerts.send_message(msg)
+                    except Exception as te:
+                        log.debug(f"Telegram skip-notify failed: {te}")
+                    return
+
+            sh = signal_hash(sig)
+            mid_str = str(raw_msg.get("id", ""))
+
+            # ── Atomic check-and-mark: dedupe + limits + reserve a slot ──
+            # ms precision avoids orderLinkId collisions on rapid bursts
+            # (Bybit returns 110072 "duplicate orderLinkId" otherwise).
+            trade_id = f"{sig['symbol']}|{sig['side']}|{int(time.time()*1000)}"
+
+            # ── Atomic check-and-RESERVE: dedupe + limits + reserve a slot ──
+            # Race fix: we add a placeholder trade with status="reserving"
+            # under the lock so a concurrent fast_signal_handler counts us
+            # in its active-trades total. inc_trades_today() also runs here
+            # so the daily counter is correct before the Bybit place call.
+            # On any subsequent failure path (place_order returns None,
+            # exception, etc.) we MUST roll back: remove the placeholder
+            # and decrement the daily counter.
+            with state_lock:
+                seen = set(st.get("seen_signal_hashes", []))
+                if sh in seen:
+                    log.debug(f"Signal {sig['symbol']} already seen, skipping")
+                    return
+                seen.add(sh)
+                st["seen_signal_hashes"] = list(seen)[-500:]
+
+                active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending", "open", "reserving")]
+                if len(active) >= MAX_CONCURRENT_TRADES:
+                    log.info(f"Active trades {len(active)}/{MAX_CONCURRENT_TRADES} → skip {sig['symbol']}")
+                    return
+                if trades_today() >= MAX_TRADES_PER_DAY:
+                    log.info(f"Trades today {trades_today()}/{MAX_TRADES_PER_DAY} → skip {sig['symbol']}")
+                    return
+
+                # Reserve the slot atomically. Counter goes up here too so
+                # parallel handlers see the new total.
+                st.setdefault("open_trades", {})[trade_id] = {
+                    "id": trade_id,
+                    "symbol": sig["symbol"],
+                    "status": "reserving",
+                    "placed_ts": time.time(),
+                }
+                inc_trades_today()
+
+                # Update last_discord_id so REST backfill doesn't re-deliver
+                try:
+                    if int(mid_str or "0") > int(st.get("last_discord_id") or "0"):
+                        st["last_discord_id"] = mid_str
+                except (ValueError, TypeError):
+                    pass
+
+            # ── Place order (outside lock — Bybit ~200ms shouldn't block other threads) ──
+            log.info(f"🔄 [WS] Placing entry order for {sig['symbol']}...")
+            _t = time.time()
+            try:
+                oid = engine.place_conditional_entry(sig, trade_id)
+            except Exception:
+                log.exception(f"❌ place_conditional_entry crashed for {sig['symbol']}")
+                oid = None
+            place_ms = (time.time() - _t) * 1000.0
+            e2e_ms = (time.time() - ts) * 1000.0 if ts else -1
+            log.info(f"⏱  [WS] place_order took {place_ms:.0f}ms | e2e Discord→Order: {e2e_ms:.0f}ms")
+
+            if not oid:
+                log.warning(f"❌ Entry order failed for {sig['symbol']} — rolling back reserved slot")
+                with state_lock:
+                    st.get("open_trades", {}).pop(trade_id, None)
+                    # Decrement daily counter (we incremented it pre-place)
+                    k = utc_day_key()
+                    cur = int(st.get("daily_counts", {}).get(k, 0))
+                    if cur > 0:
+                        st.setdefault("daily_counts", {})[k] = cur - 1
+                    # Roll back the seen_signal_hashes entry too — otherwise
+                    # if Bybit hiccuped (rate limit / network blip), the
+                    # provider's signal is silently ignored on re-delivery.
+                    seen = set(st.get("seen_signal_hashes", []))
+                    seen.discard(sh)
+                    st["seen_signal_hashes"] = list(seen)[-500:]
+                return
+
+            # ── Promote placeholder to real trade ──
+            try:
+                equity_now = bybit.wallet_equity(ACCOUNT_TYPE)  # cached
+            except Exception:
+                equity_now = 0
+
+            mid = int(mid_str or "0")
+            with state_lock:
+                st["open_trades"][trade_id] = {
+                    "id": trade_id,
+                    "symbol": sig["symbol"],
+                    "order_side": "Sell" if sig["side"] == "sell" else "Buy",
+                    "pos_side": "Short" if sig["side"] == "sell" else "Long",
+                    "trigger": float(sig["trigger"]),
+                    "tp_prices": sig.get("tp_prices") or [],
+                    "tp_splits": None,
+                    "dca_prices": sig.get("dca_prices") or [],
+                    "sl_price": sig.get("sl_price"),
+                    "sl_set_inline": bool(sig.get("_sl_inline")),
+                    "entry_order_id": oid,
+                    "status": "pending",
+                    "placed_ts": time.time(),
+                    "base_qty": sig.get("_base_qty") or engine.calc_base_qty(sig["symbol"], float(sig["trigger"])),
+                    "raw": sig.get("raw", ""),
+                    "discord_msg_id": mid,
+                    # Per-symbol effective values (account for LEVERAGE_OVERRIDES)
+                    "risk_pct": engine._effective_risk_pct(sig["symbol"]),
+                    "risk_amount": round(equity_now * engine._effective_risk_pct(sig["symbol"]) / 100, 2) if equity_now > 0 else None,
+                    "equity_at_entry": round(equity_now, 2) if equity_now > 0 else None,
+                    "leverage": engine._effective_leverage(sig["symbol"]),
+                }
+            log.info(f"🟡 [WS] ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")
+
+            # ── SPEED-CRITICAL PATH ENDS HERE ──
+            # Order is placed and acked. Everything below is post-flight
+            # bookkeeping (state to disk, Telegram alert, optional entry-
+            # watcher) — moved to a daemon thread so this handler can
+            # return immediately and start processing the next signal.
+            # save_state takes 50-200ms (sync disk I/O on Railway).
+            # Telegram .send_entry_pending takes 100-300ms (sync HTTP).
+            # Together that's 150-500ms of latency we don't need to block on.
+            def _post_flight():
+                try:
+                    save_state(STATE_FILE, st)
+                except Exception as e:
+                    log.warning(f"save_state failed in post-flight: {e}")
+                tps = sig.get("tp_prices") or []
+                tp1 = float(tps[0]) if tps else None
+                if tp1 and not DISABLE_ENTRY_WATCHER:
+                    order_side = "Sell" if sig["side"] == "sell" else "Buy"
+                    try:
+                        # Pass the entry trigger so the watcher arms ONLY
+                        # after price touches it. Prevents premature cancel
+                        # on SHORT setups where market is already below TP1
+                        # at signal time but entry hasn't filled yet (bug
+                        # affected ~27% of signals, of which 84% were
+                        # would-have-been winners).
+                        entry_watcher.watch(
+                            trade_id, sig["symbol"], order_side, tp1, oid,
+                            entry_price=float(sig["trigger"]),
+                        )
+                    except Exception as e:
+                        log.warning(f"entry_watcher.watch failed: {e}")
+                try:
+                    telegram_alerts.send_entry_pending(
+                        symbol=sig["symbol"],
+                        side="Sell" if sig["side"] == "sell" else "Buy",
+                        entry=float(sig["trigger"]),
+                        qty=st["open_trades"][trade_id]["base_qty"],
+                    )
+                except Exception as e:
+                    log.warning(f"telegram alert failed: {e}")
+            threading.Thread(target=_post_flight, daemon=True).start()
+        except Exception:
+            log.exception("[WS] fast_signal_handler crashed")
+
+    # ============================================================
+    # Fast edit handler — invoked DIRECTLY from the gateway thread
+    # via asyncio.to_thread on every Discord MESSAGE_UPDATE event.
+    # Cuts TRADE CLOSED / SL-edit detection from up-to-60s polling
+    # to ~50ms push.
+    # ============================================================
+    def fast_edit_handler(raw_msg):
+        try:
+            mid_str = str(raw_msg.get("id") or "")
+            if not mid_str:
+                return
+            txt = discord.extract_text(raw_msg)
+            if not txt:
+                return
+            with state_lock:
+                tr = None
+                for t in st.get("open_trades", {}).values():
+                    if str(t.get("discord_msg_id") or "") == mid_str \
+                       and t.get("status") in ("pending", "open"):
+                        tr = t
+                        break
+                if tr is None:
+                    return  # not a tracked message — ignore
+                log.info(f"📝 [WS-edit] msg {mid_str} (tracked: {tr.get('symbol')})")
+                _apply_signal_update_to_trade(tr, txt, engine, log)
+            save_state(STATE_FILE, st)
+        except Exception:
+            log.exception("[WS-edit] fast_edit_handler crashed")
+
+    # Now that both handlers are defined, wire them into the gateway and
+    # start the WS thread.
+    if gateway:
+        gateway.on_signal_callback = fast_signal_handler
+        gateway.on_edit_callback = fast_edit_handler
+        gateway.start()
+
     # ----- main loop -----
     while True:
         try:
             # Heartbeat log every 5 minutes
             if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
                 active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending","open")]
-                log.info(f"💓 Heartbeat: {len(active)} active trade(s), {trades_today()} today")
+                gw_state = "off"
+                if gateway is not None:
+                    gw_state = "healthy" if gateway.is_healthy() else f"down(fail={gateway.consecutive_failures()})"
+                log.info(f"💓 Heartbeat: {len(active)} active trade(s), {trades_today()} today, gateway={gw_state}")
                 last_heartbeat = time.time()
 
             # Check for signal updates (dynamic interval: 60s for pending, 10s for open)
@@ -332,143 +880,114 @@ def main():
             engine.check_position_alerts()    # Send Telegram alerts if position P&L crosses thresholds
             engine.log_daily_stats()          # Log stats once per day
 
-            # entry-fill fallback (polling) and post-orders placement
+            # entry-fill fallback (polling) and post-orders placement.
+            # Mutations under state_lock so on_execution / fast_signal_handler
+            # / save_state never observe a half-updated trade dict.
             for tid, tr in list(st.get("open_trades", {}).items()):
                 if tr.get("status") == "pending":
-                    # if position opened but ws missed: detect via positions size > 0
                     sz, avg = engine.position_size_avg(tr["symbol"])
                     if sz > 0 and avg > 0:
-                        tr["status"] = "open"
-                        tr["entry_price"] = avg
-                        tr["filled_ts"] = time.time()
+                        with state_lock:
+                            tr["status"] = "open"
+                            tr["entry_price"] = avg
+                            tr["filled_ts"] = time.time()
                         log.info(f"✅ ENTRY (poll) {tr['symbol']} @ {avg}")
                 if tr.get("status") == "open" and not tr.get("post_orders_placed"):
                     engine.place_post_entry_orders(tr)
 
-            # enforce concurrent trades
-            active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending","open")]
-            if len(active) >= MAX_CONCURRENT_TRADES:
-                log.info(f"Active trades {len(active)}/{MAX_CONCURRENT_TRADES} → skip new signals")
-            elif trades_today() >= MAX_TRADES_PER_DAY:
-                log.info(f"Trades today {trades_today()}/{MAX_TRADES_PER_DAY} → skip new signals")
+            # ── Drain queue / REST poll, then dispatch via fast_signal_handler ──
+            # Note: live WS pushes are already handled DIRECTLY from the
+            # gateway thread (via on_signal_callback). This block exists for:
+            #   - REST-fallback when gateway is unhealthy
+            #   - backfill messages enqueued at startup
+            # Limit checks live inside fast_signal_handler so it self-skips.
+            use_gateway_now = (
+                gateway is not None
+                and gateway.consecutive_failures() < GATEWAY_FALLBACK_FAILURES
+            )
+            msgs = []
+            if use_gateway_now:
+                while True:
+                    m = gateway.get_message_nowait()
+                    if m is None:
+                        break
+                    msgs.append(m)
+                if msgs:
+                    log.debug(f"[gateway] drained {len(msgs)} backfill/queued message(s)")
+
+                # Safety-net: every DISCORD_SAFETYNET_INTERVAL_SEC, also
+                # pull a small REST batch to catch messages the WS dropped
+                # silently. Dedupe is enforced by signal_hash inside the
+                # handler — re-delivering an already-seen message is a no-op.
+                if (time.time() - last_discord_safetynet) >= DISCORD_SAFETYNET_INTERVAL_SEC:
+                    last_discord_safetynet = time.time()
+                    try:
+                        sn = discord.fetch_after(st.get("last_discord_id"), limit=10)
+                        if sn:
+                            new_count = sum(
+                                1 for m in sn
+                                if int(m.get("id", "0")) > int(st.get("last_discord_id") or "0")
+                            )
+                            if new_count:
+                                log.warning(
+                                    f"⚠️  [safety-net] REST fetched {new_count} message(s) "
+                                    f"newer than gateway last-seen — WS may be dropping events"
+                                )
+                            msgs.extend(sn)
+                    except Exception as e:
+                        log.debug(f"[safety-net] REST poll failed: {e}")
             else:
-                # read discord
                 after = st.get("last_discord_id")
-                log.debug(f"Polling Discord (after={after})...")
+                log.debug(f"Polling Discord REST (after={after})...")
                 try:
                     msgs = discord.fetch_after(after, limit=50)
                 except Exception as e:
                     log.warning(f"Discord fetch failed: {e}")
                     msgs = []
-
                 log.debug(f"Fetched {len(msgs)} message(s) from Discord")
-                msgs_sorted = sorted(msgs, key=lambda m: int(m.get("id","0")))
-                max_seen = int(after or 0)
 
-                for m in msgs_sorted:
-                    mid = int(m.get("id","0"))
-                    max_seen = max(max_seen, mid)
+            # De-dupe messages by id to avoid double-dispatch when the
+            # safety-net fetch overlaps with the WS queue.
+            seen_ids: set = set()
+            unique_msgs = []
+            for m in sorted(msgs, key=lambda x: int(x.get("id", "0"))):
+                mid = m.get("id")
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                unique_msgs.append(m)
+            for m in unique_msgs:
+                fast_signal_handler(m)
 
-                    # ignore very old messages
-                    ts = discord.message_timestamp_unix(m)
-                    age = time.time() - ts if ts else 0
-                    if ts and age > TC_MAX_LAG_SEC:
-                        log.debug(f"Skipping old message (age={age:.0f}s > {TC_MAX_LAG_SEC}s)")
-                        continue
-
-                    txt = discord.extract_text(m)
-                    if not txt:
-                        log.debug(f"Message {mid}: empty text, skipping")
-                        continue
-
-                    # Log first 200 chars of message for debugging
-                    log.debug(f"Message {mid}: {txt[:200]}...")
-
-                    sig = parse_signal(txt, quote=QUOTE)
-                    if not sig:
-                        # Check if it looks like a signal but failed to parse
-                        if "SIGNAL" in txt.upper() or "ENTRY" in txt.upper():
-                            log.warning(f"⚠️ Possible signal NOT parsed: {txt[:300]}...")
-                        else:
-                            log.debug(f"Message {mid}: not a signal")
-                        continue
-
-                    log.info(f"📨 Signal parsed: {sig['symbol']} {sig['side'].upper()} @ {sig['trigger']}")
-
-                    sh = signal_hash(sig)
-                    seen = set(st.get("seen_signal_hashes", []))
-                    if sh in seen:
-                        log.debug(f"Signal {sig['symbol']} already seen, skipping")
-                        continue
-
-                    # mark seen early
-                    seen.add(sh)
-                    st["seen_signal_hashes"] = list(seen)[-500:]
-
-                    trade_id = f"{sig['symbol']}|{sig['side']}|{int(time.time())}"
-                    log.info(f"🔄 Placing entry order for {sig['symbol']}...")
-                    oid = engine.place_conditional_entry(sig, trade_id)
-                    if not oid:
-                        log.warning(f"❌ Entry order failed for {sig['symbol']}")
-                        continue
-
-                    # Get current equity for risk tracking
-                    try:
-                        equity_now = bybit.wallet_equity(ACCOUNT_TYPE)
-                    except Exception:
-                        equity_now = 0
-
-                    # store trade
-                    st.setdefault("open_trades", {})[trade_id] = {
-                        "id": trade_id,
-                        "symbol": sig["symbol"],
-                        "order_side": "Sell" if sig["side"] == "sell" else "Buy",
-                        "pos_side": "Short" if sig["side"] == "sell" else "Long",
-                        "trigger": float(sig["trigger"]),
-                        "tp_prices": sig.get("tp_prices") or [],
-                        "tp_splits": None,  # engine uses config
-                        "dca_prices": sig.get("dca_prices") or [],
-                        "sl_price": sig.get("sl_price"),
-                        "entry_order_id": oid,
-                        "status": "pending",
-                        "placed_ts": time.time(),
-                        "base_qty": engine.calc_base_qty(sig["symbol"], float(sig["trigger"])),
-                        "raw": sig.get("raw", ""),
-                        "discord_msg_id": mid,  # Store Discord message ID for signal updates
-                        # Risk & Leverage tracking (captured at trade creation)
-                        "risk_pct": RISK_PCT,
-                        "risk_amount": round(equity_now * RISK_PCT / 100, 2) if equity_now > 0 else None,
-                        "equity_at_entry": round(equity_now, 2) if equity_now > 0 else None,
-                        "leverage": LEVERAGE,
-                    }
-                    inc_trades_today()
-                    log.info(f"🟡 ENTRY PLACED {sig['symbol']} {sig['side'].upper()} trigger={sig['trigger']} (id={trade_id})")
-
-                    # Send Telegram notification for pending entry
-                    telegram_alerts.send_entry_pending(
-                        symbol=sig["symbol"],
-                        side="Sell" if sig["side"] == "sell" else "Buy",
-                        entry=float(sig["trigger"]),
-                        qty=st["open_trades"][trade_id]["base_qty"]
-                    )
-
-                    # stop if we hit limits mid-batch
-                    active = [tr for tr in st.get("open_trades", {}).values() if tr.get("status") in ("pending","open")]
-                    if len(active) >= MAX_CONCURRENT_TRADES or trades_today() >= MAX_TRADES_PER_DAY:
-                        break
-
-                st["last_discord_id"] = str(max_seen) if max_seen else after
-
-            save_state(STATE_FILE, st)
+            _save_state_throttled()
 
         except KeyboardInterrupt:
             log.info("Bye")
+            if gateway is not None:
+                try:
+                    gateway.stop()
+                except Exception:
+                    pass
             break
         except Exception as e:
             log.exception(f"Loop error: {e}")
             time.sleep(3)
 
-        time.sleep(max(1, POLL_SECONDS + random.uniform(0, max(0, POLL_JITTER_MAX))))
+        # ── Throttle ──
+        # Gateway healthy: block on msg_event so an inbound Discord push
+        # wakes the loop instantly (event-driven, ~0ms wait). The timeout
+        # also caps maintenance interval at GATEWAY_LOOP_SLEEP_SEC.
+        # Gateway down: REST polling cadence.
+        gw_healthy = (
+            gateway is not None
+            and gateway.is_healthy()
+            and gateway.consecutive_failures() < GATEWAY_FALLBACK_FAILURES
+        )
+        if gw_healthy:
+            gateway.msg_event.wait(timeout=max(0.05, GATEWAY_LOOP_SLEEP_SEC))
+            gateway.msg_event.clear()
+        else:
+            time.sleep(max(1, POLL_SECONDS + random.uniform(0, max(0, POLL_JITTER_MAX))))
 
 if __name__ == "__main__":
     main()

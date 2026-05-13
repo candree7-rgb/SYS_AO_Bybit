@@ -1,89 +1,44 @@
-# Database Schema & Migrations
+# Database Schema
 
-## Current Schema
+PostgreSQL schema, automatically initialized on first bot start via
+`db_export.init_database()`. Manual setup: `psql $DATABASE_URL -f database/schema.sql`
 
-The database has two main tables:
-- `trades` - Individual trade records
-- `daily_equity` - Daily equity snapshots
+## Tables
 
-## Multi-Bot Support (Future)
+### `trades`
+One row per closed trade.
 
-The code is **ready for multi-bot support** via `bot_id` field.
+Key columns:
+- `trade_id` — primary key
+- `symbol`, `side` (`'long'` / `'short'`)
+- `entry_price`, `avg_price`, `close_price`
+- `total_qty`, `total_margin`, `leverage`
+- `realized_pnl`, `pnl_pct_margin`, `pnl_pct_equity`
+- `equity_at_entry`, `equity_at_close`, `is_win`
+- `tp1_hit` (bool), `tps_hit` (0-3), `trail_pnl_pct`, `close_reason`
+- `signal_leverage`, `equity_pct_per_trade`, `timeframe`
+- `bot_id` — multi-bot support (default `'ao'`)
+- `opened_at`, `closed_at`, `duration_minutes`
 
-### Current Status
-- ✅ Code supports `bot_id`
-- ❌ Database column **NOT YET ADDED** (backward compatible)
-- ✅ Works without migration (defaults to 'main')
+### `daily_equity`
+End-of-day equity snapshots used by the dashboard's equity chart.
 
-### When to Migrate
+## Multi-bot
 
-Run migration when you want to add a **second bot** to the same database.
+`bot_id` is included from the start. Run a second bot with `BOT_ID=<name>` env
+var; both bots share the same DB and the dashboard can filter by `bot_id`.
 
-### How to Migrate
+## Useful queries
 
-**1. Connect to PostgreSQL:**
-```bash
-# Railway:
-railway connect Postgres
-
-# Or use psql:
-psql $DATABASE_URL
-```
-
-**2. Run Migration:**
+Per-bot performance:
 ```sql
-\i database/migration_add_bot_id.sql
+SELECT bot_id, COUNT(*) as trades,
+       SUM(CASE WHEN is_win THEN 1 ELSE 0 END)::FLOAT / COUNT(*) * 100 as win_rate,
+       SUM(realized_pnl) as total_pnl
+FROM trades GROUP BY bot_id;
 ```
 
-**3. Verify:**
+TP-fill distribution:
 ```sql
-\d trades  -- Should show bot_id column
-SELECT DISTINCT bot_id FROM trades;  -- Should show 'main'
-```
-
-**4. Start Second Bot:**
-```bash
-# In Railway, add new bot service with:
-BOT_ID=scalping
-
-# Or for local testing:
-export BOT_ID=scalping
-python main.py
-```
-
-### Dashboard Multi-Bot Support
-
-After migration, the dashboard can filter by bot:
-- All bots combined view
-- Individual bot view
-- Comparison view (Bot A vs Bot B)
-
-**Note:** Dashboard multi-bot UI is not yet implemented. After migration, you'll need to:
-1. Add dropdown/tabs to dashboard
-2. Add `bot_id` filter to all queries
-3. Optionally: add comparison charts
-
-## Manual SQL Operations
-
-### Check which bots exist:
-```sql
-SELECT bot_id, COUNT(*) as trades, SUM(realized_pnl) as total_pnl
-FROM trades
-GROUP BY bot_id;
-```
-
-### View specific bot's trades:
-```sql
-SELECT * FROM trades WHERE bot_id = 'scalping' ORDER BY closed_at DESC LIMIT 10;
-```
-
-### Compare bot performance:
-```sql
-SELECT
-  bot_id,
-  COUNT(*) as total_trades,
-  SUM(CASE WHEN is_win THEN 1 ELSE 0 END)::FLOAT / COUNT(*) * 100 as win_rate,
-  SUM(realized_pnl) as total_pnl
-FROM trades
-GROUP BY bot_id;
+SELECT tps_hit, COUNT(*) FROM trades WHERE closed_at IS NOT NULL GROUP BY tps_hit;
 ```
