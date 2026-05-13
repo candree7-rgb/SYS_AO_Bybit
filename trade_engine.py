@@ -1727,13 +1727,33 @@ class TradeEngine:
             self.log.warning(f"Failed to cleanup regular orders for {symbol}: {e}")
 
         # ── Algo orders (algo SL via set_trading_stop, algo TRAIL) ──
+        # Binance stores clientAlgoId in the form _encode_link_id produced
+        # at place-time (pipes→underscores, colons→dashes, truncated to
+        # 36 chars while preserving the trailing "-SUFFIX"). We can't just
+        # compare raw cid against trade_id+":" — that silently failed for
+        # trail orphans and left them hanging post-SL-fire (observed live
+        # on BUSDT, LABUSDT 2026-05-13).
+        #
+        # Robust fix: recompute the EXACT cid that place_order would have
+        # produced for this trade's TRAIL (encoded + truncated identically)
+        # and exact-match. For algo SL, the cid starts with "sl-" which is
+        # safe-charset and passes through encode unchanged.
+        from binance_futures import _encode_link_id
         try:
+            expected_trail_cid = _encode_link_id(f"{trade_id}:TRAIL")
+            # Legacy "*:SL" suffix isn't used in the new algo SL path
+            # (set_trading_stop builds its own "sl-{sym}-{ts}-{rnd}" cid),
+            # but we include the legacy form for safety.
+            expected_legacy_sl_cid = _encode_link_id(f"{trade_id}:SL")
             algos = self.bybit.open_algo_orders(symbol)
             for ao in algos:
                 cid_raw = ao.get("clientAlgoId") or ""
-                # Match either trade-id prefix (TRAIL: "<trade_id>:TRAIL")
-                # or the sl- prefix used by set_trading_stop for algo SL.
-                if cid_raw.startswith(trade_id + ":") or cid_raw.startswith("sl-"):
+                is_match = (
+                    cid_raw == expected_trail_cid
+                    or cid_raw == expected_legacy_sl_cid
+                    or cid_raw.startswith("sl-")  # new algo SL prefix
+                )
+                if is_match:
                     aid = ao.get("algoId")
                     if aid is not None:
                         try:
